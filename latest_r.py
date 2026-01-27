@@ -68,13 +68,16 @@ def test_qradar_connection(qradar_host, username, password):
 
 
 def _empty_details():
-    """Return empty details structure with proper data types"""
+    """
+    Return empty details structure with proper data types.
+    FIX: returns None for days_since_last_event so it doesn't show as '0'.
+    """
     return {
-        'qradar_id': '',
-        'enabled': '',
-        'last_seen': '',
-        'activity_status': '',
-        'days_since_last_event': 0
+        'qradar_id': 'N/A',
+        'enabled': 'Unknown',
+        'last_seen': 'N/A',
+        'activity_status': 'Not Found',
+        'days_since_last_event': None  # Changed from 0 to None to avoid confusion
     }
 
 
@@ -85,7 +88,7 @@ def safe_timestamp_conversion(timestamp_ms):
     Returns: (last_seen_str, activity_status, days_since_last_event)
     """
     if not timestamp_ms:
-        return 'No events recorded', 'No Activity', 0
+        return 'No events recorded', 'No Activity', None
     
     try:
         # Convert to int if it's a float
@@ -95,7 +98,6 @@ def safe_timestamp_conversion(timestamp_ms):
         # Check if timestamp looks like milliseconds (> year 2100 in seconds)
         # If it's a very large number, it's likely milliseconds
         if timestamp_ms > 4102444800:  # Year 2100 in seconds
-            # print(f"   📅 Converting milliseconds to seconds: {timestamp_ms}")
             timestamp_seconds = timestamp_ms / 1000.0
         else:
             timestamp_seconds = timestamp_ms
@@ -103,7 +105,7 @@ def safe_timestamp_conversion(timestamp_ms):
         # Validate timestamp is within reasonable range (after conversion)
         if timestamp_seconds <= MIN_TIMESTAMP or timestamp_seconds > MAX_TIMESTAMP:
             print(f"   ⚠️ Timestamp out of valid range: {timestamp_seconds}")
-            return f'Invalid timestamp: {timestamp_ms}', 'Unknown', 0
+            return f'Invalid timestamp: {timestamp_ms}', 'Unknown', None
         
         # Convert to datetime
         last_event_datetime = datetime.fromtimestamp(timestamp_seconds)
@@ -126,7 +128,7 @@ def safe_timestamp_conversion(timestamp_ms):
         
     except (ValueError, TypeError, OSError, OverflowError) as e:
         print(f"   ⚠️ Error parsing timestamp {timestamp_ms}: {e}")
-        return f'Invalid timestamp: {timestamp_ms}', 'Unknown', 0
+        return f'Invalid timestamp: {timestamp_ms}', 'Unknown', None
 
 
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
@@ -239,7 +241,8 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         'enabled': 'object',
         'last_seen': 'object',
         'activity_status': 'object',
-        'days_since_last_event': 'int64'
+        'days_since_last_event': 'float64', # Changed to float to allow NaN (empty) values
+        'remarks': 'object' # Added remarks column
     }
     
     for col, dtype in result_columns_config.items():
@@ -280,15 +283,26 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         if not details:
             details = {'status': 'Empty/Invalid', **_empty_details()}
         
-        # Update DataFrame with proper data type handling
+        # ─── UPDATE LOGIC ───
+        
+        # Update DataFrame with details
         for k, v in details.items():
-            # Use .loc to avoid the FutureWarning about incompatible dtypes
             df.loc[idx, k] = v
         
+        # Set Remarks and specific error messages
         if details['status'] == 'Found':
             found_count += 1
+            df.loc[idx, 'remarks'] = "Found"
+            icon = "✅"
+            days_msg = f"{details.get('days_since_last_event', 'N/A')}"
+        else:
+            # THIS IS THE FIX: Explicit alert message
+            df.loc[idx, 'remarks'] = "Not found by host name or IP - please check!"
+            df.loc[idx, 'activity_status'] = "Not Found" # Force status
+            icon = "❌"
+            days_msg = "N/A"
             
-        print(f"   ✅ Result: {details['status']} | Activity: {details['activity_status']} | Last Event: {details.get('last_seen', 'N/A')} | Days Since: {details.get('days_since_last_event', 'N/A')}")
+        print(f"   {icon} Result: {details['status']} | Activity: {details['activity_status']} | Days Since: {days_msg}")
         
         # Add delay to avoid overwhelming QRadar
         time.sleep(0.5)
@@ -326,26 +340,25 @@ def filter_and_email(df_dict, draft_path):
             mask_errors = df['status'].str.startswith('API Error', na=False)
             
             # Filter not found
-            mask_not_found = df['status'] == 'Not Found'
+            mask_not_found = (df['status'] == 'Not Found') | (df['activity_status'] == 'Not Found')
 
             # Add inactive sources
             if mask_inactive.any():
                 sub = df[mask_inactive].copy()
-                sub['remark'] = 'Inactive or no activity detected'
+                # Only add remark if it's not already set to the "Not Found" message
+                sub.loc[sub['remarks'].isnull(), 'remark'] = 'Inactive or no activity detected'
                 sub['sheet_name'] = name
                 frames.append(sub)
 
             # Add error sources
             if mask_errors.any():
                 sub_err = df[mask_errors].copy()
-                sub_err['remark'] = 'API error - check log source configuration'
                 sub_err['sheet_name'] = name
                 frames.append(sub_err)
                 
             # Add not found sources
             if mask_not_found.any():
                 sub_nf = df[mask_not_found].copy()
-                sub_nf['remark'] = 'Log source not found in QRadar'
                 sub_nf['sheet_name'] = name
                 frames.append(sub_nf)
 
@@ -357,7 +370,7 @@ def filter_and_email(df_dict, draft_path):
     total = len(result_df)
     inactive_count = ((result_df['activity_status'] == 'Inactive') | (result_df['activity_status'] == 'No Activity')).sum()
     error_count = result_df['status'].str.startswith('API Error', na=False).sum()
-    not_found_count = (result_df['status'] == 'Not Found').sum()
+    not_found_count = ((result_df['status'] == 'Not Found') | (result_df['activity_status'] == 'Not Found')).sum()
 
     # Save filtered results
     result_df.to_excel(draft_path, index=False)
