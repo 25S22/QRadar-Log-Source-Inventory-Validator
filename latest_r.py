@@ -11,7 +11,7 @@ INPUT_EXCEL_PATH = r'C:\path\to\your\input.xlsx'
 SHEETS_TO_PROCESS = ['Sheet1', 'Sheet2']  # or ['all'] for all sheets
 LOGSOURCE_COLUMN = 'log source name'
 IP_COLUMN = 'IP'
-IN_QRADAR_COLUMN = 'In Qradar?'  # The column name to check for "Yes"
+IN_QRADAR_COLUMN = 'In Qradar?'  # Column to check before processing (Must contain "Yes")
 QRADAR_HOST = 'https://your-qradar-host'
 QRADAR_USERNAME = 'your-username'
 QRADAR_PASSWORD = 'your-password'
@@ -21,7 +21,7 @@ ACTIVITY_THRESHOLD_DAYS = 7  # Consider log source inactive if no events in X da
 REQUEST_TIMEOUT = 30
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
 
-# Valid timestamp range
+# Valid timestamp range for sanity checks
 MIN_TIMESTAMP = 0
 MAX_TIMESTAMP = 2147483647
 
@@ -74,7 +74,7 @@ def safe_timestamp_conversion(timestamp_ms):
         if isinstance(timestamp_ms, float):
             timestamp_ms = int(timestamp_ms)
         
-        # Convert ms to seconds if needed
+        # Convert ms to seconds if needed (timestamps > year 2100 are likely ms)
         if timestamp_ms > 4102444800:
             timestamp_seconds = timestamp_ms / 1000.0
         else:
@@ -106,8 +106,8 @@ def safe_timestamp_conversion(timestamp_ms):
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
     """
     Get log source details directly from the API.
-    Uses 'ilike' with wildcards for Name to allow partial matches.
-    Uses 'contains' for IP protocol parameters.
+    Uses 'ilike' with wildcards for Name (Partial Match).
+    Uses 'contains' for IP (Strict Parameter Match).
     """
     
     # Clean the identifier
@@ -185,8 +185,8 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
 
 def process_sheet(df, sheet_name, qradar_host, username, password, logsource_column, ip_column, in_qradar_col):
     """
-    Process a single sheet.
-    Arguments now explicitly include in_qradar_col to prevent NameErrors.
+    Process a single sheet row-by-row.
+    OPTIMIZATION: Checks 'In Qradar?' column first. If NOT 'Yes', skips the row immediately.
     """
     print(f"\n📋 Processing sheet: {sheet_name}")
     
@@ -213,18 +213,23 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
     
     for idx, row in df.iterrows():
         
-        # ─── FILTERING LOGIC ───
+        # ─── OPTIMIZED SKIPPING LOGIC ───
         should_process = True
         
-        # Explicit check using the passed argument 'in_qradar_col'
+        # Check the 'In Qradar?' column if configured
         if in_qradar_col and in_qradar_col in df.columns:
             in_qradar_val = str(row[in_qradar_col]).strip()
-            # Only process if it contains "Yes" (case-insensitive)
+            
+            # Logic: If value does not contain "yes", SKIP IT.
+            # This handles "Yes", "yes", "Yes-M", "YES PLEASE" -> All Processed.
+            # "No", "Pending", "Nan", "" -> All Skipped.
             if "yes" not in in_qradar_val.lower():
                 should_process = False
+                # Mark as skipped in Excel so user knows why
                 df.at[idx, 'remarks'] = "Skipped (In Qradar? != Yes)"
                 skipped_count += 1
         
+        # The critical optimization: continue loop immediately if skipped
         if not should_process:
             continue
             
@@ -322,6 +327,7 @@ def filter_and_email(df_dict, draft_path):
         if 'status' in df.columns:
             
             # Count only rows that were processed (status is not null)
+            # This ensures we ignore the rows we skipped earlier
             processed_mask = df['status'].notna()
             count_total_processed += processed_mask.sum()
             
