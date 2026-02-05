@@ -11,7 +11,7 @@ INPUT_EXCEL_PATH = r'C:\path\to\your\input.xlsx'
 SHEETS_TO_PROCESS = ['Sheet1', 'Sheet2']  # or ['all'] for all sheets
 LOGSOURCE_COLUMN = 'log source name'
 IP_COLUMN = 'IP'
-IN_QRADAR_COLUMN = 'In Qradar?'  # The column to check for "Yes"
+IN_QRADAR_COLUMN = 'In Qradar?'  # Must contain "Yes" to be processed
 QRADAR_HOST = 'https://your-qradar-host'
 QRADAR_USERNAME = 'your-username'
 QRADAR_PASSWORD = 'your-password'
@@ -99,27 +99,23 @@ def safe_timestamp_conversion(timestamp_ms):
         return last_seen, activity_status, days_since_last_event
         
     except Exception as e:
-        print(f"   ⚠️ Error parsing timestamp {timestamp_ms}: {e}")
         return f'Invalid timestamp: {timestamp_ms}', 'Unknown', None
 
 
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
     """
     Get log source details directly from the API.
-    Uses 'ilike' with wildcards for Name to allow partial matches.
-    Uses 'contains' for IP protocol parameters.
+    Returns details dict or None if not found/error.
     """
     
-    # Clean the identifier
     clean_identifier = str(identifier).replace('"', '').replace("'", "").strip()
     
     # Construct Filter
     if is_ip:
-        # IPs are inside a list (protocol_parameters), MUST use 'contains'
+        # IP Search: Strict check inside protocol_parameters list
         query_filter = f'protocol_parameters contains value="{clean_identifier}"'
     else:
-        # Names are strings, MUST use 'ilike' with wildcards for partial match
-        # This solves the 422 Error and finds "ABC123" inside "Hello @ ABC123"
+        # Name Search: Partial match using 'ilike' with wildcards
         query_filter = f'name ilike "%{clean_identifier}%"'
     
     ls_endpoint = f"{qradar_host.rstrip('/')}/api/config/event_sources/log_source_management/log_sources"
@@ -135,7 +131,6 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         )
         
         if resp.status_code != 200:
-            print(f"   ❌ Log source API error: {resp.status_code} - {resp.text}")
             return {'status': f'API Error {resp.status_code}', **_empty_details()}
 
         ls_data = resp.json()
@@ -146,7 +141,7 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         found_source = None
         
         if is_ip:
-            # Strict validation for IPs to avoid partial number matches
+            # Strict validation for IPs
             for source in ls_data:
                 params = source.get('protocol_parameters', [])
                 if any(p.get('value') == clean_identifier for p in params):
@@ -155,7 +150,6 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
             if not found_source: 
                 found_source = ls_data[0]
         else:
-            # For partial name matches, take the first result
             found_source = ls_data[0]
 
         ls_id = found_source.get('id')
@@ -167,11 +161,10 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         enabled = found_source.get('enabled', False)
         enabled_str = 'Yes' if enabled else 'No'
             
-        print(f"   📋 Found: {ls_name} | {activity_status} | {days_since_last_event if days_since_last_event is not None else 'N/A'} days ago")
-
         return {
             'status': 'Found',
             'qradar_id': str(ls_id) if ls_id is not None else '',
+            'actual_name': ls_name,
             'enabled': enabled_str,
             'last_seen': last_seen,
             'activity_status': activity_status,
@@ -179,15 +172,25 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         }
 
     except Exception as e:
-        print(f"   ❌ Unexpected error: {e}")
         return {'status': f'Error: {str(e)[:50]}...', **_empty_details()}
 
 
-def process_sheet(df, sheet_name, qradar_host, username, password, logsource_column, ip_column):
-    """Process a single sheet with 'In Qradar?' filtering and smart AP/FW logic"""
-    print(f"\n📋 Processing sheet: {sheet_name}")
+def process_sheet(df, sheet_name, qradar_host, username, password, logsource_column, ip_column, in_qradar_col):
+    """
+    Optimized Sheet Processing:
+    1. CLEANS HEADERS.
+    2. Filters 'Yes' rows first.
+    3. Handles Disabled logic so they don't count as Inactive.
+    """
+    print(f"\n{'='*60}")
+    print(f"📋 Processing Sheet: {sheet_name}")
+    print(f"{'='*60}")
     
-    # Initialize columns
+    # ─── FIX: CLEAN COLUMN HEADERS ───
+    if not df.empty:
+        df.columns = df.columns.str.strip()
+
+    # Initialize columns if missing
     cols_to_init = {
         'status': 'object',
         'qradar_id': 'object', 
@@ -202,90 +205,133 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         if col not in df.columns:
             df[col] = pd.Series(dtype=dtype)
     
-    total = len(df)
-    processed_count = 0
-    skipped_count = 0
+    # ─── STEP 1: EFFICIENT FILTERING ───
+    if in_qradar_col not in df.columns:
+        print(f"❌ ERROR: Column '{in_qradar_col}' not found in '{sheet_name}'!")
+        print(f"   Available Columns: {list(df.columns)}")
+        print("   Skipping this sheet.")
+        return df
+
+    # Create a mask for rows where In Qradar contains "yes" (case-insensitive)
+    process_mask = df[in_qradar_col].astype(str).str.lower().str.contains("yes", na=False)
     
-    print(f"Total rows in sheet: {total}")
+    rows_to_process = df[process_mask]
+    total_rows = len(df)
+    target_count = len(rows_to_process)
     
-    for idx, row in df.iterrows():
-        
-        # ─── NEW FILTERING LOGIC ───
-        # Check if 'In Qradar?' column exists and filter
-        should_process = True
-        if IN_QRADAR_COLUMN in df.columns:
-            in_qradar_val = str(row[IN_QRADAR_COLUMN]).strip()
-            # Only process if it contains "Yes" (case-insensitive)
-            # This handles 'Yes', 'yes', 'Yes-M', 'Yes-E', etc.
-            if "yes" not in in_qradar_val.lower():
-                should_process = False
-                df.at[idx, 'remarks'] = "Skipped (In Qradar? != Yes)"
-                skipped_count += 1
-        
-        if not should_process:
-            continue
-            
-        processed_count += 1
-        print(f"[{processed_count}] Processing row {idx + 1}...", end='\r')
-        
+    print(f"📊 Total Rows: {total_rows}")
+    print(f"🎯 Rows marked 'Yes': {target_count} (Rows to scan)")
+    
+    # Mark skipped rows efficiently
+    df.loc[~process_mask, 'remarks'] = "Skipped (In Qradar != Yes)"
+    
+    if target_count == 0:
+        print("✅ No rows to process in this sheet.")
+        return df
+
+    # ─── STEP 2: ITERATE ONLY TARGET ROWS ───
+    current_idx = 0
+    
+    for idx, row in rows_to_process.iterrows():
+        current_idx += 1
         name_val = str(row[logsource_column]).strip()
+        ip_val = str(row[ip_column]).strip()
+        
+        # Cleanup
+        if name_val.lower() in ['nan', 'none', '', 'null']: name_val = None
+        if ip_val.lower() in ['nan', 'none', '', 'null']: ip_val = None
+        
+        print(f"\n🔹 [{current_idx}/{target_count}] Processing Row {idx+1}")
+        
         details = None
+        search_method = "None"
         
-        # 1. Name Lookup (Partial Match allowed via 'ilike')
-        if name_val and name_val.lower() not in ['nan', 'none', '', 'null']:
+        # 1. Search by Name
+        if name_val:
+            print(f"   🔍 Searching Name: '{name_val}' ... ", end="")
             details = get_log_source_details(qradar_host, username, password, name_val, is_ip=False)
+            
+            if details['status'] == 'Found':
+                print("✅ Found!")
+                search_method = "Name"
+            else:
+                print("⚠️ Not Found.")
         
-        # 2. IP Fallback (Only if Name failed)
-        if not details or details['status'] == 'Not Found':
-            ip_val = str(row[ip_column]).strip()
-            if ip_val and ip_val.lower() not in ['nan', 'none', '', 'null']:
-                print(f"\n   🔁 Fallback to IP: '{ip_val}'")
-                details = get_log_source_details(qradar_host, username, password, ip_val, is_ip=True)
-        
-        # Initialize details if still missing
+        # 2. Fallback to IP (Only if Name failed/missing)
+        if (not details or details['status'] == 'Not Found') and ip_val:
+            print(f"   🔁 Fallback to IP: '{ip_val}' ... ", end="")
+            details = get_log_source_details(qradar_host, username, password, ip_val, is_ip=True)
+            
+            if details['status'] == 'Found':
+                print("✅ Found!")
+                search_method = "IP"
+            else:
+                print("❌ Not Found.")
+
+        # Initialize if completely failed
         if not details:
             details = {'status': 'Empty/Invalid', **_empty_details()}
+            
+        # ─── STEP 3: UPDATE DATAFRAME & DISPLAY DETAILS ───
         
-        # ─── UPDATE LOGIC ───
-        
-        # Determine Final Status and Remarks
         if details['status'] == 'Found':
-            final_status = 'Found'
-            final_remark = "Found"
-            activity_status = details['activity_status']
-        else:
-            # 3. SMART LOGIC for AP/FW when Not Found
-            # Check if Name contains 'AP' or 'FW' to infer status
-            if "AP" in name_val:
-                final_status = 'Inferred'
-                final_remark = "Under WLC (Inferred from Name)"
-                activity_status = "Inferred"
-                print(f"\n   ℹ️  Inferred: Under WLC")
-            elif "FW" in name_val:
-                final_status = 'Inferred'
-                final_remark = "Under Forti (Inferred from Name)"
-                activity_status = "Inferred"
-                print(f"\n   ℹ️  Inferred: Under Forti")
+            df.at[idx, 'qradar_id'] = details['qradar_id']
+            df.at[idx, 'enabled'] = details['enabled']
+            df.at[idx, 'last_seen'] = details['last_seen']
+            df.at[idx, 'days_since_last_event'] = details['days_since_last_event']
+            
+            # --- NEW DISABLED LOGIC ---
+            if details['enabled'] == 'No':
+                # If disabled, we ignore its activity status
+                final_status = 'Found'
+                final_remark = "Disabled on QRadar"
+                activity_status = "Disabled"
+                
+                print(f"      📌 Log Source: {details['actual_name']}")
+                print(f"      ⚪ Status:     Disabled (Ignored for Inactivity)")
             else:
-                final_status = 'Not Found'
-                final_remark = "❌ Not found by Name or IP - Please Check!"
-                activity_status = "Not Found"
-                print(f"\n   ❌ Not Found")
-
-        # Write to DataFrame
-        for k, v in details.items():
-            if k in df.columns:
-                df.at[idx, k] = v
-        
-        # Overwrite fields based on final logic
-        df.at[idx, 'status'] = final_status
-        df.at[idx, 'remarks'] = final_remark
-        if activity_status != details['activity_status']:
+                # If enabled, we trust the activity status
+                final_status = 'Found'
+                final_remark = f"Found by {search_method}"
+                activity_status = details['activity_status']
+                
+                print(f"      📌 Log Source: {details['actual_name']}")
+                print(f"      📊 Activity:   {activity_status}")
+                print(f"      📅 Last Event: {details['last_seen']} ({details['days_since_last_event']} days ago)")
+                
+            df.at[idx, 'status'] = final_status
+            df.at[idx, 'remarks'] = final_remark
             df.at[idx, 'activity_status'] = activity_status
+            
+        else:
+            # Handle Not Found Logic with Smart Inference
+            status_val = "Not Found"
+            remark_val = "❌ Not found by Name or IP"
+            act_val = "Not Found"
+            
+            if name_val and "AP" in name_val:
+                status_val = "Inferred"
+                remark_val = "Under WLC (Inferred)"
+                act_val = "Inferred"
+                print("      ℹ️  Result: Inferred as WLC (AP in name)")
+            elif name_val and "FW" in name_val:
+                status_val = "Inferred"
+                remark_val = "Under Forti (Inferred)"
+                act_val = "Inferred"
+                print("      ℹ️  Result: Inferred as FortiGate (FW in name)")
+            else:
+                print("      ❌ Result: ABSENT in QRadar.")
 
-        time.sleep(0.2)
+            df.at[idx, 'status'] = status_val
+            df.at[idx, 'remarks'] = remark_val
+            df.at[idx, 'activity_status'] = act_val
+            
+            # Clear other fields to be clean
+            df.at[idx, 'last_seen'] = "N/A"
+            df.at[idx, 'days_since_last_event'] = None
+
+        time.sleep(0.2) # Slight delay
     
-    print(f"\n📊 Sheet {sheet_name} completed. Processed: {processed_count}, Skipped: {skipped_count}")
     return df
 
 
@@ -298,114 +344,142 @@ def create_outlook_draft(attachment_path, subject, body):
         mail.Body = body
         mail.Attachments.Add(attachment_path)
         mail.Display()
-        print(f"✉️ Draft created: {attachment_path}")
+        print(f"\n✉️  Email draft created successfully.")
     except Exception as e:
-        print(f"❌ Failed to create Outlook draft: {e}")
+        print(f"\n❌ Failed to create Outlook draft: {e}")
 
 
 def filter_and_email(df_dict, draft_path):
-    """Filter inactive/error log sources and create report with accurate counts"""
+    """
+    Filter inactive/error log sources and create report.
+    UPDATED: Excludes 'Disabled' and 'Inferred' items from the Issue Counts.
+    """
     frames = []
     
     # Global Counters
-    count_total_processed = 0 # Rows where 'In Qradar' was Yes
-    count_found_active = 0
-    count_found_inactive = 0
-    count_inferred = 0
-    count_not_found = 0
-    count_api_errors = 0
+    stats = {
+        'total_scanned': 0,
+        'found_active': 0,
+        'found_inactive': 0,
+        'found_disabled': 0,  # New counter
+        'inferred': 0,
+        'not_found': 0,
+        'errors': 0
+    }
 
     for name, df in df_dict.items():
-        if 'status' in df.columns:
-            
-            # Count only rows that were processed (status is not null)
-            processed_mask = df['status'].notna()
-            count_total_processed += processed_mask.sum()
-            
-            # --- Logic to Categorize Rows ---
-            # 1. API Errors
-            is_error = df['status'].str.startswith('API Error', na=False)
-            count_api_errors += is_error.sum()
-            
-            # 2. Not Found (Strictly those marked Not Found, excluding Inferred)
-            is_not_found = (df['status'] == 'Not Found')
-            count_not_found += is_not_found.sum()
-            
-            # 3. Inferred (AP/FW logic)
-            is_inferred = (df['status'] == 'Inferred')
-            count_inferred += is_inferred.sum()
-            
-            # 4. Found - Check Activity
-            is_found = (df['status'] == 'Found')
-            is_inactive = is_found & ((df['activity_status'] == 'Inactive') | (df['activity_status'] == 'No Activity'))
-            is_active = is_found & (df['activity_status'] == 'Active')
-            
-            count_found_inactive += is_inactive.sum()
-            count_found_active += is_active.sum()
+        if 'status' not in df.columns: continue
+        
+        # Only process rows that weren't skipped
+        processed_df = df[df['status'].notna()]
+        stats['total_scanned'] += len(processed_df)
+        
+        # --- Calculate Counts ---
+        
+        # 1. Active (Found + Active + Enabled)
+        stats['found_active'] += len(processed_df[(processed_df['status'] == 'Found') & (processed_df['activity_status'] == 'Active')])
+        
+        # 2. Inactive (Found + Inactive + Enabled)
+        # We explicitly check activity_status != Disabled here just in case, though filtering by Inactive handles it
+        mask_inactive = (processed_df['status'] == 'Found') & ((processed_df['activity_status'] == 'Inactive') | (processed_df['activity_status'] == 'No Activity'))
+        stats['found_inactive'] += mask_inactive.sum()
+        
+        # 3. Disabled (Found + Disabled)
+        mask_disabled = (processed_df['status'] == 'Found') & (processed_df['activity_status'] == 'Disabled')
+        stats['found_disabled'] += mask_disabled.sum()
+        
+        # 4. Inferred
+        stats['inferred'] += len(processed_df[processed_df['status'] == 'Inferred'])
+        
+        # 5. Not Found
+        mask_not_found = (processed_df['status'] == 'Not Found')
+        stats['not_found'] += mask_not_found.sum()
+        
+        # 6. Errors
+        mask_error = processed_df['status'].str.startswith('API Error', na=False)
+        stats['errors'] += mask_error.sum()
 
-            # --- Filter for Excel Report (Issues Only) ---
-            # Include: Inactive, Not Found, Errors, and Inferred (for visibility)
-            mask_report = is_inactive | is_not_found | is_error | is_inferred
-            
-            if mask_report.any():
-                sub = df[mask_report].copy()
-                
-                # Update remarks for inactive items specifically
-                sub.loc[is_inactive, 'remarks'] = f'Inactive - No events in last {ACTIVITY_THRESHOLD_DAYS} days'
-                
-                sub['sheet_name'] = name
-                frames.append(sub)
+        # --- Filter for Excel Report (ACTIONABLE ISSUES ONLY) ---
+        # Exclude 'Disabled' and 'Inferred' from the attachment
+        mask_report = mask_inactive | mask_not_found | mask_error
+        
+        if mask_report.any():
+            sub = processed_df[mask_report].copy()
+            # Update remark for inactive items specifically
+            sub.loc[mask_inactive, 'remarks'] = f'Inactive - No events in last {ACTIVITY_THRESHOLD_DAYS} days'
+            sub['sheet_name'] = name
+            frames.append(sub)
 
-    # Calculate Total Found (Active + Inactive + Inferred)
-    total_found_and_inferred = count_found_active + count_found_inactive + count_inferred
-
+    # If no "Bad" items found, skip email
     if not frames:
-        print("✅ No issues found; skipping email.")
-    else:
+        print("✅ No Actionable Issues detected; skipping email.")
+        return
+
+    # Check permissions before saving report
+    try:
         result_df = pd.concat(frames, ignore_index=True)
         result_df.to_excel(draft_path, index=False)
-        print(f"💾 Report saved to: {draft_path}")
+        print(f"\n💾 Filtered report saved to: {draft_path}")
+
+        # Total Issues = Rows in the attachment (Inactive + Not Found + Errors)
+        total_issues = len(result_df)
 
         # Email Body
-        subject = f"QRadar Report - {len(result_df)} Items Flagged"
+        subject = f"QRadar Action Report - {total_issues} Issues Require Attention"
+        
         body = f"""Hello,
 
 Attached is the QRadar log source status report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.
 
-📊 EXECUTIVE SUMMARY
-----------------------------------------
-Total Assets Processed:  {count_total_processed} (Only 'In Qradar' = Yes)
-Total Found / Inferred: {total_found_and_inferred}
-Total Not Found:       {count_not_found}
-API Errors:            {count_api_errors}
+⚠️ ACTION REQUIRED: {total_issues} ISSUES
+(Count includes Inactive sources and Missing assets only. Disabled sources are excluded.)
 
-📉 HEALTH BREAKDOWN
+📊 SCAN SUMMARY
 ----------------------------------------
-✅ Active:              {count_found_active}
-⚠️ Inactive:            {count_found_inactive}  (No events in {ACTIVITY_THRESHOLD_DAYS} days)
-ℹ️ Under WLC/Forti:     {count_inferred}      (Inferred from Name)
+Total Assets Scanned:  {stats['total_scanned']} (Rows where 'In Qradar' = Yes)
 
-Please review the attached Excel file for the detailed list of inactive and missing log sources.
+🔴 ISSUES FOUND (Attached):
+   - Inactive:          {stats['found_inactive']} (Enabled but no events)
+   - Not Found:         {stats['not_found']} (Absent in QRadar)
+   - API Errors:        {stats['errors']}
+
+🟢 HEALTHY / IGNORED (Not Attached):
+   - Active:            {stats['found_active']}
+   - Disabled:          {stats['found_disabled']} (Intentionally disabled on QRadar)
+   - Under WLC/Forti:   {stats['inferred']}
+
+Please review the attached Excel file for the list of items requiring attention.
 
 Best regards,
 QRadar Automation System
 """
         create_outlook_draft(draft_path, subject, body)
+        
+    except PermissionError:
+            print(f"❌ ERROR: Could not save report to '{draft_path}'. Is the file open?")
 
 
 def main():
     if not VERIFY_SSL:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    print("🚀 Starting QRadar Log Source Checker...")
+    print("🚀 Starting QRadar Log Source Checker (Optimized)...")
     
     if not test_qradar_connection(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD):
         return
 
+    # Reading Excel
+    print(f"\n📖 Reading Excel file: {INPUT_EXCEL_PATH}")
     try:
         all_sheets = pd.read_excel(INPUT_EXCEL_PATH, sheet_name=None)
+    except PermissionError:
+        print(f"❌ ERROR: Permission Denied! The file '{INPUT_EXCEL_PATH}' is OPEN. Close it and re-run.")
+        return
+    except FileNotFoundError:
+        print(f"❌ ERROR: File not found at '{INPUT_EXCEL_PATH}'. Check the path.")
+        return
     except Exception as e:
-        print(f"❌ Failed to read Excel: {e}")
+        print(f"❌ Failed to read Excel file: {e}")
         return
 
     to_process = list(all_sheets.keys()) if SHEETS_TO_PROCESS == ['all'] else SHEETS_TO_PROCESS
@@ -415,16 +489,19 @@ def main():
             all_sheets[sheet] = process_sheet(
                 all_sheets[sheet], sheet,
                 QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD,
-                LOGSOURCE_COLUMN, IP_COLUMN
+                LOGSOURCE_COLUMN, IP_COLUMN, IN_QRADAR_COLUMN
             )
 
-    print(f"\n💾 Saving original Excel...")
+    print(f"\n💾 Saving updates to original Excel...")
     try:
         with pd.ExcelWriter(INPUT_EXCEL_PATH, engine='openpyxl') as writer:
             for name, df in all_sheets.items():
                 df.to_excel(writer, sheet_name=name, index=False)
+        print("✅ Original Excel file updated successfully.")
+    except PermissionError:
+        print(f"❌ ERROR: Permission Denied! The file '{INPUT_EXCEL_PATH}' is OPEN. Close it and re-run.")
     except Exception as e:
-        print(f"❌ Failed to save Excel: {e}")
+        print(f"❌ Failed to save Excel file: {e}")
 
     filter_and_email(all_sheets, DRAFT_OUTPUT_PATH)
     print(f"\n✅ Completed!")
