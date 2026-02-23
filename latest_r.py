@@ -6,6 +6,11 @@ import time
 import os
 import win32com.client  # For creating draft emails in Outlook
 
+# Ensure charts generate in the background without opening UI windows
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt 
+
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
 INPUT_EXCEL_PATH = r'C:\path\to\your\input.xlsx'
 SHEETS_TO_PROCESS = ['Sheet1', 'Sheet2']  # or ['all'] for all sheets
@@ -99,16 +104,11 @@ def safe_timestamp_conversion(timestamp_ms):
         return last_seen, activity_status, days_since_last_event
         
     except Exception as e:
-        # print(f"   ⚠️ Error parsing timestamp {timestamp_ms}: {e}")
         return f'Invalid timestamp: {timestamp_ms}', 'Unknown', None
 
 
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
-    """
-    Get log source details directly from the API.
-    Returns details dict or None if not found/error.
-    """
-    
+    """Get log source details directly from the API."""
     clean_identifier = str(identifier).replace('"', '').replace("'", "").strip()
     
     # Construct Filter
@@ -138,9 +138,7 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
 
         # Select Best Match
         found_source = None
-        
         if is_ip:
-            # Strict validation for IPs
             for source in ls_data:
                 params = source.get('protocol_parameters', [])
                 if any(p.get('value') == clean_identifier for p in params):
@@ -153,8 +151,6 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
 
         ls_id = found_source.get('id')
         ls_name = found_source.get('name', identifier)
-        
-        # Get last event details
         last_event_time_ms = found_source.get('last_event_time')
         last_seen, activity_status, days_since_last_event = safe_timestamp_conversion(last_event_time_ms)
         enabled = found_source.get('enabled', False)
@@ -171,72 +167,58 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         }
 
     except Exception as e:
-        return {'status': f'Error: {str(e)[:50]}...', **_empty_details()}
+        return {'status': f'API Error: {str(e)[:50]}...', **_empty_details()}
 
 
 def process_sheet(df, sheet_name, qradar_host, username, password, logsource_column, ip_column, in_qradar_col):
-    """
-    Optimized Sheet Processing:
-    1. Filters DataFrame for 'Yes' rows first.
-    2. Iterates ONLY relevant rows.
-    3. Provides detailed console output.
-    """
+    """Optimized Sheet Processing with Cleanup for skipped rows."""
     print(f"\n{'='*60}")
     print(f"📋 Processing Sheet: {sheet_name}")
     print(f"{'='*60}")
     
-    # Initialize columns if missing
+    if not df.empty:
+        df.columns = df.columns.str.strip()
+
     cols_to_init = {
-        'status': 'object',
-        'qradar_id': 'object', 
-        'enabled': 'object',
-        'last_seen': 'object',
-        'activity_status': 'object',
-        'days_since_last_event': 'float64',
-        'remarks': 'object'
+        'status': 'object', 'qradar_id': 'object', 'enabled': 'object',
+        'last_seen': 'object', 'activity_status': 'object',
+        'days_since_last_event': 'float64', 'remarks': 'object'
     }
     
     for col, dtype in cols_to_init.items():
         if col not in df.columns:
             df[col] = pd.Series(dtype=dtype)
     
-    # ─── STEP 1: EFFICIENT FILTERING ───
     if in_qradar_col not in df.columns:
-        print(f"⚠️ Column '{in_qradar_col}' not found! Skipping entire sheet.")
+        print(f"❌ ERROR: Column '{in_qradar_col}' not found. Skipping sheet.")
         return df
 
-    # Create a mask for rows where In Qradar contains "yes" (case-insensitive)
-    # Handles NaN safely
+    # Mask for target rows
     process_mask = df[in_qradar_col].astype(str).str.lower().str.contains("yes", na=False)
-    
     rows_to_process = df[process_mask]
     total_rows = len(df)
     target_count = len(rows_to_process)
     
-    print(f"📊 Total Rows: {total_rows}")
-    print(f"🎯 Rows marked 'Yes': {target_count} (Rows to scan)")
+    print(f"📊 Total Rows: {total_rows} | 🎯 Rows marked 'Yes': {target_count}")
     
-    # Mark skipped rows efficiently
+    # ─── STALE DATA CLEANUP ───
+    # If a row was changed from "Yes" to "No", we wipe its old data to avoid false alerts
     df.loc[~process_mask, 'remarks'] = "Skipped (In Qradar != Yes)"
+    df.loc[~process_mask, ['status', 'activity_status', 'last_seen', 'qradar_id', 'enabled', 'days_since_last_event']] = None
     
     if target_count == 0:
-        print("✅ No rows to process in this sheet.")
         return df
 
-    # ─── STEP 2: ITERATE ONLY TARGET ROWS ───
     current_idx = 0
-    
     for idx, row in rows_to_process.iterrows():
         current_idx += 1
         name_val = str(row[logsource_column]).strip()
         ip_val = str(row[ip_column]).strip()
         
-        # Clean cleanup
         if name_val.lower() in ['nan', 'none', '', 'null']: name_val = None
         if ip_val.lower() in ['nan', 'none', '', 'null']: ip_val = None
         
         print(f"\n🔹 [{current_idx}/{target_count}] Processing Row {idx+1}")
-        
         details = None
         search_method = "None"
         
@@ -244,181 +226,267 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         if name_val:
             print(f"   🔍 Searching Name: '{name_val}' ... ", end="")
             details = get_log_source_details(qradar_host, username, password, name_val, is_ip=False)
-            
             if details['status'] == 'Found':
                 print("✅ Found!")
                 search_method = "Name"
             else:
-                print("⚠️ Not Found.")
+                print(f"⚠️ {details['status']}")
         
-        # 2. Fallback to IP (Only if Name failed/missing)
-        if (not details or details['status'] == 'Not Found') and ip_val:
+        # 2. IP FALLBACK (Triggers if Name was not found OR if there was an API Error)
+        if (not details or details['status'] != 'Found') and ip_val:
             print(f"   🔁 Fallback to IP: '{ip_val}' ... ", end="")
             details = get_log_source_details(qradar_host, username, password, ip_val, is_ip=True)
-            
             if details['status'] == 'Found':
                 print("✅ Found!")
                 search_method = "IP"
             else:
-                print("❌ Not Found.")
+                print(f"❌ {details['status']}")
 
-        # Initialize if completely failed
         if not details:
             details = {'status': 'Empty/Invalid', **_empty_details()}
             
-        # ─── STEP 3: UPDATE DATAFRAME & DISPLAY DETAILS ───
-        
         if details['status'] == 'Found':
-            # Update Data
-            df.at[idx, 'status'] = 'Found'
-            df.at[idx, 'remarks'] = f"Found by {search_method}"
             df.at[idx, 'qradar_id'] = details['qradar_id']
             df.at[idx, 'enabled'] = details['enabled']
             df.at[idx, 'last_seen'] = details['last_seen']
-            df.at[idx, 'activity_status'] = details['activity_status']
             df.at[idx, 'days_since_last_event'] = details['days_since_last_event']
             
-            # Print Details
-            print(f"      📌 Log Source: {details['actual_name']}")
-            print(f"      📊 Activity:   {details['activity_status']}")
-            print(f"      📅 Last Event: {details['last_seen']} ({details['days_since_last_event']} days ago)")
+            if details['enabled'] == 'No':
+                final_status = 'Found'
+                final_remark = "Disabled on QRadar"
+                activity_status = "Disabled"
+            else:
+                final_status = 'Found'
+                final_remark = f"Found by {search_method}"
+                activity_status = details['activity_status']
+                
+            df.at[idx, 'status'] = final_status
+            df.at[idx, 'remarks'] = final_remark
+            df.at[idx, 'activity_status'] = activity_status
             
         else:
-            # Handle Not Found Logic
-            # Smart Inference for AP/FW
-            status_val = "Not Found"
-            remark_val = "❌ Not found by Name or IP"
-            act_val = "Not Found"
+            # Handle Errors and Not Found correctly
+            status_val = details['status'] 
+            remark_val = f"❌ {status_val}"
+            act_val = "Error" if "Error" in status_val else "Not Found"
             
             if name_val and "AP" in name_val:
-                status_val = "Inferred"
-                remark_val = "Under WLC (Inferred)"
-                act_val = "Inferred"
-                print("      ℹ️  Result: Inferred as WLC (AP in name)")
+                status_val, remark_val, act_val = "Inferred", "Under WLC (Inferred)", "Inferred"
             elif name_val and "FW" in name_val:
-                status_val = "Inferred"
-                remark_val = "Under Forti (Inferred)"
-                act_val = "Inferred"
-                print("      ℹ️  Result: Inferred as FortiGate (FW in name)")
-            else:
-                print("      ❌ Result: ABSENT in QRadar.")
+                status_val, remark_val, act_val = "Inferred", "Under Forti (Inferred)", "Inferred"
 
             df.at[idx, 'status'] = status_val
             df.at[idx, 'remarks'] = remark_val
             df.at[idx, 'activity_status'] = act_val
-            
-            # Clear other fields to be clean
             df.at[idx, 'last_seen'] = "N/A"
             df.at[idx, 'days_since_last_event'] = None
 
-        time.sleep(0.2) # Slight delay to be nice to API
+        time.sleep(0.2) 
     
     return df
 
 
-def create_outlook_draft(attachment_path, subject, body):
-    """Create Outlook draft"""
+def generate_pie_chart(data_dict, title, filename):
+    """Generates a pie chart, saves it locally, and returns the path."""
+    filtered_data = {k: v for k, v in data_dict.items() if v > 0}
+    if not filtered_data:
+        return None
+
+    labels = list(filtered_data.keys())
+    sizes = list(filtered_data.values())
+    
+    # Specific colors for clear reporting visibility
+    color_map = {
+        'Active': '#28a745',          # Green
+        'Inactive': '#dc3545',        # Red
+        'Not Found': '#6c757d',       # Grey
+        'API Errors': '#fd7e14',      # Orange
+        'Disabled/Inferred': '#17a2b8' # Teal
+    }
+    colors = [color_map.get(label, '#cccccc') for label in labels]
+
+    fig, ax = plt.subplots(figsize=(4.5, 3.5))
+    ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=140, 
+           textprops={'fontsize': 9}, wedgeprops={'edgecolor': 'white'})
+    ax.axis('equal') 
+    plt.title(title, pad=15, fontsize=11, fontweight='bold')
+    
+    filepath = os.path.join(os.path.dirname(INPUT_EXCEL_PATH), filename)
+    plt.savefig(filepath, bbox_inches='tight', dpi=100)
+    plt.close()
+    return filepath
+
+
+def create_html_outlook_draft(attachment_path, subject, html_body, image_paths):
+    """Create Outlook HTML draft with embedded images and ephemeral cleanup"""
     try:
         outlook = win32com.client.Dispatch('Outlook.Application')
         mail = outlook.CreateItem(0)
         mail.Subject = subject
-        mail.Body = body
-        mail.Attachments.Add(attachment_path)
+        
+        # Attach the Excel report
+        if os.path.exists(attachment_path):
+            mail.Attachments.Add(attachment_path)
+
+        # Attach and embed images via HTML Content-IDs
+        for cid, img_path in image_paths.items():
+            if img_path and os.path.exists(img_path):
+                attachment = mail.Attachments.Add(img_path)
+                attachment.PropertyAccessor.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid)
+        
+        mail.HTMLBody = html_body
         mail.Display()
         print(f"\n✉️  Email draft created successfully.")
+        
+        # EPHEMERAL CLEANUP: Delete the generated PNG files so they don't clutter your drive
+        for cid, img_path in image_paths.items():
+            if img_path and os.path.exists(img_path):
+                try:
+                    os.remove(img_path)
+                except Exception as e:
+                    print(f"⚠️ Could not delete temporary image {img_path}: {e}")
+                
     except Exception as e:
         print(f"\n❌ Failed to create Outlook draft: {e}")
 
 
-def filter_and_email(df_dict, draft_path):
-    """Filter results and generate report"""
-    frames = []
+def filter_and_email(processed_sheets_only, draft_path):
+    """Generates visual HTML reports and separate Excel tabs per sheet."""
+    report_frames = {}
+    sheet_stats = {}
+    images_to_embed = {}
     
-    stats = {
-        'total_scanned': 0,
-        'found_active': 0,
-        'found_inactive': 0,
-        'inferred': 0,
-        'not_found': 0,
-        'errors': 0
-    }
+    global_stats = { 'Active': 0, 'Inactive': 0, 'Not Found': 0, 'API Errors': 0, 'Disabled/Inferred': 0 }
 
-    for name, df in df_dict.items():
+    for name, df in processed_sheets_only.items():
         if 'status' not in df.columns: continue
-        
-        # Only count rows we actually touched (status is filled)
         processed_df = df[df['status'].notna()]
-        stats['total_scanned'] += len(processed_df)
         
-        # Calculate Counts
-        stats['found_active'] += len(processed_df[(processed_df['status'] == 'Found') & (processed_df['activity_status'] == 'Active')])
-        
-        inactive_mask = (processed_df['status'] == 'Found') & ((processed_df['activity_status'] == 'Inactive') | (processed_df['activity_status'] == 'No Activity'))
-        stats['found_inactive'] += len(processed_df[inactive_mask])
-        
-        stats['inferred'] += len(processed_df[processed_df['status'] == 'Inferred'])
-        stats['not_found'] += len(processed_df[processed_df['status'] == 'Not Found'])
-        stats['errors'] += processed_df['status'].str.startswith('API Error', na=False).sum()
+        if len(processed_df) == 0: continue
 
-        # Build Report DataFrame (Inactive + Not Found + Errors)
-        mask_report = inactive_mask | (processed_df['status'] == 'Not Found') | (processed_df['status'] == 'Inferred') | processed_df['status'].str.startswith('API Error', na=False)
+        # Calculate per-sheet stats
+        active = len(processed_df[(processed_df['status'] == 'Found') & (processed_df['activity_status'] == 'Active')])
+        inactive = len(processed_df[(processed_df['status'] == 'Found') & ((processed_df['activity_status'] == 'Inactive') | (processed_df['activity_status'] == 'No Activity'))])
+        disabled = len(processed_df[(processed_df['status'] == 'Found') & (processed_df['activity_status'] == 'Disabled')])
+        inferred = len(processed_df[processed_df['status'] == 'Inferred'])
+        not_found = len(processed_df[processed_df['status'] == 'Not Found'])
+        errors = processed_df['status'].astype(str).str.startswith('API Error').sum()
+
+        sheet_counts = {
+            'Active': active,
+            'Inactive': inactive,
+            'Not Found': not_found,
+            'API Errors': errors,
+            'Disabled/Inferred': disabled + inferred
+        }
         
+        sheet_stats[name] = sheet_counts
+        
+        for k in global_stats: global_stats[k] += sheet_counts[k]
+
+        # Filter actionable items for the Excel attachment
+        mask_inactive = (processed_df['status'] == 'Found') & ((processed_df['activity_status'] == 'Inactive') | (processed_df['activity_status'] == 'No Activity'))
+        mask_not_found = (processed_df['status'] == 'Not Found')
+        mask_error = processed_df['status'].astype(str).str.startswith('API Error')
+        
+        mask_report = mask_inactive | mask_not_found | mask_error
         if mask_report.any():
             sub = processed_df[mask_report].copy()
-            # Update remark for inactive specifically
-            sub.loc[inactive_mask, 'remarks'] = f"Inactive > {ACTIVITY_THRESHOLD_DAYS} days"
-            sub['sheet_name'] = name
-            frames.append(sub)
+            sub.loc[mask_inactive, 'remarks'] = f'Inactive - No events in {ACTIVITY_THRESHOLD_DAYS} days'
+            report_frames[name] = sub 
 
-    # Save and Email
-    if not frames:
-        print("✅ No issues found; skipping email.")
-    else:
-        try:
-            result_df = pd.concat(frames, ignore_index=True)
-            result_df.to_excel(draft_path, index=False)
-            print(f"\n💾 Filtered report saved: {draft_path}")
+    if not report_frames:
+        print("✅ No Actionable Issues detected; skipping email.")
+        return
 
-            total_found = stats['found_active'] + stats['found_inactive'] + stats['inferred']
-            
-            body = f"""Hello,
+    # Write actionable issues into individual tabs based on their original sheet names
+    try:
+        with pd.ExcelWriter(draft_path, engine='openpyxl') as writer:
+            for sheet_name, df in report_frames.items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+        print(f"\n💾 Filtered report saved to: {draft_path}")
+    except PermissionError:
+        print(f"❌ ERROR: Could not save report to '{draft_path}'. Is the file open?")
+        return
 
-Attached is the QRadar log source status report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.
+    # Generate Chart Images
+    overall_cid = "overall_chart"
+    overall_path = generate_pie_chart(global_stats, "Overall Inventory Status", "temp_overall.png")
+    if overall_path:
+        images_to_embed[overall_cid] = overall_path
+    
+    for name, counts in sheet_stats.items():
+        cid = f"chart_{name.replace(' ', '_')}"
+        chart_path = generate_pie_chart(counts, f"{name} Status", f"temp_{name}.png")
+        if chart_path:
+            images_to_embed[cid] = chart_path
 
-📊 EXECUTIVE SUMMARY
-----------------------------------------
-Total Assets Scanned:  {stats['total_scanned']} (Rows marked 'Yes')
-Total Found / Inferred: {total_found}
-Total Not Found:       {stats['not_found']}
-API Errors:            {stats['errors']}
+    total_issues = global_stats['Inactive'] + global_stats['Not Found'] + global_stats['API Errors']
 
-📉 HEALTH BREAKDOWN
-----------------------------------------
-✅ Active:              {stats['found_active']}
-⚠️ Inactive:            {stats['found_inactive']}  (No events in {ACTIVITY_THRESHOLD_DAYS} days)
-ℹ️ Under WLC/Forti:     {stats['inferred']}
+    # Build the HTML Body
+    html_body = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; color: #333;">
+        <h2 style="color: #0056b3;">QRadar Automation: {total_issues} Issues Require Attention</h2>
+        <p>Attached is the automated QRadar log source status report generated on <b>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</b>.</p>
+        
+        <table style="width: 100%; max-width: 600px; border-collapse: collapse; margin-bottom: 20px;">
+            <tr style="background-color: #f8f9fa;">
+                <td style="padding: 10px; border: 1px solid #dee2e6;"><b>Total Assets Scanned:</b></td>
+                <td style="padding: 10px; border: 1px solid #dee2e6;">{sum(global_stats.values())}</td>
+            </tr>
+            <tr>
+                <td style="padding: 10px; border: 1px solid #dee2e6; color: #dc3545;"><b>🔴 Actionable Issues:</b></td>
+                <td style="padding: 10px; border: 1px solid #dee2e6;"><b>{total_issues}</b></td>
+            </tr>
+        </table>
 
-Please review the attached Excel file.
+        <h3>Overall System Health</h3>
+    """
+    
+    if overall_cid in images_to_embed:
+        html_body += f'<img src="cid:{overall_cid}"><br>'
+        
+    html_body += """
+        <hr style="border: 1px solid #eee; margin: 30px 0;">
+        <h3>Breakdown by Processed Sheets</h3>
+    """
+    
+    for name, counts in sheet_stats.items():
+        cid = f"chart_{name.replace(' ', '_')}"
+        html_body += f"""
+        <div style="margin-bottom: 30px;">
+            <h4 style="margin-bottom: 5px; color: #444;">{name}</h4>
+            <ul style="list-style-type: none; padding-left: 0; margin-bottom: 10px;">
+                <li><span style="color: #dc3545; font-weight: bold;">Inactive:</span> {counts['Inactive']}</li>
+                <li><span style="color: #6c757d; font-weight: bold;">Not Found:</span> {counts['Not Found']}</li>
+                <li><span style="color: #fd7e14; font-weight: bold;">API Errors:</span> {counts['API Errors']}</li>
+                <li><span style="color: #28a745; font-weight: bold;">Active:</span> {counts['Active']}</li>
+            </ul>
+        """
+        if cid in images_to_embed:
+            html_body += f'<img src="cid:{cid}">'
+        html_body += "</div>"
 
-Best regards,
-QRadar Automation System
-"""
-            create_outlook_draft(draft_path, f"QRadar Report - {len(result_df)} Items", body)
-            
-        except PermissionError:
-             print(f"❌ ERROR: Could not save report to '{draft_path}'. Is the file open?")
+    html_body += """
+        <br><p style="font-size: 12px; color: #777;">Automated Cyber Defense Reporting</p>
+    </body>
+    </html>
+    """
+    
+    subject = f"QRadar Action Report - {total_issues} Issues Require Attention"
+    create_html_outlook_draft(draft_path, subject, html_body, images_to_embed)
 
 
 def main():
     if not VERIFY_SSL:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    print("🚀 Starting QRadar Log Source Checker (Optimized)...")
+    print("🚀 Starting Automated Cyber Defense QRadar Checker...")
     
     if not test_qradar_connection(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD):
         return
 
-    # Reading Excel
     print(f"\n📖 Reading Excel file: {INPUT_EXCEL_PATH}")
     try:
         all_sheets = pd.read_excel(INPUT_EXCEL_PATH, sheet_name=None)
@@ -442,12 +510,14 @@ def main():
             for name, df in all_sheets.items():
                 df.to_excel(writer, sheet_name=name, index=False)
         print("✅ Original Excel file updated successfully.")
-    except PermissionError:
-        print(f"❌ ERROR: Permission Denied! The file '{INPUT_EXCEL_PATH}' is OPEN. Close it and re-run.")
     except Exception as e:
         print(f"❌ Failed to save Excel file: {e}")
 
-    filter_and_email(all_sheets, DRAFT_OUTPUT_PATH)
+    # ─── STRICT SHEET ISOLATION ─── 
+    # Pass only the targeted sheets to the reporting function so old data doesn't sneak in
+    processed_sheets_only = {k: v for k, v in all_sheets.items() if k in to_process}
+    filter_and_email(processed_sheets_only, DRAFT_OUTPUT_PATH)
+    
     print(f"\n✅ Completed!")
 
 if __name__ == '__main__':
