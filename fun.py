@@ -135,7 +135,6 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
     # Construct Filter for the API call
     if is_ip:
         # IP Search: Check inside protocol_parameters OR if the IP is literally in the name
-        # NOTE: Outer parentheses are excluded to prevent 400 Bad Request syntax errors
         query_filter = f'protocol_parameters contains value="{clean_identifier}" or name ilike "%{clean_identifier}%"'
     else:
         # Name Search: Partial match using 'ilike' with wildcards
@@ -174,7 +173,7 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
                     found_source = source
                     break
             
-            # If not in parameters, fallback to the first result (caught by name ilike IP)
+            # If not in parameters, fallback to the first result
             if not found_source: 
                 found_source = ls_data[0]
         else:
@@ -261,7 +260,6 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         return df
 
     # ─── HARD RESET / PRE-RUN CLEANSE ───
-    # Initialize or empty specific columns to prevent stale data ghosting
     cols_to_init = {
         'status': 'object', 
         'qradar_id': 'object', 
@@ -607,6 +605,9 @@ def filter_and_email(processed_sheets_only, draft_path):
     </body>
     </html>
     """
+    
+    # The missing assignment that caused the NameError has been restored right here
+    subject = f"QRadar Action Report - {total_issues} Issues Require Attention"
     
     create_html_outlook_draft(draft_path, subject, html_body, images_to_embed)
 
