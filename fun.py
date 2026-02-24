@@ -458,7 +458,7 @@ def create_html_outlook_draft(attachment_path, subject, html_body, image_paths):
 def filter_and_email(processed_sheets_only, draft_path):
     """
     Calculates final SOC metrics across 6 distinct categories, generates charts,
-    saves the complete processed inventory as an Excel attachment, and structures the HTML email.
+    saves the strictly ACTIONABLE inventory as an Excel attachment, and structures the HTML email.
     """
     report_frames = {}
     sheet_stats = {}
@@ -514,17 +514,25 @@ def filter_and_email(processed_sheets_only, draft_path):
         for k in global_stats: 
             global_stats[k] += sheet_counts[k]
 
-        # Update the 'remarks' specifically for inactive items to provide clear context in the report
-        processed_df.loc[mask_inactive, 'remarks'] = f'Inactive - No events in last {ACTIVITY_THRESHOLD_DAYS} days'
+        # ─── ACTIONABLE ITEM FILTERING FOR ATTACHMENT ───
+        # Combine masks to strictly isolate devices that need attention
+        mask_report = mask_inactive | mask_not_found | mask_error
         
-        # Ensure EVERY processed log source goes into the attachment, not just errors
-        report_frames[name] = processed_df 
+        if mask_report.any():
+            # Slice only the actionable rows to be saved in the attachment
+            sub = processed_df[mask_report].copy()
+            
+            # Update the 'remarks' specifically for inactive items to provide clear context
+            sub.loc[mask_inactive, 'remarks'] = f'Inactive - No events in last {ACTIVITY_THRESHOLD_DAYS} days'
+            
+            # Add this isolated DataFrame to our report compiler
+            report_frames[name] = sub 
 
     if not report_frames:
         print("✅ No Actionable Issues detected; skipping email.")
         return
 
-    # Generate the comprehensive multi-tab Excel attachment
+    # Generate the comprehensive multi-tab Excel attachment containing ONLY actionable items
     try:
         with pd.ExcelWriter(draft_path, engine='openpyxl') as writer:
             for sheet_name, df in report_frames.items():
@@ -554,10 +562,10 @@ def filter_and_email(processed_sheets_only, draft_path):
     <html>
     <body style="font-family: Arial, sans-serif; color: #333;">
         <h2 style="color: #0056b3;">QRadar Action Report - {total_issues} Issues Require Attention</h2>
-        <p>Attached is the full QRadar log source status report generated on <b>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</b>.</p>
+        <p>Attached is the automated QRadar log source status report generated on <b>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</b>.</p>
         
         <p>⚠️ <b>ACTION REQUIRED: {total_issues} ISSUES</b><br>
-        (Count includes Inactive sources and Missing assets only. The attached Excel file contains <b>all scanned assets</b> for your review.)</p>
+        (Count includes Inactive sources and Missing assets only. The attached Excel file contains <b>only the actionable items</b> that require your review.)</p>
         
         <table style="width: 100%; max-width: 600px; border-collapse: collapse; margin-bottom: 20px;">
             <tr style="background-color: #f8f9fa;">
@@ -606,7 +614,6 @@ def filter_and_email(processed_sheets_only, draft_path):
     </html>
     """
     
-    # The missing assignment that caused the NameError has been restored right here
     subject = f"QRadar Action Report - {total_issues} Issues Require Attention"
     
     create_html_outlook_draft(draft_path, subject, html_body, images_to_embed)
