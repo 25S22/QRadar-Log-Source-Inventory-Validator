@@ -6,6 +6,7 @@ import time
 import os
 import win32com.client
 import openpyxl
+from openpyxl.styles import PatternFill
 import concurrent.futures
 
 # Ensure charts generate in the background without opening UI windows
@@ -19,19 +20,28 @@ SHEETS_TO_PROCESS = ['Sheet1', 'Sheet2']  # or ['all'] for all sheets
 LOGSOURCE_COLUMN = 'log source name'
 IP_COLUMN = 'IP'
 IN_QRADAR_COLUMN = 'In Qradar?'  # Must contain "Yes" to be processed
+
 QRADAR_HOST = 'https://your-qradar-host'
 QRADAR_USERNAME = 'your-username'
 QRADAR_PASSWORD = 'your-password'
 VERIFY_SSL = False
+
 DRAFT_OUTPUT_PATH = os.path.join(os.path.dirname(INPUT_EXCEL_PATH), 'inactive_and_errors.xlsx')
 ACTIVITY_THRESHOLD_DAYS = 7  # Consider log source inactive if no events in X days
 REQUEST_TIMEOUT = 30
 MAX_WORKERS = 10  # Number of simultaneous API requests to QRadar
+
+# Expected Log Source Types. Anything else found will be HIGHLIGHTED YELLOW in Excel
+EXPECTED_LS_TYPES = ['Microsoft Security Event Log', 'Linux OS']
+
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
 
 # Valid timestamp range for QRadar API responses
 MIN_TIMESTAMP = 0
 MAX_TIMESTAMP = 2147483647
+
+# Global Cache to prevent API DDOS when resolving Log Source Type IDs
+LOG_SOURCE_TYPES_CACHE = {}
 
 
 def test_qradar_connection(qradar_host, username, password):
@@ -69,6 +79,42 @@ def test_qradar_connection(qradar_host, username, password):
         return False
 
 
+def fetch_log_source_types(qradar_host, username, password):
+    """
+    PRE-FETCH CACHE: Downloads the master dictionary of Log Source Type IDs 
+    to their string Names so worker threads don't have to constantly query the API.
+    """
+    print("📥 Fetching Log Source Types Dictionary into memory...")
+    qradar_host = qradar_host.rstrip('/')
+    endpoint = f"{qradar_host}/api/config/event_sources/log_source_management/log_source_types"
+    
+    try:
+        resp = requests.get(
+            endpoint,
+            auth=(username, password),
+            verify=VERIFY_SSL,
+            timeout=REQUEST_TIMEOUT,
+            headers={
+                'Accept': 'application/json', 
+                'Version': '14.0'
+            }
+        )
+        
+        if resp.status_code == 200:
+            types_data = resp.json()
+            for t in types_data:
+                ls_id = t.get('id')
+                ls_name = t.get('name')
+                if ls_id is not None and ls_name is not None:
+                    LOG_SOURCE_TYPES_CACHE[ls_id] = ls_name
+            print(f"✅ Successfully cached {len(LOG_SOURCE_TYPES_CACHE)} Log Source Types.")
+        else:
+            print(f"⚠️ Failed to fetch Log Source Types. API returned {resp.status_code}.")
+            
+    except Exception as e:
+        print(f"❌ Error fetching Log Source Types: {e}")
+
+
 def _empty_details():
     """
     Return an empty details structure to ensure dictionary keys 
@@ -79,7 +125,9 @@ def _empty_details():
         'enabled': 'Unknown',
         'last_seen': 'N/A',
         'activity_status': 'Not Found',
-        'days_since_last_event': None
+        'days_since_last_event': None,
+        'actual_name': 'N/A',
+        'ls_type': 'N/A'
     }
 
 
@@ -128,7 +176,8 @@ def safe_timestamp_conversion(timestamp_ms):
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
     """
     Get log source details directly from the QRadar API.
-    Returns a details dictionary or None if not found/error.
+    Implements the SMART SELECTION ALGORITHM to prioritize active/enabled devices
+    and map the Log Source Type from the global cache.
     """
     clean_identifier = str(identifier).replace('"', '').replace("'", "").strip()
     
@@ -163,25 +212,51 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         if not ls_data:
             return {'status': 'Not Found', **_empty_details()}
 
-        found_source = None
-        
+        # ─── 1. PRE-FILTER VALID MATCHES ───
+        valid_sources = []
         if is_ip:
-            # Try strict validation for IPs first
-            for source in ls_data:
-                params = source.get('protocol_parameters', [])
-                if any(p.get('value') == clean_identifier for p in params):
-                    found_source = source
-                    break
-            
-            # If not in parameters, fallback to the first result
-            if not found_source: 
-                found_source = ls_data[0]
+            # Ensure the API didn't hand us garbage; strictly validate the IP is present
+            for src in ls_data:
+                params = src.get('protocol_parameters', [])
+                in_params = any(p.get('value') == clean_identifier for p in params)
+                in_name = clean_identifier.lower() in str(src.get('name', '')).lower()
+                
+                if in_params or in_name:
+                    valid_sources.append(src)
         else:
-            # If searching by name, take the first valid match
-            found_source = ls_data[0]
+            valid_sources = ls_data
 
+        if not valid_sources:
+            return {'status': 'Not Found', **_empty_details()}
+
+        # ─── 2. SMART SELECTION ALGORITHM ───
+        # Separate into buckets
+        enabled_sources = []
+        disabled_sources = []
+        
+        for src in valid_sources:
+            if src.get('enabled') is True:
+                enabled_sources.append(src)
+            else:
+                disabled_sources.append(src)
+                
+        # Sort both buckets by last_event_time (Descending)
+        enabled_sources.sort(key=lambda x: x.get('last_event_time') or 0, reverse=True)
+        disabled_sources.sort(key=lambda x: x.get('last_event_time') or 0, reverse=True)
+        
+        # Prioritize the most recent Enabled source. Fall back to Disabled only if no Enabled sources exist.
+        if enabled_sources:
+            found_source = enabled_sources[0]
+        else:
+            found_source = disabled_sources[0]
+
+        # ─── 3. EXTRACT DETAILS ───
         ls_id = found_source.get('id')
         ls_name = found_source.get('name', identifier)
+        type_id = found_source.get('type_id')
+        
+        # Map the Log Source Type from our global cache
+        ls_type_name = LOG_SOURCE_TYPES_CACHE.get(type_id, f"Unknown Type ID: {type_id}")
         
         last_event_time_ms = found_source.get('last_event_time')
         last_seen, activity_status, days_since_last_event = safe_timestamp_conversion(last_event_time_ms)
@@ -197,6 +272,7 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
             'status': 'Found',
             'qradar_id': str(ls_id) if ls_id is not None else '',
             'actual_name': ls_name,
+            'ls_type': ls_type_name,
             'enabled': enabled_str,
             'last_seen': last_seen,
             'activity_status': activity_status,
@@ -260,6 +336,7 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         return df
 
     # ─── HARD RESET / PRE-RUN CLEANSE ───
+    # Initialize all standard and new output columns
     cols_to_init = {
         'status': 'object', 
         'qradar_id': 'object', 
@@ -267,7 +344,9 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         'last_seen': 'object', 
         'activity_status': 'object',
         'days_since_last_event': 'float64', 
-        'remarks': 'object'
+        'remarks': 'object',
+        'QRadar Actual Name': 'object',
+        'Log Source Type': 'object'
     }
     
     for col, dtype in cols_to_init.items():
@@ -317,6 +396,10 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
             
             print(f"\n🔹 [{processed_count}/{target_count}] Resolving: {name_val or 'Unknown'} -> {details['status']}")
             
+            # Write the new audit columns regardless of success/fail status
+            df.at[idx, 'QRadar Actual Name'] = details['actual_name']
+            df.at[idx, 'Log Source Type'] = details['ls_type']
+            
             if details['status'] == 'Found':
                 df.at[idx, 'qradar_id'] = details['qradar_id']
                 df.at[idx, 'enabled'] = details['enabled']
@@ -333,7 +416,7 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
                     df.at[idx, 'status'] = 'Found'
                     df.at[idx, 'remarks'] = f"Found by {search_method}"
                     df.at[idx, 'activity_status'] = details['activity_status']
-                    print(f"      📌 Log Source: {details['actual_name']}")
+                    print(f"      📌 Log Source: {details['actual_name']} [{details['ls_type']}]")
                     print(f"      📊 Activity:   {details['activity_status']}")
                     print(f"      📅 Last Event: {details['last_seen']} ({details['days_since_last_event']} days ago)")
                     
@@ -623,10 +706,13 @@ def save_surgical_updates_to_excel(filepath, processed_dataframes):
     """
     SURGICAL SAVE: Opens the original workbook with openpyxl and updates 
     only the specific status columns. Preserves all original hostnames, formulas, and formatting.
-    Also implements NaN value scrubbing to prevent data corruption.
+    Implements NaN scrubbing AND the Dynamic Yellow Highlight for unexpected Log Source Types.
     """
     try:
         wb = openpyxl.load_workbook(filepath)
+        
+        # Initialize the yellow highlight style
+        yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
         
         cols_to_update = [
             'status', 
@@ -635,7 +721,9 @@ def save_surgical_updates_to_excel(filepath, processed_dataframes):
             'last_seen', 
             'activity_status', 
             'days_since_last_event', 
-            'remarks'
+            'remarks',
+            'QRadar Actual Name',
+            'Log Source Type'
         ]
         
         for sheet_name, df in processed_dataframes.items():
@@ -671,7 +759,14 @@ def save_surgical_updates_to_excel(filepath, processed_dataframes):
                     if pd.isna(val):
                         val = ""
                         
-                    ws.cell(row=excel_row, column=col_map[c]).value = val
+                    target_cell = ws.cell(row=excel_row, column=col_map[c])
+                    target_cell.value = val
+                    
+                    # ─── THE YELLOW HIGHLIGHTER ───
+                    # If the column is Log Source Type, the device was Found, and it is NOT in our expected list
+                    if c == 'Log Source Type' and val != "" and val != "N/A":
+                        if val not in EXPECTED_LS_TYPES:
+                            target_cell.fill = yellow_fill
                     
         wb.save(filepath)
         print("✅ Original Excel file updated surgically (Formulas and original data preserved!).")
@@ -690,6 +785,9 @@ def main():
     
     if not test_qradar_connection(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD):
         return
+        
+    # Pre-fetch the Log Source Types dictionary to speed up processing
+    fetch_log_source_types(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD)
 
     print(f"\n📖 Reading Excel file: {INPUT_EXCEL_PATH}")
     
