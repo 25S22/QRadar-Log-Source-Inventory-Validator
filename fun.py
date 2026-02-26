@@ -31,7 +31,9 @@ ACTIVITY_THRESHOLD_DAYS = 7  # Consider log source inactive if no events in X da
 REQUEST_TIMEOUT = 30
 MAX_WORKERS = 10  # Number of simultaneous API requests to QRadar
 
-# Expected Log Source Types. Anything else found will be HIGHLIGHTED YELLOW in Excel
+# Expected Log Source Types. 
+# Anything else found will be HIGHLIGHTED YELLOW. 
+# If an expected type is found but it's older than an unexpected one, it gets HIGHLIGHTED RED.
 EXPECTED_LS_TYPES = ['Microsoft Security Event Log', 'Linux OS']
 
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
@@ -127,7 +129,8 @@ def _empty_details():
         'activity_status': 'Not Found',
         'days_since_last_event': None,
         'actual_name': 'N/A',
-        'ls_type': 'N/A'
+        'ls_type': 'N/A',
+        'is_older_expected': False  # Flag to trigger the RED highlight in Excel
     }
 
 
@@ -176,17 +179,14 @@ def safe_timestamp_conversion(timestamp_ms):
 def get_log_source_details(qradar_host, username, password, identifier, is_ip=False):
     """
     Get log source details directly from the QRadar API.
-    Implements the SMART SELECTION ALGORITHM to prioritize active/enabled devices
-    and map the Log Source Type from the global cache.
+    Implements the AGGRESSIVE TYPE-PRIORITY OVERRIDE to prioritize 
+    Expected Types over newer Unexpected Types (like WinCollect).
     """
     clean_identifier = str(identifier).replace('"', '').replace("'", "").strip()
     
-    # Construct Filter for the API call
     if is_ip:
-        # IP Search: Check inside protocol_parameters OR if the IP is literally in the name
         query_filter = f'protocol_parameters contains value="{clean_identifier}" or name ilike "%{clean_identifier}%"'
     else:
-        # Name Search: Partial match using 'ilike' with wildcards
         query_filter = f'name ilike "%{clean_identifier}%"'
     
     ls_endpoint = f"{qradar_host.rstrip('/')}/api/config/event_sources/log_source_management/log_sources"
@@ -215,7 +215,6 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         # ─── 1. PRE-FILTER VALID MATCHES ───
         valid_sources = []
         if is_ip:
-            # Ensure the API didn't hand us garbage; strictly validate the IP is present
             for src in ls_data:
                 params = src.get('protocol_parameters', [])
                 in_params = any(p.get('value') == clean_identifier for p in params)
@@ -229,8 +228,7 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         if not valid_sources:
             return {'status': 'Not Found', **_empty_details()}
 
-        # ─── 2. SMART SELECTION ALGORITHM ───
-        # Separate into buckets
+        # ─── 2. BUCKET BY ENABLED STATUS ───
         enabled_sources = []
         disabled_sources = []
         
@@ -244,29 +242,45 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
         enabled_sources.sort(key=lambda x: x.get('last_event_time') or 0, reverse=True)
         disabled_sources.sort(key=lambda x: x.get('last_event_time') or 0, reverse=True)
         
-        # Prioritize the most recent Enabled source. Fall back to Disabled only if no Enabled sources exist.
-        if enabled_sources:
-            found_source = enabled_sources[0]
-        else:
-            found_source = disabled_sources[0]
+        # ─── 3. AGGRESSIVE TYPE-PRIORITY OVERRIDE ───
+        found_source = None
+        is_older_expected = False
+        
+        # We always check the Enabled bucket first
+        active_bucket = enabled_sources if enabled_sources else disabled_sources
+        
+        if active_bucket:
+            # The absolute most recent time of ANY log source in this bucket
+            max_recent_time = active_bucket[0].get('last_event_time') or 0
+            
+            # Scan down the list to find the first one that is an EXPECTED type
+            expected_src = None
+            for src in active_bucket:
+                type_name = LOG_SOURCE_TYPES_CACHE.get(src.get('type_id'), "")
+                if type_name in EXPECTED_LS_TYPES:
+                    expected_src = src
+                    break
+            
+            if expected_src:
+                found_source = expected_src
+                # If we bypassed a newer, unexpected source to get here, flag it for the RED highlight
+                if (found_source.get('last_event_time') or 0) < max_recent_time:
+                    is_older_expected = True
+            else:
+                # If no expected types exist at all, we fall back to the absolute most recent one
+                found_source = active_bucket[0]
 
-        # ─── 3. EXTRACT DETAILS ───
+        # ─── 4. EXTRACT FINAL DETAILS ───
         ls_id = found_source.get('id')
         ls_name = found_source.get('name', identifier)
         type_id = found_source.get('type_id')
         
-        # Map the Log Source Type from our global cache
         ls_type_name = LOG_SOURCE_TYPES_CACHE.get(type_id, f"Unknown Type ID: {type_id}")
         
         last_event_time_ms = found_source.get('last_event_time')
         last_seen, activity_status, days_since_last_event = safe_timestamp_conversion(last_event_time_ms)
         
-        enabled = found_source.get('enabled', False)
-        
-        if enabled:
-            enabled_str = 'Yes'
-        else:
-            enabled_str = 'No'
+        enabled_str = 'Yes' if found_source.get('enabled', False) else 'No'
             
         return {
             'status': 'Found',
@@ -276,7 +290,8 @@ def get_log_source_details(qradar_host, username, password, identifier, is_ip=Fa
             'enabled': enabled_str,
             'last_seen': last_seen,
             'activity_status': activity_status,
-            'days_since_last_event': days_since_last_event
+            'days_since_last_event': days_since_last_event,
+            'is_older_expected': is_older_expected
         }
 
     except Exception as e:
@@ -346,7 +361,8 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
         'days_since_last_event': 'float64', 
         'remarks': 'object',
         'QRadar Actual Name': 'object',
-        'Log Source Type': 'object'
+        'Log Source Type': 'object',
+        'Is Older Expected': 'bool'  # Hidden logic column for the Excel Highlighter
     }
     
     for col, dtype in cols_to_init.items():
@@ -396,9 +412,10 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
             
             print(f"\n🔹 [{processed_count}/{target_count}] Resolving: {name_val or 'Unknown'} -> {details['status']}")
             
-            # Write the new audit columns regardless of success/fail status
+            # Always map the audit columns
             df.at[idx, 'QRadar Actual Name'] = details['actual_name']
             df.at[idx, 'Log Source Type'] = details['ls_type']
+            df.at[idx, 'Is Older Expected'] = details.get('is_older_expected', False)
             
             if details['status'] == 'Found':
                 df.at[idx, 'qradar_id'] = details['qradar_id']
@@ -406,15 +423,23 @@ def process_sheet(df, sheet_name, qradar_host, username, password, logsource_col
                 df.at[idx, 'last_seen'] = details['last_seen']
                 df.at[idx, 'days_since_last_event'] = details['days_since_last_event']
                 
+                # Base remark depending on the search method
+                base_remark = f"Found by {search_method}"
+                
+                # Append a warning if we had to bypass a newer, unexpected source
+                if details.get('is_older_expected'):
+                    base_remark += " | ⚠️ Bypassed newer unexpected source"
+                    print(f"      🚨 WARNING: Bypassed a newer unexpected log source to lock onto this expected one!")
+
                 if details['enabled'] == 'No':
                     df.at[idx, 'status'] = 'Found'
                     df.at[idx, 'remarks'] = "Disabled on QRadar"
                     df.at[idx, 'activity_status'] = "Disabled"
-                    print(f"      📌 Log Source: {details['actual_name']}")
+                    print(f"      📌 Log Source: {details['actual_name']} [{details['ls_type']}]")
                     print(f"      ⚪ Status:     Disabled (Ignored for Inactivity)")
                 else:
                     df.at[idx, 'status'] = 'Found'
-                    df.at[idx, 'remarks'] = f"Found by {search_method}"
+                    df.at[idx, 'remarks'] = base_remark
                     df.at[idx, 'activity_status'] = details['activity_status']
                     print(f"      📌 Log Source: {details['actual_name']} [{details['ls_type']}]")
                     print(f"      📊 Activity:   {details['activity_status']}")
@@ -619,6 +644,9 @@ def filter_and_email(processed_sheets_only, draft_path):
     try:
         with pd.ExcelWriter(draft_path, engine='openpyxl') as writer:
             for sheet_name, df in report_frames.items():
+                # Drop the backend hidden column from the attachment before saving
+                if 'Is Older Expected' in df.columns:
+                    df = df.drop(columns=['Is Older Expected'])
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
     except PermissionError:
         print(f"❌ ERROR: Could not save report to '{draft_path}'. Is the file open?")
@@ -704,15 +732,15 @@ def filter_and_email(processed_sheets_only, draft_path):
 
 def save_surgical_updates_to_excel(filepath, processed_dataframes):
     """
-    SURGICAL SAVE: Opens the original workbook with openpyxl and updates 
-    only the specific status columns. Preserves all original hostnames, formulas, and formatting.
-    Implements NaN scrubbing AND the Dynamic Yellow Highlight for unexpected Log Source Types.
+    SURGICAL SAVE & HIGHLIGHTER: Opens the original workbook with openpyxl and updates 
+    only the specific status columns. Evaluates conditional highlighting.
     """
     try:
         wb = openpyxl.load_workbook(filepath)
         
-        # Initialize the yellow highlight style
-        yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+        # Define Highlighter Colors
+        red_fill = PatternFill(start_color='FF6666', end_color='FF6666', fill_type='solid') # Soft Red
+        yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid') # Bright Yellow
         
         cols_to_update = [
             'status', 
@@ -721,8 +749,8 @@ def save_surgical_updates_to_excel(filepath, processed_dataframes):
             'last_seen', 
             'activity_status', 
             'days_since_last_event', 
-            'remarks',
-            'QRadar Actual Name',
+            'remarks', 
+            'QRadar Actual Name', 
             'Log Source Type'
         ]
         
@@ -731,7 +759,6 @@ def save_surgical_updates_to_excel(filepath, processed_dataframes):
                 continue
                 
             ws = wb[sheet_name]
-            
             header_row = 1
             col_map = {}
             
@@ -748,9 +775,12 @@ def save_surgical_updates_to_excel(filepath, processed_dataframes):
                     col_map[c] = new_col_idx
                     ws.cell(row=header_row, column=new_col_idx).value = c
             
-            # Align Pandas index with Excel rows (assuming headers are strictly on Row 1)
+            # Align Pandas index with Excel rows
             for idx, row in df.iterrows():
                 excel_row = idx + 2  
+                
+                # Fetch the hidden logic flag directly from the Pandas Row
+                is_older_expected = row.get('Is Older Expected', False)
                 
                 for c in cols_to_update:
                     val = row[c]
@@ -762,14 +792,17 @@ def save_surgical_updates_to_excel(filepath, processed_dataframes):
                     target_cell = ws.cell(row=excel_row, column=col_map[c])
                     target_cell.value = val
                     
-                    # ─── THE YELLOW HIGHLIGHTER ───
-                    # If the column is Log Source Type, the device was Found, and it is NOT in our expected list
+                    # ─── THE CONDITIONAL HIGHLIGHTER ───
                     if c == 'Log Source Type' and val != "" and val != "N/A":
-                        if val not in EXPECTED_LS_TYPES:
+                        if is_older_expected:
+                            # 1. Expected type, but older than an unexpected type (RED)
+                            target_cell.fill = red_fill
+                        elif val not in EXPECTED_LS_TYPES:
+                            # 2. Complete rogue type, not in our expected list at all (YELLOW)
                             target_cell.fill = yellow_fill
                     
         wb.save(filepath)
-        print("✅ Original Excel file updated surgically (Formulas and original data preserved!).")
+        print("✅ Original Excel file updated surgically (Formulas, original data, and Conditional Formatting applied!).")
         
     except PermissionError:
         print(f"❌ ERROR: Permission Denied! The file '{filepath}' is OPEN. Close it and re-run to save changes.")
@@ -790,7 +823,6 @@ def main():
     fetch_log_source_types(QRADAR_HOST, QRADAR_USERNAME, QRADAR_PASSWORD)
 
     print(f"\n📖 Reading Excel file: {INPUT_EXCEL_PATH}")
-    
     try:
         all_sheets = pd.read_excel(INPUT_EXCEL_PATH, sheet_name=None)
     except Exception as e:
@@ -808,7 +840,7 @@ def main():
         if sheet in all_sheets:
             all_sheets[sheet] = process_sheet(
                 all_sheets[sheet], 
-                sheet,
+                sheet, 
                 QRADAR_HOST, 
                 QRADAR_USERNAME, 
                 QRADAR_PASSWORD,
