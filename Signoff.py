@@ -41,9 +41,14 @@ YOUR_EMAIL_ADDRESS = 'youremail@yourorg.com'
 TRIGGER_DL = '@SOC-DL@yourorg.com'
 
 # Outlook folder names
-INBOX_FOLDER_NAME  = 'Inbox'    # folder to monitor
-DRAFTS_FOLDER_NAME = 'Drafts'   # where drafts are saved
-SENT_FOLDER_NAME   = 'Sent Items'
+# Set SIGNOFF_FOLDER_NAME to the dedicated subfolder under Inbox where your
+# Outlook rule routes signoff emails. If you have not created a rule yet and
+# want to scan the full Inbox temporarily, set this to None.
+# Example: 'SIEM Signoffs' → scans Inbox\SIEM Signoffs only
+SIGNOFF_FOLDER_NAME = 'SIEM Signoffs'   # set to None to scan full Inbox
+
+DRAFTS_FOLDER_NAME = 'Drafts'           # leave as-is unless using a custom drafts folder
+SENT_FOLDER_NAME   = 'Sent Items'       # leave as-is unless using a custom sent folder
 
 # Where the run log is written — one log file, appended on every run
 RUN_LOG_PATH = r'C:\path\to\your\signoff_runner.log'
@@ -481,13 +486,29 @@ def get_outlook_folders():
     """
     Connects to the running Outlook instance and returns the three required folders.
     Exits cleanly if Outlook is not open — emails are left completely untouched.
+
+    If SIGNOFF_FOLDER_NAME is set, opens that subfolder under Inbox.
+    If SIGNOFF_FOLDER_NAME is None, falls back to the full Inbox.
     """
     try:
-        outlook  = win32com.client.Dispatch('Outlook.Application')
-        ns       = outlook.GetNamespace('MAPI')
-        inbox    = ns.GetDefaultFolder(6)   # 6 = Inbox
-        drafts   = ns.GetDefaultFolder(16)  # 16 = Drafts
-        sent     = ns.GetDefaultFolder(5)   # 5  = Sent Items
+        outlook    = win32com.client.Dispatch('Outlook.Application')
+        ns         = outlook.GetNamespace('MAPI')
+        main_inbox = ns.GetDefaultFolder(6)   # 6 = Inbox
+        drafts     = ns.GetDefaultFolder(16)  # 16 = Drafts
+        sent       = ns.GetDefaultFolder(5)   # 5  = Sent Items
+
+        if SIGNOFF_FOLDER_NAME:
+            try:
+                inbox = main_inbox.Folders[SIGNOFF_FOLDER_NAME]
+                _log(f"📁 Monitoring subfolder: Inbox\\{SIGNOFF_FOLDER_NAME}")
+            except Exception:
+                _log(f"⚠️  Subfolder '{SIGNOFF_FOLDER_NAME}' not found — "
+                     f"falling back to full Inbox. Create the Outlook rule first.")
+                inbox = main_inbox
+        else:
+            inbox = main_inbox
+            _log("📁 Monitoring: Full Inbox (no subfolder configured)")
+
         return inbox, drafts, sent
 
     except Exception as e:
@@ -544,6 +565,7 @@ def main():
     _log(f"   Lookback   : {LOOKBACK_HOURS}h  |  Keyword: '{SUBJECT_KEYWORD}'")
     _log(f"   Separator  : '{SUBJECT_SEPARATOR}'  |  Allowed senders: {len(ALLOWED_SENDERS)}")
     _log(f"   Trigger DL : '{TRIGGER_DL}' (must appear in email body)")
+    _log(f"   Folder     : '{SIGNOFF_FOLDER_NAME or 'Full Inbox'}'")
     _log(f"   MODE       : DRAFT ONLY — nothing is sent automatically")
 
     # ── Lockfile ──
@@ -571,8 +593,13 @@ def main():
         skipped   = 0
         drafted   = 0
 
-        # Collect items first to avoid COM collection mutation during iteration
-        inbox_items = list(inbox.Items)
+        # Collect only emails within the lookback window using Outlook's
+        # Restrict method — filters at COM level before loading into Python.
+        # Far faster than loading all items and filtering in Python.
+        cutoff_str  = cutoff_time.strftime('%m/%d/%Y %H:%M %p')
+        inbox_items = list(inbox.Items.Restrict(
+            f"[ReceivedTime] >= '{cutoff_str}'"
+        ))
 
         for mail_item in inbox_items:
 
