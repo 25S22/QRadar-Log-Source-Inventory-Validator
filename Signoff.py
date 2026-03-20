@@ -23,12 +23,8 @@ LOOKBACK_HOURS = 24
 # Sender allowlist — only these addresses trigger a draft.
 # Use exact addresses OR @domain entries for whole-domain matching.
 # Example: 'analyst@org.com' or '@soc.org.com'
-ALLOWED_SENDERS = [
-    'analyst1@yourorg.com',
-    'analyst2@yourorg.com',
-    'youremail@yourorg.com',       # add your own for testing
-    '@soc.yourorg.com',            # whole domain example
-]
+# Leave EMPTY to allow all senders — all other checks remain active.
+ALLOWED_SENDERS = []
 
 # Your own reply address — used to guard against processing your own sent items
 # that may appear in the inbox (e.g. on shared mailboxes)
@@ -324,7 +320,13 @@ def is_sender_allowed(sender_address):
     Checks sender against ALLOWED_SENDERS.
     Supports exact address matching and @domain wildcard matching.
     Case-insensitive on both sides.
+
+    If ALLOWED_SENDERS is empty, all senders are allowed — all other
+    checks (subject guards, DL in body, conversation deduplication) remain active.
     """
+    if not ALLOWED_SENDERS:
+        return True   # empty list = allow all senders, no restriction
+
     if not sender_address:
         return False
 
@@ -563,7 +565,8 @@ def main():
     _log("=" * 60)
     _log("🚀 QRadar Signoff Auto-Draft starting...")
     _log(f"   Lookback   : {LOOKBACK_HOURS}h  |  Keyword: '{SUBJECT_KEYWORD}'")
-    _log(f"   Separator  : '{SUBJECT_SEPARATOR}'  |  Allowed senders: {len(ALLOWED_SENDERS)}")
+    _log(f"   Separator  : '{SUBJECT_SEPARATOR}'  |  "
+         f"Allowed senders: {'ALL' if not ALLOWED_SENDERS else len(ALLOWED_SENDERS)}")
     _log(f"   Trigger DL : '{TRIGGER_DL}' (must appear in email body)")
     _log(f"   Folder     : '{SIGNOFF_FOLDER_NAME or 'Full Inbox'}'")
     _log(f"   MODE       : DRAFT ONLY — nothing is sent automatically")
