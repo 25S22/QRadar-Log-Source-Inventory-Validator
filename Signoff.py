@@ -56,42 +56,14 @@ LOCKFILE_PATH = r'C:\path\to\your\signoff.lock'
 REQUEST_TIMEOUT = 30
 
 # ─── REPLY TEMPLATES ───────────────────────────────────────────────────────────
-# Edit the wording to match your organisation's language exactly.
-# Available placeholders for all three templates:
-#   {hostname}   — the hostname extracted from the subject
-#   {last_seen}  — formatted datetime of last event (Active/Inactive only)
-#   {days_ago}   — number of days since last event (Active/Inactive only)
-#   {ls_type}    — QRadar Log Source Type string (Active/Inactive only)
-#   {ls_name}    — QRadar actual log source name as it appears in QRadar
-
-REPLY_ACTIVE = (
-    "Hi,\n\n"
-    "{hostname} is confirmed reporting in SIEM.\n\n"
-    "Log Source Name : {ls_name}\n"
-    "Log Source Type : {ls_type}\n"
-    "Last Event      : {last_seen} ({days_ago} days ago)\n\n"
-    "Regards,\n"
-    "Automated SOC Response"
-)
-
-REPLY_INACTIVE = (
-    "Hi,\n\n"
-    "{hostname} was found in SIEM but has not reported recently.\n\n"
-    "Log Source Name : {ls_name}\n"
-    "Log Source Type : {ls_type}\n"
-    "Last Event      : {last_seen} ({days_ago} days ago)\n\n"
-    "Please investigate why this source has gone silent.\n\n"
-    "Regards,\n"
-    "Automated SOC Response"
-)
-
-REPLY_NOT_FOUND = (
-    "Hi,\n\n"
-    "{hostname} was not found in the QRadar log source inventory.\n\n"
-    "Please ensure the asset is onboarded and configured correctly in SIEM.\n\n"
-    "Regards,\n"
-    "Automated SOC Response"
-)
+# The reply wording is built in _build_reply_html() below the config block.
+# Three scenarios are handled automatically:
+#   Active      — green banner, confirmed reporting, log source details shown
+#   Inactive    — amber banner, found but not reporting, details + warning shown
+#   Not Found   — red banner, not in QRadar inventory
+#
+# To change wording, edit the summary_line strings inside _build_reply_html().
+# Placeholders available: hostname, actual_name, ls_type, last_seen, days_since_last_event
 
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
 
@@ -432,48 +404,148 @@ def is_already_handled(mail_item, sent_folder, drafts_folder):
     return False, "not handled"
 
 
+def _build_reply_html(hostname, qradar_result):
+    """
+    Builds a clean, professional HTML reply body.
+    No dark themes — looks like a well-formatted human reply.
+    Status row colour changes based on Active / Inactive / Not Found.
+    """
+    status   = qradar_result.get('status')
+    activity = qradar_result.get('activity_status', '')
+
+    # Status indicator
+    if status != 'Found':
+        status_color = '#c0392b'
+        status_label = '✖  Not Found in QRadar'
+        detail_rows  = ''
+        summary_line = (
+            f"<b>{hostname}</b> was <b>not found</b> in the QRadar log source inventory. "
+            f"Please ensure the asset is onboarded and configured correctly in SIEM."
+        )
+    elif activity == 'Active':
+        status_color = '#1a7a4a'
+        status_label = '✔  Reporting in SIEM'
+        summary_line = f"<b>{hostname}</b> is confirmed reporting in SIEM."
+        detail_rows  = f"""
+        <tr>
+          <td style="padding:7px 12px;color:#555;font-size:13px;border-bottom:1px solid #eee;
+                     width:160px;">Log Source Name</td>
+          <td style="padding:7px 12px;font-size:13px;border-bottom:1px solid #eee;
+                     font-weight:600;color:#222;">{qradar_result.get('actual_name','N/A')}</td>
+        </tr>
+        <tr>
+          <td style="padding:7px 12px;color:#555;font-size:13px;border-bottom:1px solid #eee;">
+            Log Source Type</td>
+          <td style="padding:7px 12px;font-size:13px;border-bottom:1px solid #eee;
+                     color:#333;">{qradar_result.get('ls_type','N/A')}</td>
+        </tr>
+        <tr>
+          <td style="padding:7px 12px;color:#555;font-size:13px;">Last Event</td>
+          <td style="padding:7px 12px;font-size:13px;color:#333;">
+            {qradar_result.get('last_seen','N/A')}
+            &nbsp;<span style="color:#888;font-size:12px;">
+              ({qradar_result.get('days_since_last_event','N/A')} days ago)
+            </span>
+          </td>
+        </tr>"""
+    else:
+        status_color = '#c87800'
+        status_label = '⚠  Found but Not Reporting'
+        summary_line = (
+            f"<b>{hostname}</b> was found in SIEM but has <b>not reported recently</b>. "
+            f"Please investigate why this source has gone silent."
+        )
+        detail_rows  = f"""
+        <tr>
+          <td style="padding:7px 12px;color:#555;font-size:13px;border-bottom:1px solid #eee;
+                     width:160px;">Log Source Name</td>
+          <td style="padding:7px 12px;font-size:13px;border-bottom:1px solid #eee;
+                     font-weight:600;color:#222;">{qradar_result.get('actual_name','N/A')}</td>
+        </tr>
+        <tr>
+          <td style="padding:7px 12px;color:#555;font-size:13px;border-bottom:1px solid #eee;">
+            Log Source Type</td>
+          <td style="padding:7px 12px;font-size:13px;border-bottom:1px solid #eee;
+                     color:#333;">{qradar_result.get('ls_type','N/A')}</td>
+        </tr>
+        <tr>
+          <td style="padding:7px 12px;color:#555;font-size:13px;">Last Event</td>
+          <td style="padding:7px 12px;font-size:13px;color:#333;">
+            {qradar_result.get('last_seen','N/A')}
+            &nbsp;<span style="color:#888;font-size:12px;">
+              ({qradar_result.get('days_since_last_event','N/A')} days ago)
+            </span>
+          </td>
+        </tr>"""
+
+    detail_block = f"""
+    <table style="width:100%;max-width:480px;border-collapse:collapse;
+                  margin-top:16px;border:1px solid #e0e0e0;border-radius:6px;
+                  overflow:hidden;">
+      {detail_rows}
+    </table>""" if detail_rows else ''
+
+    run_time = datetime.now().strftime('%d %B %Y, %H:%M')
+
+    return f"""
+<html>
+<body style="font-family:'Segoe UI',Arial,sans-serif;color:#222;
+             font-size:13px;line-height:1.6;margin:0;padding:0;">
+
+  <div style="max-width:560px;padding:20px 0;">
+
+    <p style="margin:0 0 16px 0;">Hi,</p>
+
+    <!-- Status banner -->
+    <div style="background:{status_color};color:#fff;padding:10px 16px;
+                border-radius:6px;font-size:13px;font-weight:600;
+                margin-bottom:16px;letter-spacing:0.2px;">
+      {status_label}
+    </div>
+
+    <p style="margin:0 0 4px 0;">{summary_line}</p>
+
+    {detail_block}
+
+    <p style="margin:20px 0 4px 0;color:#555;font-size:12px;">
+      This is an automated response from the SIEM monitoring system.<br>
+      Checked against QRadar on {run_time}.
+    </p>
+
+    <p style="margin:16px 0 0 0;">Regards,<br>
+    <span style="font-weight:600;">SOC — Automated SIEM Check</span></p>
+
+  </div>
+
+</body>
+</html>"""
+
+
 # ─── DRAFT BUILDER ─────────────────────────────────────────────────────────────
 def build_reply_body(hostname, qradar_result):
     """
-    Selects the correct template based on QRadar result and fills in placeholders.
-    Returns the plain text body string.
-    All three templates are defined in config — wording is fully yours to control.
+    Thin wrapper — returns the HTML reply body for the given QRadar result.
+    Kept separate so the call site in main() stays unchanged.
     """
-    status = qradar_result.get('status')
-
-    if status != 'Found':
-        return REPLY_NOT_FOUND.format(hostname=hostname)
-
-    activity = qradar_result.get('activity_status', '')
-    data     = {
-        'hostname': hostname,
-        'ls_name':  qradar_result.get('actual_name', 'N/A'),
-        'ls_type':  qradar_result.get('ls_type', 'N/A'),
-        'last_seen': qradar_result.get('last_seen', 'N/A'),
-        'days_ago':  qradar_result.get('days_since_last_event', 'N/A'),
-    }
-
-    if activity == 'Active':
-        return REPLY_ACTIVE.format(**data)
-    else:
-        return REPLY_INACTIVE.format(**data)
+    return _build_reply_html(hostname, qradar_result)
 
 
-def create_draft_reply(mail_item, body_text, hostname):
+def create_draft_reply(mail_item, html_body, hostname):
     """
     Creates a draft reply to the original email and saves it silently to Drafts.
     Uses ReplyAll so all original recipients are included — change to Reply() if needed.
 
-    The draft subject gets [Processed] prepended so the conversation check and
-    subject guards both catch it if it ever appears as an incoming item.
+    Sets HTMLBody so the reply renders as formatted HTML in Outlook.
+    The draft subject gets [Processed] prepended so subject guards catch it
+    if it ever appears as an incoming item.
 
     THIS IS DRAFT ONLY — mail.Save() is called, NOT mail.Send().
     No email is sent from this script under any circumstance.
     """
     try:
-        reply         = mail_item.ReplyAll()
-        reply.Body    = body_text
-        reply.Subject = f"[Processed] {mail_item.Subject}"
+        reply          = mail_item.ReplyAll()
+        reply.HTMLBody = html_body
+        reply.Subject  = f"[Processed] {mail_item.Subject}"
         reply.Save()   # ← saves to Drafts, does NOT send
         _log(f"      ✅ Draft saved to Drafts folder for: {hostname}")
         return True
@@ -596,29 +668,20 @@ def main():
         skipped   = 0
         drafted   = 0
 
-        # Collect only emails within the lookback window using Outlook's
-        # Restrict method — filters at COM level before loading into Python.
-        # Far faster than loading all items and filtering in Python.
-        cutoff_str  = cutoff_time.strftime('%m/%d/%Y %H:%M %p')
+        # Restrict filters at COM level — only emails within the lookback window
+        # are returned before anything loads into Python.
+        # %I = 12-hour clock (required by Outlook's Restrict filter), %p = AM/PM
+        cutoff_str  = cutoff_time.strftime('%m/%d/%Y %I:%M %p')
         inbox_items = list(inbox.Items.Restrict(
             f"[ReceivedTime] >= '{cutoff_str}'"
         ))
+        _log(f"   {len(inbox_items)} email(s) found in window.")
 
         for mail_item in inbox_items:
 
-            # Skip non-mail items (calendar invites etc.)
+            # Skip non-mail items (calendar invites, meeting requests etc.)
             try:
                 if mail_item.Class != 43:   # 43 = olMail
-                    continue
-            except Exception:
-                continue
-
-            # ── Time filter ──
-            try:
-                received = mail_item.ReceivedTime
-                # win32com returns a timezone-aware datetime; strip tz for comparison
-                received_naive = received.replace(tzinfo=None)
-                if received_naive < cutoff_time:
                     continue
             except Exception:
                 continue
