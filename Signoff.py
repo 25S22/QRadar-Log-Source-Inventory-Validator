@@ -55,39 +55,42 @@ LOCKFILE_PATH = r'C:\path\to\your\signoff.lock'
 # Request timeout — mirrors main script
 REQUEST_TIMEOUT = 30
 
-# Expected Log Source Types to validate per hostname.
-# Uses the same fuzzy keyword matching as the main inventory script —
-# 'Microsoft Security' matches 'Microsoft Windows Security Event Log'.
-# When a hostname is queried, ALL returned log sources are checked and
-# each expected type is marked FOUND or MISSING in the reply.
+# Smart OS-based log source type validation.
+# The script detects the device OS from the QRadar sources returned and
+# applies ONLY the rules for that OS group — no cross-group false flags.
 #
-# If ALL types are found   → green banner, confirmed full coverage
-# If ANY type is missing   → amber banner, shows found vs missing per type
-# If host not in QRadar    → red banner, no type check performed
+# How detection works:
+#   Each group's FIRST entry in 'required' is its signature type.
+#   The script scans returned sources for that signature using fuzzy matching.
+#   First group whose signature is found wins — order of keys = priority.
 #
-# Leave EMPTY to skip type validation entirely — script behaves exactly
-# as before, returning the single best source result only.
-EXPECTED_LS_TYPES_CHECK = []
-# Example:
-# EXPECTED_LS_TYPES_CHECK = ['Microsoft Security', 'Linux OS']
+# 'required'   — list of type keywords that must all be present for that OS
+# 'companions' — dict of {primary_type: companion_type} that must also exist
+#
+# Leave OS_TYPE_GROUPS = {} to disable smart detection entirely and fall back
+# to EXPECTED_LS_TYPES_CHECK / LS_COMPANION_RULES below (legacy mode).
+OS_TYPE_GROUPS = {
+    'Windows': {
+        'required':   ['Microsoft Security'],
+        'companions': {'Microsoft Security': 'WinCollect'},
+    },
+    'Linux': {
+        'required':   ['Linux OS'],
+        'companions': {},
+    },
+}
 
-# Companion rules — certain log source types require another type to also
-# be present to be considered fully covered.
-#
-# Key   = the primary type (must match an entry in EXPECTED_LS_TYPES_CHECK)
-# Value = the companion type that must also exist for that host
-#
-# Uses the same fuzzy keyword matching as EXPECTED_LS_TYPES_CHECK.
-# Types NOT listed here are self-sufficient (e.g. Linux OS alone is fine).
-#
-# Example: Microsoft Security requires WinCollect alongside it.
-# If Microsoft Security found but WinCollect missing → amber warning row.
-# If Linux OS found alone → green, no companion needed.
-LS_COMPANION_RULES = {}
-# Example:
-# LS_COMPANION_RULES = {
-#     'Microsoft Security': 'WinCollect',
-# }
+# Legacy flat mode — only used when OS_TYPE_GROUPS = {} above.
+# Leave both empty if using OS_TYPE_GROUPS.
+EXPECTED_LS_TYPES_CHECK = []
+LS_COMPANION_RULES      = {}
+
+# Onboarding escalation — when a required log source type is missing,
+# this person is added to CC and mentioned in the reply body.
+# Set ONBOARD_REQUEST_CC to '' to disable CC entirely.
+# ONBOARD_REQUEST_NAME is how they appear in the email body e.g. '@xyz'
+ONBOARD_REQUEST_CC   = 'onboarding-owner@yourorg.com'
+ONBOARD_REQUEST_NAME = '@xyz'
 
 # ─── REPLY TEMPLATES ───────────────────────────────────────────────────────────
 # The reply wording is built in _build_reply_html() below the config block.
@@ -387,31 +390,40 @@ def query_all_log_sources_readonly(hostname):
         return {'status': f'Error: {str(e)[:60]}', 'sources': []}
 
 
-def validate_expected_types(all_sources_result):
+def validate_expected_types(all_sources_result, required_types=None, companions=None):
     """
-    Checks each entry in EXPECTED_LS_TYPES_CHECK against the full list of
-    returned log sources using the same fuzzy keyword matching as the main
-    inventory script.
+    Validates a specific set of required types against all returned log sources.
 
-    Also checks LS_COMPANION_RULES — if a type has a defined companion,
-    verifies the companion type exists in the source list too.
+    required_types: list of keyword strings to check (e.g. ['Microsoft Security'])
+                    Defaults to EXPECTED_LS_TYPES_CHECK if not passed (legacy mode).
+    companions:     dict of {primary_kw: companion_kw} rules.
+                    Defaults to LS_COMPANION_RULES if not passed (legacy mode).
 
-    Returns a list of dicts — one per expected type — in order:
+    In OS_TYPE_GROUPS mode, build_reply_body passes the detected group's
+    required and companions directly so only relevant types are checked.
+    In legacy mode, the globals are used unchanged.
+
+    Returns a list of dicts — one per required type:
       {
-        'expected':          str,         # keyword from config
-        'found':             bool,        # primary type found
-        'companion_needed':  str | None,  # companion keyword if rule defined
-        'companion_found':   bool,        # True if companion present or not needed
-        'ls_type':           str | None,  # resolved QRadar type name if found
+        'expected':          str,
+        'found':             bool,
+        'companion_needed':  str | None,
+        'companion_found':   bool,
+        'ls_type':           str | None,
         'ls_name':           str | None,
         'last_seen':         str | None,
         'days_ago':          int | None
       }
     """
+    if required_types is None:
+        required_types = EXPECTED_LS_TYPES_CHECK
+    if companions is None:
+        companions = LS_COMPANION_RULES
+
     results = []
     sources = all_sources_result.get('sources', [])
 
-    for expected_kw in EXPECTED_LS_TYPES_CHECK:
+    for expected_kw in required_types:
         exp_words = str(expected_kw).lower().split()
 
         matched = [
@@ -423,7 +435,7 @@ def validate_expected_types(all_sources_result):
             results.append({
                 'expected':         expected_kw,
                 'found':            False,
-                'companion_needed': LS_COMPANION_RULES.get(expected_kw),
+                'companion_needed': companions.get(expected_kw),
                 'companion_found':  False,
                 'ls_type':          None,
                 'ls_name':          None,
@@ -432,16 +444,14 @@ def validate_expected_types(all_sources_result):
             })
             continue
 
-        # Best match: enabled first, then most recent
         matched_enabled  = [s for s in matched if s.get('enabled')]
         matched_disabled = [s for s in matched if not s.get('enabled')]
         matched_enabled.sort(key=lambda x: x.get('days_ago') or 99999)
         matched_disabled.sort(key=lambda x: x.get('days_ago') or 99999)
         best = matched_enabled[0] if matched_enabled else matched_disabled[0]
 
-        # Check companion rule if one is defined for this type
-        companion_kw     = LS_COMPANION_RULES.get(expected_kw)
-        companion_found  = True   # default: no rule = satisfied
+        companion_kw    = companions.get(expected_kw)
+        companion_found = True
         if companion_kw:
             comp_words      = str(companion_kw).lower().split()
             companion_found = any(
@@ -461,6 +471,39 @@ def validate_expected_types(all_sources_result):
         })
 
     return results
+
+
+def detect_os_group(sources):
+    """
+    Scans returned QRadar sources to determine which OS_TYPE_GROUPS group
+    this device belongs to.
+
+    Detection: the first entry in each group's 'required' list is its
+    signature type. Fuzzy-matches against all returned sources.
+    First matching group (by key order in OS_TYPE_GROUPS) wins.
+
+    Returns (group_name, group_rules) or (None, None) if no group matched.
+    If OS_TYPE_GROUPS is empty, returns (None, None) — legacy mode active.
+    """
+    if not OS_TYPE_GROUPS:
+        return None, None
+
+    for group_name, rules in OS_TYPE_GROUPS.items():
+        required = rules.get('required', [])
+        if not required:
+            continue
+
+        # Use the first required type as the OS signature
+        signature_words = str(required[0]).lower().split()
+        signature_found = any(
+            all(w in str(s.get('ls_type', '')).lower() for w in signature_words)
+            for s in sources
+        )
+
+        if signature_found:
+            return group_name, rules
+
+    return None, None
 
 
 # ─── SENDER VALIDATION ─────────────────────────────────────────────────────────
@@ -581,7 +624,7 @@ def is_already_handled(mail_item, sent_folder, drafts_folder):
     return False, "not handled"
 
 
-def _build_reply_html(hostname, qradar_result, type_validation=None):
+def _build_reply_html(hostname, qradar_result, type_validation=None, os_group=None):
     """
     Builds a clean, professional HTML reply body.
 
@@ -640,24 +683,26 @@ def _build_reply_html(hostname, qradar_result, type_validation=None):
         if not any_missing and not any_companion_missing:
             banner_color = '#1a7a4a'
             banner_label = '✔&nbsp; All Expected Log Sources Confirmed'
+            os_label     = f' ({os_group} device)' if os_group else ''
             summary_line = (
                 f"<b>{hostname}</b> has all expected log source types "
-                f"present in SIEM."
+                f"present in SIEM{os_label}."
             )
         else:
             banner_color  = '#c87800'
             found_count   = sum(1 for r in type_validation if r['found'])
             total_count   = len(type_validation)
+            os_label      = f' ({os_group} device)' if os_group else ''
             if any_missing:
                 banner_label = '⚠&nbsp; Partial Coverage — Types Missing'
                 summary_line = (
-                    f"<b>{hostname}</b> — {found_count} of {total_count} expected "
+                    f"<b>{hostname}</b>{os_label} — {found_count} of {total_count} expected "
                     f"log source types found. Missing types are highlighted below."
                 )
             else:
                 banner_label = '⚠&nbsp; Companion Log Source Missing'
                 summary_line = (
-                    f"<b>{hostname}</b> — all primary types found but a required "
+                    f"<b>{hostname}</b>{os_label} — all primary types found but a required "
                     f"companion log source is missing. See details below."
                 )
 
@@ -672,7 +717,13 @@ def _build_reply_html(hostname, qradar_result, type_validation=None):
             )
 
             if not r['found']:
-                # Primary type missing — red row
+                # Primary type missing — red row with onboard escalation
+                onboard_note = (
+                    f"{ONBOARD_REQUEST_NAME}, request you to onboard this "
+                    f"log source type on SIEM."
+                    if ONBOARD_REQUEST_NAME.strip() else
+                    "Not found — please onboard this log source type."
+                )
                 type_rows += f"""
                 <tr style="background:#fff5f5;">
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
@@ -687,11 +738,18 @@ def _build_reply_html(hostname, qradar_result, type_validation=None):
                              font-size:12px;color:#c0392b;">—</td>
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
                              font-size:12px;color:#c0392b;font-style:italic;">
-                    Not found — please onboard this log source type.</td>
+                    {onboard_note}</td>
                 </tr>"""
 
             elif r['companion_needed'] and not r['companion_found']:
-                # Primary found, companion missing — amber row
+                # Primary found, companion missing — amber row with onboard mention
+                companion_note = (
+                    f"Found — but <b>{r['companion_needed']}</b> companion missing. "
+                    f"{ONBOARD_REQUEST_NAME}, request you to onboard the companion "
+                    f"log source on SIEM."
+                    if ONBOARD_REQUEST_NAME.strip() else
+                    f"Found — but <b>{r['companion_needed']}</b> companion missing."
+                )
                 type_rows += f"""
                 <tr style="background:#fffbf0;">
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
@@ -707,7 +765,7 @@ def _build_reply_html(hostname, qradar_result, type_validation=None):
                     {r.get('last_seen','N/A')} {days_str}</td>
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
                              font-size:12px;color:#c87800;font-style:italic;">
-                    Found — but <b>{r['companion_needed']}</b> companion missing.</td>
+                    {companion_note}</td>
                 </tr>"""
 
             else:
@@ -823,35 +881,72 @@ def _build_reply_html(hostname, qradar_result, type_validation=None):
 # ─── DRAFT BUILDER ─────────────────────────────────────────────────────────────
 def build_reply_body(hostname, qradar_result):
     """
-    Routes to the correct HTML builder based on whether EXPECTED_LS_TYPES_CHECK
-    is populated in config.
+    Routes to the correct HTML builder.
 
-    If EXPECTED_LS_TYPES_CHECK is empty:
-      Uses qradar_result (single best source) — original behaviour unchanged.
+    OS_TYPE_GROUPS mode (default):
+      Detects device OS from returned sources, validates only that group's
+      required types and companions. No cross-group false flags.
 
-    If EXPECTED_LS_TYPES_CHECK is populated:
-      qradar_result is the all-sources result from query_all_log_sources_readonly.
-      Runs validate_expected_types and passes the breakdown to _build_reply_html.
+    Legacy flat mode (OS_TYPE_GROUPS = {}):
+      Uses EXPECTED_LS_TYPES_CHECK and LS_COMPANION_RULES as before.
+
+    Single-source mode (both empty):
+      Returns simple found/not-found reply — original behaviour.
+
+    Returns (html_body, needs_cc) tuple.
+    needs_cc is True when any type or companion is missing — caller adds CC.
     """
-    if not EXPECTED_LS_TYPES_CHECK:
-        return _build_reply_html(hostname, qradar_result, type_validation=None)
-
-    # Type validation mode — qradar_result is the all-sources dict here
+    # Not found — no CC needed regardless
     if qradar_result.get('status') != 'Found':
-        return _build_reply_html(hostname, qradar_result, type_validation=None)
+        return _build_reply_html(hostname, qradar_result, type_validation=None), False
 
-    validation = validate_expected_types(qradar_result)
-    return _build_reply_html(hostname, qradar_result, type_validation=validation)
+    sources = qradar_result.get('sources', [])
+
+    # ── OS_TYPE_GROUPS smart mode ──
+    if OS_TYPE_GROUPS:
+        group_name, group_rules = detect_os_group(sources)
+
+        if group_name is None:
+            # No OS signature matched — treat as not found
+            fallback = {'status': 'Not Found', 'sources': []}
+            return _build_reply_html(hostname, fallback, type_validation=None), False
+
+        validation = validate_expected_types(
+            qradar_result,
+            required_types = group_rules.get('required', []),
+            companions     = group_rules.get('companions', {}),
+        )
+        needs_cc  = any(
+            not r['found'] or (r['companion_needed'] and not r['companion_found'])
+            for r in validation
+        )
+        html = _build_reply_html(
+            hostname, qradar_result,
+            type_validation=validation,
+            os_group=group_name
+        )
+        return html, needs_cc
+
+    # ── Legacy flat mode ──
+    if EXPECTED_LS_TYPES_CHECK:
+        validation = validate_expected_types(qradar_result)
+        needs_cc   = any(
+            not r['found'] or (r['companion_needed'] and not r['companion_found'])
+            for r in validation
+        )
+        return _build_reply_html(hostname, qradar_result, type_validation=validation), needs_cc
+
+    # ── Single-source mode ──
+    return _build_reply_html(hostname, qradar_result, type_validation=None), False
 
 
-def create_draft_reply(mail_item, html_body, hostname):
+def create_draft_reply(mail_item, html_body, hostname, needs_cc=False):
     """
     Creates a draft reply to the original email and saves it silently to Drafts.
-    Uses ReplyAll so all original recipients are included — change to Reply() if needed.
+    Uses ReplyAll so all original recipients are included.
 
-    Sets HTMLBody so the reply renders as formatted HTML in Outlook.
-    The draft subject gets [Processed] prepended so subject guards catch it
-    if it ever appears as an incoming item.
+    needs_cc: if True and ONBOARD_REQUEST_CC is set, adds that address to CC.
+              Only applied when types are missing — green replies have no CC.
 
     THIS IS DRAFT ONLY — mail.Save() is called, NOT mail.Send().
     No email is sent from this script under any circumstance.
@@ -860,7 +955,16 @@ def create_draft_reply(mail_item, html_body, hostname):
         reply          = mail_item.ReplyAll()
         reply.HTMLBody = html_body
         reply.Subject  = f"[Processed] {mail_item.Subject}"
-        reply.Save()   # ← saves to Drafts, does NOT send
+
+        if needs_cc and ONBOARD_REQUEST_CC.strip():
+            existing_cc  = reply.CC or ''
+            reply.CC     = (
+                f"{existing_cc}; {ONBOARD_REQUEST_CC}".strip('; ')
+                if existing_cc else ONBOARD_REQUEST_CC
+            )
+            _log(f"      📧 CC added: {ONBOARD_REQUEST_CC}")
+
+        reply.Save()
         _log(f"      ✅ Draft saved to Drafts folder for: {hostname}")
         return True
 
@@ -1068,8 +1172,8 @@ def main():
                      f"Last seen: {qradar_result.get('last_seen', 'N/A')}")
 
             # ── Build and save draft ──
-            body = build_reply_body(hostname, qradar_result)
-            success = create_draft_reply(mail_item, body, hostname)
+            body, needs_cc = build_reply_body(hostname, qradar_result)
+            success = create_draft_reply(mail_item, body, hostname, needs_cc=needs_cc)
 
             if success:
                 drafted += 1
