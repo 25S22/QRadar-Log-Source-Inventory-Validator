@@ -55,6 +55,22 @@ LOCKFILE_PATH = r'C:\path\to\your\signoff.lock'
 # Request timeout — mirrors main script
 REQUEST_TIMEOUT = 30
 
+# Expected Log Source Types to validate per hostname.
+# Uses the same fuzzy keyword matching as the main inventory script —
+# 'Microsoft Security' matches 'Microsoft Windows Security Event Log'.
+# When a hostname is queried, ALL returned log sources are checked and
+# each expected type is marked FOUND or MISSING in the reply.
+#
+# If ALL types are found   → green banner, confirmed full coverage
+# If ANY type is missing   → amber banner, shows found vs missing per type
+# If host not in QRadar    → red banner, no type check performed
+#
+# Leave EMPTY to skip type validation entirely — script behaves exactly
+# as before, returning the single best source result only.
+EXPECTED_LS_TYPES_CHECK = []
+# Example:
+# EXPECTED_LS_TYPES_CHECK = ['Microsoft Security', 'Linux OS']
+
 # ─── REPLY TEMPLATES ───────────────────────────────────────────────────────────
 # The reply wording is built in _build_reply_html() below the config block.
 # Three scenarios are handled automatically:
@@ -286,7 +302,135 @@ def query_log_source_readonly(hostname):
         return {**_empty_result(), 'status': f'Error: {str(e)[:60]}'}
 
 
-# ─── SENDER VALIDATION ─────────────────────────────────────────────────────────
+def query_all_log_sources_readonly(hostname):
+    """
+    STRICTLY READ-ONLY — fetches ALL log sources matching the hostname.
+    Used when EXPECTED_LS_TYPES_CHECK is defined so every returned source
+    can be checked against each expected type.
+
+    Only HTTP GET. Nothing in QRadar is modified, created or deleted.
+
+    Returns a dict:
+      {
+        'status': 'Found' | 'Not Found' | 'API Error ...',
+        'sources': [
+          {
+            'name':      str,
+            'ls_type':   str,
+            'enabled':   bool,
+            'last_seen': str,
+            'activity':  str,
+            'days_ago':  int | None
+          },
+          ...
+        ]
+      }
+    """
+    clean_hostname = str(hostname).replace('"', '').replace("'", "").strip()
+    endpoint = (
+        f"{QRADAR_HOST.rstrip('/')}/api/config/event_sources"
+        f"/log_source_management/log_sources"
+    )
+
+    try:
+        resp = requests.get(
+            endpoint,
+            params={'filter': f'name ilike "%{clean_hostname}%"'},
+            auth=(QRADAR_USERNAME, QRADAR_PASSWORD),
+            verify=VERIFY_SSL,
+            timeout=REQUEST_TIMEOUT,
+            headers={'Accept': 'application/json', 'Version': '14.0'}
+        )
+
+        if resp.status_code != 200:
+            return {'status': f'API Error {resp.status_code}', 'sources': []}
+
+        ls_data = resp.json()
+        if not ls_data:
+            return {'status': 'Not Found', 'sources': []}
+
+        sources = []
+        for src in ls_data:
+            type_id      = src.get('type_id')
+            ls_type_name = LOG_SOURCE_TYPES_CACHE.get(type_id, f"Unknown Type ID: {type_id}")
+            last_seen, activity, days_ago = _safe_timestamp(src.get('last_event_time'))
+            sources.append({
+                'name':     src.get('name', hostname),
+                'ls_type':  ls_type_name,
+                'enabled':  src.get('enabled', False),
+                'last_seen': last_seen,
+                'activity': activity,
+                'days_ago': days_ago,
+            })
+
+        return {'status': 'Found', 'sources': sources}
+
+    except Exception as e:
+        return {'status': f'Error: {str(e)[:60]}', 'sources': []}
+
+
+def validate_expected_types(all_sources_result):
+    """
+    Checks each entry in EXPECTED_LS_TYPES_CHECK against the full list of
+    returned log sources using the same fuzzy keyword matching as the main
+    inventory script.
+
+    Returns a list of dicts — one per expected type — in order:
+      {
+        'expected':  str,           # the keyword string from config
+        'found':     bool,          # True if at least one source matched
+        'ls_type':   str | None,    # resolved QRadar type name if found
+        'ls_name':   str | None,    # log source name if found
+        'last_seen': str | None,
+        'activity':  str | None,
+        'days_ago':  int | None
+      }
+
+    If a type matches multiple sources, the best one is chosen:
+    enabled first, then most recent last_event_time.
+    """
+    results  = []
+    sources  = all_sources_result.get('sources', [])
+
+    for expected_kw in EXPECTED_LS_TYPES_CHECK:
+        exp_words = str(expected_kw).lower().split()
+
+        # Collect all sources that fuzzy-match this expected keyword
+        matched = [
+            s for s in sources
+            if all(w in str(s.get('ls_type', '')).lower() for w in exp_words)
+        ]
+
+        if not matched:
+            results.append({
+                'expected': expected_kw,
+                'found':    False,
+                'ls_type':  None,
+                'ls_name':  None,
+                'last_seen': None,
+                'activity': None,
+                'days_ago': None,
+            })
+            continue
+
+        # Best match: enabled first, then most recent
+        matched_enabled  = [s for s in matched if s.get('enabled')]
+        matched_disabled = [s for s in matched if not s.get('enabled')]
+        matched_enabled.sort(key=lambda x: x.get('days_ago') or 99999)
+        matched_disabled.sort(key=lambda x: x.get('days_ago') or 99999)
+        best = matched_enabled[0] if matched_enabled else matched_disabled[0]
+
+        results.append({
+            'expected': expected_kw,
+            'found':    True,
+            'ls_type':  best.get('ls_type'),
+            'ls_name':  best.get('name'),
+            'last_seen': best.get('last_seen'),
+            'activity': best.get('activity'),
+            'days_ago': best.get('days_ago'),
+        })
+
+    return results
 def is_sender_allowed(sender_address):
     """
     Checks sender against ALLOWED_SENDERS.
@@ -404,103 +548,198 @@ def is_already_handled(mail_item, sent_folder, drafts_folder):
     return False, "not handled"
 
 
-def _build_reply_html(hostname, qradar_result):
+def _build_reply_html(hostname, qradar_result, type_validation=None):
     """
     Builds a clean, professional HTML reply body.
-    No dark themes — looks like a well-formatted human reply.
-    Status row colour changes based on Active / Inactive / Not Found.
+
+    type_validation: list returned by validate_expected_types(), or None.
+      - None / empty EXPECTED_LS_TYPES_CHECK → original single-source layout
+      - Populated → per-type validation table with green/red rows
+
+    Three top-level states:
+      Not Found   — red banner, no detail table
+      All found   — green banner (or amber if any type inactive)
+      Some missing — amber banner with partial coverage message
     """
-    status   = qradar_result.get('status')
-    activity = qradar_result.get('activity_status', '')
-
-    # Status indicator
-    if status != 'Found':
-        status_color = '#c0392b'
-        status_label = '✖  Not Found in QRadar'
-        detail_rows  = ''
-        summary_line = (
-            f"<b>{hostname}</b> was <b>not found</b> in the QRadar log source inventory. "
-            f"Please ensure the asset is onboarded and configured correctly in SIEM."
-        )
-    elif activity == 'Active':
-        status_color = '#1a7a4a'
-        status_label = '✔  Reporting in SIEM'
-        summary_line = f"<b>{hostname}</b> is confirmed reporting in SIEM."
-        detail_rows  = f"""
-        <tr>
-          <td style="padding:7px 12px;color:#555;font-size:13px;border-bottom:1px solid #eee;
-                     width:160px;">Log Source Name</td>
-          <td style="padding:7px 12px;font-size:13px;border-bottom:1px solid #eee;
-                     font-weight:600;color:#222;">{qradar_result.get('actual_name','N/A')}</td>
-        </tr>
-        <tr>
-          <td style="padding:7px 12px;color:#555;font-size:13px;border-bottom:1px solid #eee;">
-            Log Source Type</td>
-          <td style="padding:7px 12px;font-size:13px;border-bottom:1px solid #eee;
-                     color:#333;">{qradar_result.get('ls_type','N/A')}</td>
-        </tr>
-        <tr>
-          <td style="padding:7px 12px;color:#555;font-size:13px;">Last Event</td>
-          <td style="padding:7px 12px;font-size:13px;color:#333;">
-            {qradar_result.get('last_seen','N/A')}
-            &nbsp;<span style="color:#888;font-size:12px;">
-              ({qradar_result.get('days_since_last_event','N/A')} days ago)
-            </span>
-          </td>
-        </tr>"""
-    else:
-        status_color = '#c87800'
-        status_label = '⚠  Found but Not Reporting'
-        summary_line = (
-            f"<b>{hostname}</b> was found in SIEM but has <b>not reported recently</b>. "
-            f"Please investigate why this source has gone silent."
-        )
-        detail_rows  = f"""
-        <tr>
-          <td style="padding:7px 12px;color:#555;font-size:13px;border-bottom:1px solid #eee;
-                     width:160px;">Log Source Name</td>
-          <td style="padding:7px 12px;font-size:13px;border-bottom:1px solid #eee;
-                     font-weight:600;color:#222;">{qradar_result.get('actual_name','N/A')}</td>
-        </tr>
-        <tr>
-          <td style="padding:7px 12px;color:#555;font-size:13px;border-bottom:1px solid #eee;">
-            Log Source Type</td>
-          <td style="padding:7px 12px;font-size:13px;border-bottom:1px solid #eee;
-                     color:#333;">{qradar_result.get('ls_type','N/A')}</td>
-        </tr>
-        <tr>
-          <td style="padding:7px 12px;color:#555;font-size:13px;">Last Event</td>
-          <td style="padding:7px 12px;font-size:13px;color:#333;">
-            {qradar_result.get('last_seen','N/A')}
-            &nbsp;<span style="color:#888;font-size:12px;">
-              ({qradar_result.get('days_since_last_event','N/A')} days ago)
-            </span>
-          </td>
-        </tr>"""
-
-    detail_block = f"""
-    <table style="width:100%;max-width:480px;border-collapse:collapse;
-                  margin-top:16px;border:1px solid #e0e0e0;border-radius:6px;
-                  overflow:hidden;">
-      {detail_rows}
-    </table>""" if detail_rows else ''
+    status = qradar_result.get('status') if qradar_result else 'Not Found'
 
     run_time = datetime.now().strftime('%d %B %Y, %H:%M')
+
+    # ── NOT FOUND / ERROR — same for both modes ──
+    if status != 'Found':
+        banner_color = '#c0392b'
+        banner_label = '✖  Not Found in QRadar'
+        summary_line = (
+            f"<b>{hostname}</b> was <b>not found</b> in the QRadar log source "
+            f"inventory. Please ensure the asset is onboarded and configured "
+            f"correctly in SIEM."
+        )
+        detail_block = ''
+
+    # ── TYPE VALIDATION MODE ──
+    elif type_validation is not None:
+        all_found   = all(r['found'] for r in type_validation)
+        any_missing = any(not r['found'] for r in type_validation)
+        any_inactive = any(
+            r['found'] and r.get('activity') != 'Active'
+            for r in type_validation
+        )
+
+        if all_found and not any_inactive:
+            banner_color = '#1a7a4a'
+            banner_label = '✔  All Expected Log Sources Confirmed'
+            summary_line = (
+                f"<b>{hostname}</b> has all expected log source types "
+                f"reporting in SIEM."
+            )
+        elif all_found and any_inactive:
+            banner_color = '#c87800'
+            banner_label = '⚠  All Types Found — Some Not Reporting'
+            summary_line = (
+                f"<b>{hostname}</b> has all expected types onboarded but "
+                f"one or more have not reported recently."
+            )
+        else:
+            banner_color = '#c87800'
+            banner_label = '⚠  Partial Coverage — Types Missing'
+            found_count   = sum(1 for r in type_validation if r['found'])
+            total_count   = len(type_validation)
+            summary_line  = (
+                f"<b>{hostname}</b> — {found_count} of {total_count} expected "
+                f"log source types found. Missing types are highlighted below."
+            )
+
+        # Build per-type rows
+        type_rows = ''
+        for r in type_validation:
+            if r['found']:
+                act         = r.get('activity', 'Unknown')
+                row_bg      = '#f0faf4' if act == 'Active' else '#fffbf0'
+                icon        = '✔' if act == 'Active' else '⚠'
+                icon_color  = '#1a7a4a' if act == 'Active' else '#c87800'
+                days_str    = (
+                    f"<span style='color:#888;font-size:11px;'>"
+                    f"({'Today' if r['days_ago'] == 0 else str(r['days_ago']) + ' days ago'})"
+                    f"</span>"
+                    if r['days_ago'] is not None else
+                    "<span style='color:#aaa;font-size:11px;'>(unknown)</span>"
+                )
+                type_rows += f"""
+                <tr style="background:{row_bg};">
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:{icon_color};font-weight:700;
+                             width:24px;text-align:center;">{icon}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#333;font-weight:600;">
+                    {r['expected']}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#555;">{r.get('ls_name','N/A')}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#555;">
+                    {r.get('last_seen','N/A')} {days_str}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:{icon_color};font-weight:600;">
+                    {act}</td>
+                </tr>"""
+            else:
+                type_rows += f"""
+                <tr style="background:#fff5f5;">
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c0392b;font-weight:700;
+                             width:24px;text-align:center;">✖</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c0392b;font-weight:600;">
+                    {r['expected']}</td>
+                  <td colspan="3"
+                      style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c0392b;font-style:italic;">
+                    Not found in QRadar — please onboard this log source type.
+                  </td>
+                </tr>"""
+
+        detail_block = f"""
+        <table style="width:100%;max-width:600px;border-collapse:collapse;
+                      margin-top:16px;border:1px solid #e0e0e0;
+                      border-radius:6px;overflow:hidden;">
+          <tr style="background:#f5f5f5;">
+            <th style="padding:7px 12px;font-size:11px;color:#777;
+                       font-weight:600;text-align:left;
+                       border-bottom:2px solid #ddd;width:24px;"></th>
+            <th style="padding:7px 12px;font-size:11px;color:#777;
+                       font-weight:600;text-align:left;
+                       border-bottom:2px solid #ddd;">Expected Type</th>
+            <th style="padding:7px 12px;font-size:11px;color:#777;
+                       font-weight:600;text-align:left;
+                       border-bottom:2px solid #ddd;">Log Source Name</th>
+            <th style="padding:7px 12px;font-size:11px;color:#777;
+                       font-weight:600;text-align:left;
+                       border-bottom:2px solid #ddd;">Last Event</th>
+            <th style="padding:7px 12px;font-size:11px;color:#777;
+                       font-weight:600;text-align:left;
+                       border-bottom:2px solid #ddd;">Status</th>
+          </tr>
+          {type_rows}
+        </table>"""
+
+    # ── ORIGINAL SINGLE-SOURCE MODE (EXPECTED_LS_TYPES_CHECK is empty) ──
+    else:
+        activity = qradar_result.get('activity_status', '')
+        if activity == 'Active':
+            banner_color = '#1a7a4a'
+            banner_label = '✔  Reporting in SIEM'
+            summary_line = f"<b>{hostname}</b> is confirmed reporting in SIEM."
+        else:
+            banner_color = '#c87800'
+            banner_label = '⚠  Found but Not Reporting'
+            summary_line = (
+                f"<b>{hostname}</b> was found in SIEM but has "
+                f"<b>not reported recently</b>. "
+                f"Please investigate why this source has gone silent."
+            )
+
+        detail_block = f"""
+        <table style="width:100%;max-width:480px;border-collapse:collapse;
+                      margin-top:16px;border:1px solid #e0e0e0;
+                      border-radius:6px;overflow:hidden;">
+          <tr>
+            <td style="padding:7px 12px;color:#555;font-size:13px;
+                       border-bottom:1px solid #eee;width:160px;">
+              Log Source Name</td>
+            <td style="padding:7px 12px;font-size:13px;
+                       border-bottom:1px solid #eee;font-weight:600;color:#222;">
+              {qradar_result.get('actual_name','N/A')}</td>
+          </tr>
+          <tr>
+            <td style="padding:7px 12px;color:#555;font-size:13px;
+                       border-bottom:1px solid #eee;">Log Source Type</td>
+            <td style="padding:7px 12px;font-size:13px;
+                       border-bottom:1px solid #eee;color:#333;">
+              {qradar_result.get('ls_type','N/A')}</td>
+          </tr>
+          <tr>
+            <td style="padding:7px 12px;color:#555;font-size:13px;">
+              Last Event</td>
+            <td style="padding:7px 12px;font-size:13px;color:#333;">
+              {qradar_result.get('last_seen','N/A')}
+              &nbsp;<span style="color:#888;font-size:12px;">
+                ({qradar_result.get('days_since_last_event','N/A')} days ago)
+              </span>
+            </td>
+          </tr>
+        </table>"""
 
     return f"""
 <html>
 <body style="font-family:'Segoe UI',Arial,sans-serif;color:#222;
              font-size:13px;line-height:1.6;margin:0;padding:0;">
-
-  <div style="max-width:560px;padding:20px 0;">
+  <div style="max-width:620px;padding:20px 0;">
 
     <p style="margin:0 0 16px 0;">Hi,</p>
 
-    <!-- Status banner -->
-    <div style="background:{status_color};color:#fff;padding:10px 16px;
+    <div style="background:{banner_color};color:#fff;padding:10px 16px;
                 border-radius:6px;font-size:13px;font-weight:600;
                 margin-bottom:16px;letter-spacing:0.2px;">
-      {status_label}
+      {banner_label}
     </div>
 
     <p style="margin:0 0 4px 0;">{summary_line}</p>
@@ -516,7 +755,6 @@ def _build_reply_html(hostname, qradar_result):
     <span style="font-weight:600;">SOC — Automated SIEM Check</span></p>
 
   </div>
-
 </body>
 </html>"""
 
@@ -524,10 +762,25 @@ def _build_reply_html(hostname, qradar_result):
 # ─── DRAFT BUILDER ─────────────────────────────────────────────────────────────
 def build_reply_body(hostname, qradar_result):
     """
-    Thin wrapper — returns the HTML reply body for the given QRadar result.
-    Kept separate so the call site in main() stays unchanged.
+    Routes to the correct HTML builder based on whether EXPECTED_LS_TYPES_CHECK
+    is populated in config.
+
+    If EXPECTED_LS_TYPES_CHECK is empty:
+      Uses qradar_result (single best source) — original behaviour unchanged.
+
+    If EXPECTED_LS_TYPES_CHECK is populated:
+      qradar_result is the all-sources result from query_all_log_sources_readonly.
+      Runs validate_expected_types and passes the breakdown to _build_reply_html.
     """
-    return _build_reply_html(hostname, qradar_result)
+    if not EXPECTED_LS_TYPES_CHECK:
+        return _build_reply_html(hostname, qradar_result, type_validation=None)
+
+    # Type validation mode — qradar_result is the all-sources dict here
+    if qradar_result.get('status') != 'Found':
+        return _build_reply_html(hostname, qradar_result, type_validation=None)
+
+    validation = validate_expected_types(qradar_result)
+    return _build_reply_html(hostname, qradar_result, type_validation=validation)
 
 
 def create_draft_reply(mail_item, html_body, hostname):
@@ -742,10 +995,16 @@ def main():
 
             # ── QRadar query — read only ──
             _log(f"      🔍 Querying QRadar...")
-            qradar_result = query_log_source_readonly(hostname)
-            _log(f"      📊 Result: {qradar_result['status']} | "
-                 f"Activity: {qradar_result.get('activity_status', 'N/A')} | "
-                 f"Last seen: {qradar_result.get('last_seen', 'N/A')}")
+            if EXPECTED_LS_TYPES_CHECK:
+                qradar_result = query_all_log_sources_readonly(hostname)
+                _log(f"      📊 Status: {qradar_result['status']} | "
+                     f"Sources returned: {len(qradar_result.get('sources', []))} | "
+                     f"Checking {len(EXPECTED_LS_TYPES_CHECK)} expected type(s)")
+            else:
+                qradar_result = query_log_source_readonly(hostname)
+                _log(f"      📊 Result: {qradar_result['status']} | "
+                     f"Activity: {qradar_result.get('activity_status', 'N/A')} | "
+                     f"Last seen: {qradar_result.get('last_seen', 'N/A')}")
 
             # ── Build and save draft ──
             body = build_reply_body(hostname, qradar_result)
