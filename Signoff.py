@@ -393,67 +393,6 @@ def validate_expected_types(all_sources_result):
     returned log sources using the same fuzzy keyword matching as the main
     inventory script.
 
-    Returns a list of dicts — one per expected type — in order:
-      {
-        'expected':  str,           # the keyword string from config
-        'found':     bool,          # True if at least one source matched
-        'ls_type':   str | None,    # resolved QRadar type name if found
-        'ls_name':   str | None,    # log source name if found
-        'last_seen': str | None,
-        'activity':  str | None,
-        'days_ago':  int | None
-      }
-
-    If a type matches multiple sources, the best one is chosen:
-    enabled first, then most recent last_event_time.
-    """
-    results  = []
-    sources  = all_sources_result.get('sources', [])
-
-    for expected_kw in EXPECTED_LS_TYPES_CHECK:
-        exp_words = str(expected_kw).lower().split()
-
-        # Collect all sources that fuzzy-match this expected keyword
-        matched = [
-            s for s in sources
-            if all(w in str(s.get('ls_type', '')).lower() for w in exp_words)
-        ]
-
-        if not matched:
-            results.append({
-                'expected': expected_kw,
-                'found':    False,
-                'ls_type':  None,
-                'ls_name':  None,
-                'last_seen': None,
-                'activity': None,
-                'days_ago': None,
-            })
-            continue
-
-        # Best match: enabled first, then most recent
-        matched_enabled  = [s for s in matched if s.get('enabled')]
-        matched_disabled = [s for s in matched if not s.get('enabled')]
-        matched_enabled.sort(key=lambda x: x.get('days_ago') or 99999)
-        matched_disabled.sort(key=lambda x: x.get('days_ago') or 99999)
-        best = matched_enabled[0] if matched_enabled else matched_disabled[0]
-
-        results.append({
-            'expected': expected_kw,
-            'found':    True,
-            'ls_type':  best.get('ls_type'),
-            'ls_name':  best.get('name'),
-            'last_seen': best.get('last_seen'),
-            'activity': best.get('activity'),
-            'days_ago': best.get('days_ago'),
-        })
-
-def validate_expected_types(all_sources_result):
-    """
-    Checks each entry in EXPECTED_LS_TYPES_CHECK against the full list of
-    returned log sources using the same fuzzy keyword matching as the main
-    inventory script.
-
     Also checks LS_COMPANION_RULES — if a type has a defined companion,
     verifies the companion type exists in the source list too.
 
@@ -525,6 +464,7 @@ def validate_expected_types(all_sources_result):
 
 
 # ─── SENDER VALIDATION ─────────────────────────────────────────────────────────
+def is_sender_allowed(sender_address):
     """
     Checks sender against ALLOWED_SENDERS.
     Supports exact address matching and @domain wildcard matching.
