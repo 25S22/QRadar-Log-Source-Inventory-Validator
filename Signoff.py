@@ -71,6 +71,24 @@ EXPECTED_LS_TYPES_CHECK = []
 # Example:
 # EXPECTED_LS_TYPES_CHECK = ['Microsoft Security', 'Linux OS']
 
+# Companion rules — certain log source types require another type to also
+# be present to be considered fully covered.
+#
+# Key   = the primary type (must match an entry in EXPECTED_LS_TYPES_CHECK)
+# Value = the companion type that must also exist for that host
+#
+# Uses the same fuzzy keyword matching as EXPECTED_LS_TYPES_CHECK.
+# Types NOT listed here are self-sufficient (e.g. Linux OS alone is fine).
+#
+# Example: Microsoft Security requires WinCollect alongside it.
+# If Microsoft Security found but WinCollect missing → amber warning row.
+# If Linux OS found alone → green, no companion needed.
+LS_COMPANION_RULES = {}
+# Example:
+# LS_COMPANION_RULES = {
+#     'Microsoft Security': 'WinCollect',
+# }
+
 # ─── REPLY TEMPLATES ───────────────────────────────────────────────────────────
 # The reply wording is built in _build_reply_html() below the config block.
 # Three scenarios are handled automatically:
@@ -430,8 +448,83 @@ def validate_expected_types(all_sources_result):
             'days_ago': best.get('days_ago'),
         })
 
+def validate_expected_types(all_sources_result):
+    """
+    Checks each entry in EXPECTED_LS_TYPES_CHECK against the full list of
+    returned log sources using the same fuzzy keyword matching as the main
+    inventory script.
+
+    Also checks LS_COMPANION_RULES — if a type has a defined companion,
+    verifies the companion type exists in the source list too.
+
+    Returns a list of dicts — one per expected type — in order:
+      {
+        'expected':          str,         # keyword from config
+        'found':             bool,        # primary type found
+        'companion_needed':  str | None,  # companion keyword if rule defined
+        'companion_found':   bool,        # True if companion present or not needed
+        'ls_type':           str | None,  # resolved QRadar type name if found
+        'ls_name':           str | None,
+        'last_seen':         str | None,
+        'days_ago':          int | None
+      }
+    """
+    results = []
+    sources = all_sources_result.get('sources', [])
+
+    for expected_kw in EXPECTED_LS_TYPES_CHECK:
+        exp_words = str(expected_kw).lower().split()
+
+        matched = [
+            s for s in sources
+            if all(w in str(s.get('ls_type', '')).lower() for w in exp_words)
+        ]
+
+        if not matched:
+            results.append({
+                'expected':         expected_kw,
+                'found':            False,
+                'companion_needed': LS_COMPANION_RULES.get(expected_kw),
+                'companion_found':  False,
+                'ls_type':          None,
+                'ls_name':          None,
+                'last_seen':        None,
+                'days_ago':         None,
+            })
+            continue
+
+        # Best match: enabled first, then most recent
+        matched_enabled  = [s for s in matched if s.get('enabled')]
+        matched_disabled = [s for s in matched if not s.get('enabled')]
+        matched_enabled.sort(key=lambda x: x.get('days_ago') or 99999)
+        matched_disabled.sort(key=lambda x: x.get('days_ago') or 99999)
+        best = matched_enabled[0] if matched_enabled else matched_disabled[0]
+
+        # Check companion rule if one is defined for this type
+        companion_kw     = LS_COMPANION_RULES.get(expected_kw)
+        companion_found  = True   # default: no rule = satisfied
+        if companion_kw:
+            comp_words      = str(companion_kw).lower().split()
+            companion_found = any(
+                all(w in str(s.get('ls_type', '')).lower() for w in comp_words)
+                for s in sources
+            )
+
+        results.append({
+            'expected':         expected_kw,
+            'found':            True,
+            'companion_needed': companion_kw,
+            'companion_found':  companion_found,
+            'ls_type':          best.get('ls_type'),
+            'ls_name':          best.get('name'),
+            'last_seen':        best.get('last_seen'),
+            'days_ago':         best.get('days_ago'),
+        })
+
     return results
-def is_sender_allowed(sender_address):
+
+
+# ─── SENDER VALIDATION ─────────────────────────────────────────────────────────
     """
     Checks sender against ALLOWED_SENDERS.
     Supports exact address matching and @domain wildcard matching.
@@ -552,83 +645,118 @@ def _build_reply_html(hostname, qradar_result, type_validation=None):
     """
     Builds a clean, professional HTML reply body.
 
-    type_validation: list returned by validate_expected_types(), or None.
-      - None / empty EXPECTED_LS_TYPES_CHECK → original single-source layout
-      - Populated → per-type validation table with green/red rows
+    Inactive state removed entirely — signoff emails are for new devices
+    which will always be recent. Days since last event is shown in the
+    table and speaks for itself.
 
-    Three top-level states:
-      Not Found   — red banner, no detail table
-      All found   — green banner (or amber if any type inactive)
-      Some missing — amber banner with partial coverage message
+    States:
+      Not Found                → red banner
+      All types found, all
+        companions satisfied   → green banner
+      Any type missing OR
+        any companion missing  → amber banner
+      Single-source mode
+        (no type check)        → green if found, red if not found
     """
-    status = qradar_result.get('status') if qradar_result else 'Not Found'
-
+    status   = qradar_result.get('status') if qradar_result else 'Not Found'
     run_time = datetime.now().strftime('%d %B %Y, %H:%M')
 
-    # ── NOT FOUND / ERROR — same for both modes ──
+    # ── NOT FOUND / ERROR ──
     if status != 'Found':
-        banner_color = '#c0392b'
-        banner_label = '✖  Not Found in QRadar'
-        summary_line = (
-            f"<b>{hostname}</b> was <b>not found</b> in the QRadar log source "
-            f"inventory. Please ensure the asset is onboarded and configured "
-            f"correctly in SIEM."
-        )
-        detail_block = ''
+        return f"""
+<html>
+<body style="font-family:'Segoe UI',Arial,sans-serif;color:#222;
+             font-size:13px;line-height:1.6;margin:0;padding:0;">
+  <div style="max-width:620px;padding:20px 0;">
+    <p style="margin:0 0 16px 0;">Hi,</p>
+    <div style="background:#c0392b;color:#fff;padding:10px 16px;
+                border-radius:6px;font-size:13px;font-weight:600;
+                margin-bottom:16px;">
+      ✖&nbsp; Not Found in QRadar
+    </div>
+    <p style="margin:0 0 4px 0;">
+      <b>{hostname}</b> was <b>not found</b> in the QRadar log source
+      inventory. Please ensure the asset is onboarded and configured
+      correctly in SIEM.
+    </p>
+    <p style="margin:20px 0 4px 0;color:#555;font-size:12px;">
+      This is an automated response from the SIEM monitoring system.<br>
+      Checked against QRadar on {run_time}.
+    </p>
+    <p style="margin:16px 0 0 0;">Regards,<br>
+    <span style="font-weight:600;">SOC — Automated SIEM Check</span></p>
+  </div>
+</body>
+</html>"""
 
     # ── TYPE VALIDATION MODE ──
-    elif type_validation is not None:
-        all_found   = all(r['found'] for r in type_validation)
-        any_missing = any(not r['found'] for r in type_validation)
-        any_inactive = any(
-            r['found'] and r.get('activity') != 'Active'
+    if type_validation is not None:
+        any_missing          = any(not r['found'] for r in type_validation)
+        any_companion_missing = any(
+            r['found'] and r['companion_needed'] and not r['companion_found']
             for r in type_validation
         )
 
-        if all_found and not any_inactive:
+        if not any_missing and not any_companion_missing:
             banner_color = '#1a7a4a'
-            banner_label = '✔  All Expected Log Sources Confirmed'
+            banner_label = '✔&nbsp; All Expected Log Sources Confirmed'
             summary_line = (
                 f"<b>{hostname}</b> has all expected log source types "
-                f"reporting in SIEM."
-            )
-        elif all_found and any_inactive:
-            banner_color = '#c87800'
-            banner_label = '⚠  All Types Found — Some Not Reporting'
-            summary_line = (
-                f"<b>{hostname}</b> has all expected types onboarded but "
-                f"one or more have not reported recently."
+                f"present in SIEM."
             )
         else:
-            banner_color = '#c87800'
-            banner_label = '⚠  Partial Coverage — Types Missing'
+            banner_color  = '#c87800'
             found_count   = sum(1 for r in type_validation if r['found'])
             total_count   = len(type_validation)
-            summary_line  = (
-                f"<b>{hostname}</b> — {found_count} of {total_count} expected "
-                f"log source types found. Missing types are highlighted below."
-            )
+            if any_missing:
+                banner_label = '⚠&nbsp; Partial Coverage — Types Missing'
+                summary_line = (
+                    f"<b>{hostname}</b> — {found_count} of {total_count} expected "
+                    f"log source types found. Missing types are highlighted below."
+                )
+            else:
+                banner_label = '⚠&nbsp; Companion Log Source Missing'
+                summary_line = (
+                    f"<b>{hostname}</b> — all primary types found but a required "
+                    f"companion log source is missing. See details below."
+                )
 
-        # Build per-type rows
         type_rows = ''
         for r in type_validation:
-            if r['found']:
-                act         = r.get('activity', 'Unknown')
-                row_bg      = '#f0faf4' if act == 'Active' else '#fffbf0'
-                icon        = '✔' if act == 'Active' else '⚠'
-                icon_color  = '#1a7a4a' if act == 'Active' else '#c87800'
-                days_str    = (
-                    f"<span style='color:#888;font-size:11px;'>"
-                    f"({'Today' if r['days_ago'] == 0 else str(r['days_ago']) + ' days ago'})"
-                    f"</span>"
-                    if r['days_ago'] is not None else
-                    "<span style='color:#aaa;font-size:11px;'>(unknown)</span>"
-                )
+            days_str = (
+                f"<span style='color:#888;font-size:11px;'>"
+                f"({'Today' if r['days_ago'] == 0 else str(r['days_ago']) + ' days ago'})"
+                f"</span>"
+                if r['days_ago'] is not None else
+                "<span style='color:#aaa;font-size:11px;'>(no events yet)</span>"
+            )
+
+            if not r['found']:
+                # Primary type missing — red row
                 type_rows += f"""
-                <tr style="background:{row_bg};">
+                <tr style="background:#fff5f5;">
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
-                             font-size:12px;color:{icon_color};font-weight:700;
-                             width:24px;text-align:center;">{icon}</td>
+                             font-size:12px;color:#c0392b;font-weight:700;
+                             width:24px;text-align:center;">✖</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c0392b;font-weight:600;">
+                    {r['expected']}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c0392b;">—</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c0392b;">—</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c0392b;font-style:italic;">
+                    Not found — please onboard this log source type.</td>
+                </tr>"""
+
+            elif r['companion_needed'] and not r['companion_found']:
+                # Primary found, companion missing — amber row
+                type_rows += f"""
+                <tr style="background:#fffbf0;">
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c87800;font-weight:700;
+                             width:24px;text-align:center;">⚠</td>
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
                              font-size:12px;color:#333;font-weight:600;">
                     {r['expected']}</td>
@@ -638,65 +766,65 @@ def _build_reply_html(hostname, qradar_result, type_validation=None):
                              font-size:12px;color:#555;">
                     {r.get('last_seen','N/A')} {days_str}</td>
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
-                             font-size:12px;color:{icon_color};font-weight:600;">
-                    {act}</td>
+                             font-size:12px;color:#c87800;font-style:italic;">
+                    Found — but <b>{r['companion_needed']}</b> companion missing.</td>
                 </tr>"""
+
             else:
+                # Primary found, companion satisfied or not needed — green row
                 type_rows += f"""
-                <tr style="background:#fff5f5;">
+                <tr style="background:#f0faf4;">
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
-                             font-size:12px;color:#c0392b;font-weight:700;
-                             width:24px;text-align:center;">✖</td>
+                             font-size:12px;color:#1a7a4a;font-weight:700;
+                             width:24px;text-align:center;">✔</td>
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
-                             font-size:12px;color:#c0392b;font-weight:600;">
+                             font-size:12px;color:#333;font-weight:600;">
                     {r['expected']}</td>
-                  <td colspan="3"
-                      style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
-                             font-size:12px;color:#c0392b;font-style:italic;">
-                    Not found in QRadar — please onboard this log source type.
-                  </td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#555;">{r.get('ls_name','N/A')}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#555;">
+                    {r.get('last_seen','N/A')} {days_str}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#1a7a4a;font-weight:600;">
+                    Confirmed</td>
                 </tr>"""
 
         detail_block = f"""
-        <table style="width:100%;max-width:600px;border-collapse:collapse;
+        <table style="width:100%;max-width:640px;border-collapse:collapse;
                       margin-top:16px;border:1px solid #e0e0e0;
                       border-radius:6px;overflow:hidden;">
           <tr style="background:#f5f5f5;">
-            <th style="padding:7px 12px;font-size:11px;color:#777;
-                       font-weight:600;text-align:left;
-                       border-bottom:2px solid #ddd;width:24px;"></th>
-            <th style="padding:7px 12px;font-size:11px;color:#777;
-                       font-weight:600;text-align:left;
-                       border-bottom:2px solid #ddd;">Expected Type</th>
-            <th style="padding:7px 12px;font-size:11px;color:#777;
-                       font-weight:600;text-align:left;
-                       border-bottom:2px solid #ddd;">Log Source Name</th>
-            <th style="padding:7px 12px;font-size:11px;color:#777;
-                       font-weight:600;text-align:left;
-                       border-bottom:2px solid #ddd;">Last Event</th>
-            <th style="padding:7px 12px;font-size:11px;color:#777;
-                       font-weight:600;text-align:left;
-                       border-bottom:2px solid #ddd;">Status</th>
+            <th style="padding:7px 12px;font-size:11px;color:#777;font-weight:600;
+                       text-align:left;border-bottom:2px solid #ddd;
+                       width:24px;"></th>
+            <th style="padding:7px 12px;font-size:11px;color:#777;font-weight:600;
+                       text-align:left;border-bottom:2px solid #ddd;">
+              Expected Type</th>
+            <th style="padding:7px 12px;font-size:11px;color:#777;font-weight:600;
+                       text-align:left;border-bottom:2px solid #ddd;">
+              Log Source Name</th>
+            <th style="padding:7px 12px;font-size:11px;color:#777;font-weight:600;
+                       text-align:left;border-bottom:2px solid #ddd;">
+              Last Event</th>
+            <th style="padding:7px 12px;font-size:11px;color:#777;font-weight:600;
+                       text-align:left;border-bottom:2px solid #ddd;">
+              Result</th>
           </tr>
           {type_rows}
         </table>"""
 
-    # ── ORIGINAL SINGLE-SOURCE MODE (EXPECTED_LS_TYPES_CHECK is empty) ──
+    # ── SINGLE-SOURCE MODE (EXPECTED_LS_TYPES_CHECK empty) ──
     else:
-        activity = qradar_result.get('activity_status', '')
-        if activity == 'Active':
-            banner_color = '#1a7a4a'
-            banner_label = '✔  Reporting in SIEM'
-            summary_line = f"<b>{hostname}</b> is confirmed reporting in SIEM."
-        else:
-            banner_color = '#c87800'
-            banner_label = '⚠  Found but Not Reporting'
-            summary_line = (
-                f"<b>{hostname}</b> was found in SIEM but has "
-                f"<b>not reported recently</b>. "
-                f"Please investigate why this source has gone silent."
-            )
-
+        banner_color = '#1a7a4a'
+        banner_label = '✔&nbsp; Reporting in SIEM'
+        summary_line = f"<b>{hostname}</b> is confirmed present in SIEM."
+        days_val     = qradar_result.get('days_since_last_event')
+        days_display = (
+            'Today' if days_val == 0
+            else f"{days_val} days ago" if days_val is not None
+            else 'N/A'
+        )
         detail_block = f"""
         <table style="width:100%;max-width:480px;border-collapse:collapse;
                       margin-top:16px;border:1px solid #e0e0e0;
@@ -722,7 +850,7 @@ def _build_reply_html(hostname, qradar_result, type_validation=None):
             <td style="padding:7px 12px;font-size:13px;color:#333;">
               {qradar_result.get('last_seen','N/A')}
               &nbsp;<span style="color:#888;font-size:12px;">
-                ({qradar_result.get('days_since_last_event','N/A')} days ago)
+                ({days_display})
               </span>
             </td>
           </tr>
@@ -732,28 +860,21 @@ def _build_reply_html(hostname, qradar_result, type_validation=None):
 <html>
 <body style="font-family:'Segoe UI',Arial,sans-serif;color:#222;
              font-size:13px;line-height:1.6;margin:0;padding:0;">
-  <div style="max-width:620px;padding:20px 0;">
-
+  <div style="max-width:660px;padding:20px 0;">
     <p style="margin:0 0 16px 0;">Hi,</p>
-
     <div style="background:{banner_color};color:#fff;padding:10px 16px;
                 border-radius:6px;font-size:13px;font-weight:600;
                 margin-bottom:16px;letter-spacing:0.2px;">
       {banner_label}
     </div>
-
     <p style="margin:0 0 4px 0;">{summary_line}</p>
-
     {detail_block}
-
     <p style="margin:20px 0 4px 0;color:#555;font-size:12px;">
       This is an automated response from the SIEM monitoring system.<br>
       Checked against QRadar on {run_time}.
     </p>
-
     <p style="margin:16px 0 0 0;">Regards,<br>
     <span style="font-weight:600;">SOC — Automated SIEM Check</span></p>
-
   </div>
 </body>
 </html>"""
