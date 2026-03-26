@@ -64,7 +64,7 @@ REQUEST_TIMEOUT = 30
 # Key order = detection priority (Windows checked before Linux here).
 #
 # Each entry in 'required' gets its own row in the reply table.
-# All must be present for a green result.
+# All must be present AND reporting for a green result.
 #
 # Leave OS_TYPE_GROUPS = {} to disable type validation entirely and fall
 # back to a simple found/not-found reply.
@@ -77,8 +77,9 @@ OS_TYPE_GROUPS = {
     },
 }
 
-# Onboarding escalation — when a required log source type is missing,
-# this person is added to CC and mentioned in the reply body.
+# Onboarding escalation — when a required log source type is missing OR found
+# but has sent no events yet, this person is added to CC and mentioned in the
+# reply body.
 # Set ONBOARD_REQUEST_CC to '' to disable CC entirely.
 # ONBOARD_REQUEST_NAME is how they appear in the email body e.g. '@xyz'
 ONBOARD_REQUEST_CC   = 'onboarding-owner@yourorg.com'
@@ -86,25 +87,24 @@ ONBOARD_REQUEST_NAME = '@xyz'
 
 # ─── REPLY TEMPLATES ───────────────────────────────────────────────────────────
 # The reply wording is built in _build_reply_html() below the config block.
-# Three scenarios are handled automatically:
-#   Active      — green banner, confirmed reporting, log source details shown
-#   Inactive    — amber banner, found but not reporting, details + warning shown
-#   Not Found   — red banner, not in QRadar inventory
+# Four scenarios are handled automatically:
+#   Active (all confirmed)  — green banner, all log source details shown
+#   Silent (found, no events) — amber banner, found but zero events, CC escalated
+#   Partial (types missing) — amber banner, missing types highlighted, CC escalated
+#   Not Found               — red banner, not in QRadar inventory
 #
 # To change wording, edit the summary_line strings inside _build_reply_html().
-# Placeholders available: hostname, actual_name, ls_type, last_seen, days_since_last_event
 
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
 
 # Activity threshold for Active vs Inactive determination (days)
-# Mirrors the same logic as the main inventory script
 ACTIVITY_THRESHOLD_DAYS = 7
 
 # Valid timestamp boundaries — mirrors main script
 _MIN_TS = 0
 _MAX_TS = 2147483647
 
-# Global Log Source Types cache — same pattern as main script
+# Global Log Source Types cache
 LOG_SOURCE_TYPES_CACHE = {}
 
 
@@ -153,7 +153,6 @@ def release_lock():
 def test_qradar_connection():
     """
     Tests QRadar connection before processing any emails.
-    Mirrors the same pre-flight check as the main inventory script.
     If this fails, no drafts are created — emails stay untouched for the next run.
     """
     _log("🔗 Testing QRadar connection...")
@@ -184,7 +183,6 @@ def test_qradar_connection():
 def fetch_log_source_types():
     """
     Pre-fetches Log Source Type ID → Name dictionary into memory.
-    Exact same pattern as the main inventory script.
     """
     _log("📥 Fetching Log Source Types into cache...")
     endpoint = f"{QRADAR_HOST.rstrip('/')}/api/config/event_sources/log_source_management/log_source_types"
@@ -225,7 +223,6 @@ def _empty_result():
 def _safe_timestamp(timestamp_ms):
     """
     Converts QRadar epoch ms timestamp to a readable string and activity status.
-    Mirrors safe_timestamp_conversion from the main script exactly.
     Read-only — no side effects.
     """
     if not timestamp_ms:
@@ -255,12 +252,7 @@ def _safe_timestamp(timestamp_ms):
 def query_log_source_readonly(hostname):
     """
     STRICTLY READ-ONLY QRadar query for a given hostname.
-
-    Only HTTP GET requests are used — no POST, PUT, PATCH or DELETE anywhere
-    in this function. Nothing in QRadar is modified, created or deleted.
-
-    Logic mirrors get_log_source_details from the main inventory script with
-    the IP fallback removed — signoff emails always use hostnames, never IPs.
+    Only HTTP GET requests — nothing in QRadar is modified, created or deleted.
 
     Returns a result dict with status, name, type, last_seen, activity_status,
     and days_since_last_event.
@@ -288,7 +280,6 @@ def query_log_source_readonly(hostname):
         if not ls_data:
             return _empty_result()
 
-        # Pick best source: enabled first, then most recent last_event_time
         enabled  = [s for s in ls_data if s.get('enabled') is True]
         disabled = [s for s in ls_data if s.get('enabled') is False]
         enabled.sort(key=lambda x: x.get('last_event_time') or 0, reverse=True)
@@ -368,12 +359,12 @@ def query_all_log_sources_readonly(hostname):
             ls_type_name = LOG_SOURCE_TYPES_CACHE.get(type_id, f"Unknown Type ID: {type_id}")
             last_seen, activity, days_ago = _safe_timestamp(src.get('last_event_time'))
             sources.append({
-                'name':     src.get('name', hostname),
-                'ls_type':  ls_type_name,
-                'enabled':  src.get('enabled', False),
+                'name':      src.get('name', hostname),
+                'ls_type':   ls_type_name,
+                'enabled':   src.get('enabled', False),
                 'last_seen': last_seen,
-                'activity': activity,
-                'days_ago': days_ago,
+                'activity':  activity,
+                'days_ago':  days_ago,
             })
 
         return {'status': 'Found', 'sources': sources}
@@ -385,19 +376,20 @@ def query_all_log_sources_readonly(hostname):
 def validate_expected_types(all_sources_result, required_types):
     """
     Checks each entry in required_types against all returned QRadar sources.
-    Uses the same fuzzy keyword matching as the main inventory script.
+    Uses fuzzy keyword matching — each word in the required type keyword must
+    appear in the log source type name.
 
-    Each required type gets its own result row — shown as a separate
-    table row in the reply email regardless of found/not-found state.
+    Each required type gets its own result row — shown as a separate table row
+    in the reply email regardless of found/not-found/silent state.
 
     Returns a list of dicts, one per required type:
       {
         'expected':  str,         # keyword from config
-        'found':     bool,
+        'found':     bool,        # True if type exists in QRadar
         'ls_type':   str | None,  # resolved QRadar type name if found
         'ls_name':   str | None,
         'last_seen': str | None,
-        'days_ago':  int | None
+        'days_ago':  int | None   # None means found but zero events recorded
       }
     """
     results = []
@@ -434,7 +426,7 @@ def validate_expected_types(all_sources_result, required_types):
             'ls_type':  best.get('ls_type'),
             'ls_name':  best.get('name'),
             'last_seen': best.get('last_seen'),
-            'days_ago': best.get('days_ago'),
+            'days_ago': best.get('days_ago'),   # None = found but no events yet
         })
 
     return results
@@ -460,7 +452,6 @@ def detect_os_group(sources):
         if not required:
             continue
 
-        # Use the first required type as the OS signature
         signature_words = str(required[0]).lower().split()
         signature_found = any(
             all(w in str(s.get('ls_type', '')).lower() for w in signature_words)
@@ -480,11 +471,10 @@ def is_sender_allowed(sender_address):
     Supports exact address matching and @domain wildcard matching.
     Case-insensitive on both sides.
 
-    If ALLOWED_SENDERS is empty, all senders are allowed — all other
-    checks (subject guards, DL in body, conversation deduplication) remain active.
+    If ALLOWED_SENDERS is empty, all senders are allowed.
     """
     if not ALLOWED_SENDERS:
-        return True   # empty list = allow all senders, no restriction
+        return True
 
     if not sender_address:
         return False
@@ -494,11 +484,9 @@ def is_sender_allowed(sender_address):
     for entry in ALLOWED_SENDERS:
         entry_clean = entry.strip().lower()
 
-        # @domain wildcard — sender must end with this domain
         if entry_clean.startswith('@'):
             if sender_clean.endswith(entry_clean):
                 return True
-        # Exact address match
         else:
             if sender_clean == entry_clean:
                 return True
@@ -510,7 +498,6 @@ def is_sender_allowed(sender_address):
 def passes_subject_guards(subject):
     """
     All four guards must pass before an email is considered for processing.
-    Any failure returns False with a reason string for logging.
 
     Guards:
       1. Must contain the SUBJECT_SEPARATOR
@@ -524,20 +511,16 @@ def passes_subject_guards(subject):
     subject_stripped = subject.strip()
     subject_lower    = subject_stripped.lower()
 
-    # Guard 3 — reply/forward prefixes
     reply_prefixes = ('re:', 'fw:', 'fwd:')
     if any(subject_lower.startswith(p) for p in reply_prefixes):
         return False, f"reply/forward prefix detected: '{subject_stripped[:30]}'"
 
-    # Guard 4 — already processed tag
     if '[processed]' in subject_lower:
         return False, "subject contains [Processed] tag"
 
-    # Guard 1 — separator must be present
     if SUBJECT_SEPARATOR not in subject_stripped:
         return False, f"separator '{SUBJECT_SEPARATOR}' not found in subject"
 
-    # Guard 2 — keyword must appear left of separator
     left_side = subject_stripped.split(SUBJECT_SEPARATOR)[0].strip().lower()
     if SUBJECT_KEYWORD.lower() not in left_side:
         return False, f"keyword '{SUBJECT_KEYWORD}' not found left of separator"
@@ -563,8 +546,6 @@ def is_already_handled(mail_item, sent_folder, drafts_folder):
 
     This is the primary deduplication mechanism — no local storage needed.
     If a reply was already sent OR a draft already exists, returns True.
-
-    If you delete a draft manually, the next run will create a fresh one.
     """
     conv_id = mail_item.ConversationID
 
@@ -591,21 +572,22 @@ def is_already_handled(mail_item, sent_folder, drafts_folder):
     return False, "not handled"
 
 
+# ─── HTML REPLY BUILDER ────────────────────────────────────────────────────────
 def _build_reply_html(hostname, qradar_result, type_validation=None, os_group=None):
     """
     Builds the HTML reply body.
 
-    States:
-      Not Found / no sources  → red banner
-      All required types found → green banner, per-type table
-      Any type missing         → amber banner, per-type table with red rows
-      No type validation       → green banner, simple source detail
+    Four states:
+      Not Found / no sources     → red banner
+      All types found + reporting → green banner, all rows green
+      Any type found but silent  → amber banner, silent rows amber with CC name
+      Any type missing entirely  → amber banner, missing rows red with CC name
     """
     status   = qradar_result.get('status') if qradar_result else 'Not Found'
     sources  = qradar_result.get('sources', []) if qradar_result else []
     run_time = datetime.now().strftime('%d %B %Y, %H:%M')
 
-    # ── NOT FOUND ──
+    # ── NOT FOUND ──────────────────────────────────────────────────────────────
     if status != 'Found' or not sources:
         return f"""
 <html>
@@ -633,40 +615,58 @@ def _build_reply_html(hostname, qradar_result, type_validation=None, os_group=No
 </body>
 </html>"""
 
-    # ── TYPE VALIDATION MODE ──
+    # ── TYPE VALIDATION MODE ───────────────────────────────────────────────────
     if type_validation is not None:
-        any_missing = any(not r['found'] for r in type_validation)
-        os_label    = f' ({os_group} device)' if os_group else ''
+        os_label = f' ({os_group} device)' if os_group else ''
 
-        if not any_missing:
+        # FIX: any_problem covers BOTH missing types AND found-but-silent sources
+        any_missing   = any(not r['found'] for r in type_validation)
+        any_no_events = any(r['found'] and r['days_ago'] is None for r in type_validation)
+        any_problem   = any_missing or any_no_events
+
+        if not any_problem:
+            # All types found AND all have sent events — full green
             banner_color = '#1a7a4a'
             banner_label = '✔&nbsp; Confirmed Reporting on SIEM'
             summary_line = (
                 f"<b>{hostname}</b> is reporting on our SIEM{os_label}. "
                 f"All required log sources are present and active."
             )
+
         else:
+            # Amber banner — distinguish wording by problem type
             banner_color = '#c87800'
             found_count  = sum(1 for r in type_validation if r['found'])
             total_count  = len(type_validation)
-            banner_label = '⚠&nbsp; Partial — Log Sources Missing'
-            summary_line = (
-                f"<b>{hostname}</b>{os_label} — {found_count} of {total_count} "
-                f"required log sources found on SIEM. "
-                f"Missing sources are highlighted below."
-            )
 
+            if any_missing:
+                banner_label = '⚠&nbsp; Partial — Log Sources Missing'
+                summary_line = (
+                    f"<b>{hostname}</b>{os_label} — {found_count} of {total_count} "
+                    f"required log sources found on SIEM. "
+                    f"Missing sources are highlighted below."
+                )
+            else:
+                # All onboarded but at least one is completely silent
+                banner_label = '⚠&nbsp; Partial — Log Sources Not Reporting'
+                summary_line = (
+                    f"<b>{hostname}</b>{os_label} — all {total_count} required log "
+                    f"sources are onboarded but one or more have not sent any events "
+                    f"yet. Please investigate."
+                )
+
+        # ── Build per-type table rows ──────────────────────────────────────────
         type_rows = ''
         for r in type_validation:
             days_str = (
                 f"<span style='color:#888;font-size:11px;'>"
                 f"({'Today' if r['days_ago'] == 0 else str(r['days_ago']) + ' days ago'})"
                 f"</span>"
-                if r['days_ago'] is not None else
-                "<span style='color:#aaa;font-size:11px;'>(no events yet)</span>"
+                if r['days_ago'] is not None else ''
             )
 
             if not r['found']:
+                # ── RED ROW — type missing entirely ───────────────────────────
                 onboard_note = (
                     f"{ONBOARD_REQUEST_NAME}, request you to onboard this "
                     f"log source on SIEM."
@@ -689,7 +689,40 @@ def _build_reply_html(hostname, qradar_result, type_validation=None, os_group=No
                              font-size:12px;color:#c0392b;font-style:italic;">
                     {onboard_note}</td>
                 </tr>"""
+
+            elif r['days_ago'] is None:
+                # ── AMBER ROW — found in QRadar but zero events received yet ──
+                #
+                # FIX: This is the new third row state. Previously these rows
+                # fell through to the green block and showed "Confirmed" despite
+                # having no events. Now they render amber with an explicit
+                # "no events received" note and the CC person called out by name.
+                no_event_note = (
+                    f"{ONBOARD_REQUEST_NAME}, no events received from this log "
+                    f"source yet — please investigate."
+                    if ONBOARD_REQUEST_NAME.strip() else
+                    "No events received yet — please investigate."
+                )
+                type_rows += f"""
+                <tr style="background:#fffbf0;">
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c87800;font-weight:700;
+                             width:24px;text-align:center;">⚠</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c87800;font-weight:600;">
+                    {r['expected']}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#555;">{r.get('ls_name', 'N/A')}</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c87800;font-style:italic;">
+                    No events recorded</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
+                             font-size:12px;color:#c87800;font-style:italic;">
+                    {no_event_note}</td>
+                </tr>"""
+
             else:
+                # ── GREEN ROW — found and actively reporting ───────────────────
                 type_rows += f"""
                 <tr style="background:#f0faf4;">
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
@@ -699,10 +732,10 @@ def _build_reply_html(hostname, qradar_result, type_validation=None, os_group=No
                              font-size:12px;color:#333;font-weight:600;">
                     {r['expected']}</td>
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
-                             font-size:12px;color:#555;">{r.get('ls_name','N/A')}</td>
+                             font-size:12px;color:#555;">{r.get('ls_name', 'N/A')}</td>
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
                              font-size:12px;color:#555;">
-                    {r.get('last_seen','N/A')} {days_str}</td>
+                    {r.get('last_seen', 'N/A')} {days_str}</td>
                   <td style="padding:8px 12px;border-bottom:1px solid #e8e8e8;
                              font-size:12px;color:#1a7a4a;font-weight:600;">
                     Confirmed</td>
@@ -731,13 +764,12 @@ def _build_reply_html(hostname, qradar_result, type_validation=None, os_group=No
           {type_rows}
         </table>"""
 
-    # ── SIMPLE FOUND MODE (OS_TYPE_GROUPS empty or OS undetected) ──
+    # ── SIMPLE FOUND MODE (OS_TYPE_GROUPS empty or OS undetected) ─────────────
     else:
         banner_color = '#1a7a4a'
         banner_label = '✔&nbsp; Confirmed Reporting on SIEM'
         summary_line = f"<b>{hostname}</b> is reporting on our SIEM."
 
-        # Show the best single source from the sources list
         best_src = None
         if sources:
             enabled  = [s for s in sources if s.get('enabled')]
@@ -762,20 +794,20 @@ def _build_reply_html(hostname, qradar_result, type_validation=None, os_group=No
                   Log Source Name</td>
                 <td style="padding:7px 12px;font-size:13px;
                            border-bottom:1px solid #eee;font-weight:600;color:#222;">
-                  {best_src.get('name','N/A')}</td>
+                  {best_src.get('name', 'N/A')}</td>
               </tr>
               <tr>
                 <td style="padding:7px 12px;color:#555;font-size:13px;
                            border-bottom:1px solid #eee;">Log Source Type</td>
                 <td style="padding:7px 12px;font-size:13px;
                            border-bottom:1px solid #eee;color:#333;">
-                  {best_src.get('ls_type','N/A')}</td>
+                  {best_src.get('ls_type', 'N/A')}</td>
               </tr>
               <tr>
                 <td style="padding:7px 12px;color:#555;font-size:13px;">
                   Last Event</td>
                 <td style="padding:7px 12px;font-size:13px;color:#333;">
-                  {best_src.get('last_seen','N/A')}
+                  {best_src.get('last_seen', 'N/A')}
                   &nbsp;<span style="color:#888;font-size:12px;">
                     ({days_display})
                   </span>
@@ -817,12 +849,16 @@ def build_reply_body(hostname, qradar_result):
     If qradar_result has no sources at all → Not Found reply.
     If OS_TYPE_GROUPS is populated → detect OS, validate required types only.
     If OS detection fails (neither signature matched but sources exist) →
-      show what was found with an unrecognised device type warning rather
-      than a false Not Found. This prevents the cache-miss Not Found bug.
+      show what was found with an unrecognised device type warning.
     If OS_TYPE_GROUPS = {} → simple found reply, no type validation.
 
     Returns (html_body, needs_cc) tuple.
-    needs_cc is True only when at least one required type is missing.
+
+    FIX: needs_cc is True when ANY required type is either:
+      - missing entirely (not r['found']), OR
+      - found but has sent zero events (r['found'] and r['days_ago'] is None)
+    Previously only the missing case triggered needs_cc, so found-but-silent
+    sources never added the CC recipient or escalation wording.
     """
     status  = qradar_result.get('status')
     sources = qradar_result.get('sources', [])
@@ -841,9 +877,8 @@ def build_reply_body(hostname, qradar_result):
     group_name, group_rules = detect_os_group(sources)
 
     if group_name is None:
-        # Sources exist but no OS signature matched.
-        # Show what was found instead of a false Not Found.
-        # This handles type cache misses gracefully.
+        # Sources exist but no OS signature matched — show raw sources,
+        # no type validation, to avoid a false Not Found.
         _log(f"      ⚠️  OS group undetected for {hostname} — "
              f"showing raw sources, no type validation applied.")
         return _build_reply_html(hostname, qradar_result,
@@ -854,7 +889,11 @@ def build_reply_body(hostname, qradar_result):
         required_types=group_rules.get('required', []),
     )
 
-    needs_cc = any(not r['found'] for r in validation)
+    # FIX: CC is needed for missing types OR for found-but-silent types
+    needs_cc = any(
+        not r['found'] or (r['found'] and r['days_ago'] is None)
+        for r in validation
+    )
 
     html = _build_reply_html(
         hostname, qradar_result,
@@ -870,7 +909,7 @@ def create_draft_reply(mail_item, html_body, hostname, needs_cc=False):
     Uses ReplyAll so all original recipients are included.
 
     needs_cc: if True and ONBOARD_REQUEST_CC is set, adds that address to CC.
-              Only applied when types are missing — green replies have no CC.
+              Triggered when types are missing OR found but sending no events.
 
     THIS IS DRAFT ONLY — mail.Save() is called, NOT mail.Send().
     No email is sent from this script under any circumstance.
@@ -937,29 +976,20 @@ def body_contains_dl(mail_item):
     """
     Checks whether the email body contains the TRIGGER_DL string.
     The body wording is completely irrelevant — only the DL presence matters.
-    This means wording like 'please check', 'can you validate', 'kindly confirm'
-    can change freely without breaking the script.
 
-    Checks plain text body first. Falls back to HTML body if plain text is empty
-    so rich-text / HTML-only emails are not missed.
-
-    If TRIGGER_DL is set to '' in config, this check is skipped entirely
-    and all sender-validated emails with matching subjects are processed.
-
-    Case-insensitive throughout.
+    Checks plain text body first. Falls back to HTML body if plain text is empty.
+    Case-insensitive. If TRIGGER_DL = '' in config, this check is skipped.
     """
     if not TRIGGER_DL.strip():
-        return True   # DL check disabled in config
+        return True
 
     dl_lower = TRIGGER_DL.strip().lower()
 
     try:
-        # Primary: plain text body
         body = mail_item.Body or ''
         if dl_lower in body.strip().lower():
             return True
 
-        # Fallback: HTML body — covers cases where .Body is empty in HTML-only emails
         html_body = mail_item.HTMLBody or ''
         if dl_lower in html_body.strip().lower():
             return True
@@ -1004,15 +1034,13 @@ def main():
 
         # ── Scan inbox for emails within the lookback window ──
         cutoff_time = datetime.now() - timedelta(hours=LOOKBACK_HOURS)
-        _log(f"\n📬 Scanning Inbox for emails since {cutoff_time.strftime('%Y-%m-%d %H:%M:%S')}...")
+        _log(f"\n📬 Scanning Inbox for emails since "
+             f"{cutoff_time.strftime('%Y-%m-%d %H:%M:%S')}...")
 
         processed = 0
         skipped   = 0
         drafted   = 0
 
-        # Restrict filters at COM level — only emails within the lookback window
-        # are returned before anything loads into Python.
-        # %I = 12-hour clock (required by Outlook's Restrict filter), %p = AM/PM
         cutoff_str  = cutoff_time.strftime('%m/%d/%Y %I:%M %p')
         inbox_items = list(inbox.Items.Restrict(
             f"[ReceivedTime] >= '{cutoff_str}'"
@@ -1047,7 +1075,6 @@ def main():
             except Exception:
                 sender = ''
 
-            # Skip your own address — prevents processing replies you sent
             if sender.strip().lower() == YOUR_EMAIL_ADDRESS.strip().lower():
                 skipped += 1
                 _log(f"   ⏭️  SKIP (own address): '{subject[:60]}'")
@@ -1055,13 +1082,15 @@ def main():
 
             if not is_sender_allowed(sender):
                 skipped += 1
-                _log(f"   ⏭️  SKIP (sender not in allowlist — {sender}): '{subject[:60]}'")
+                _log(f"   ⏭️  SKIP (sender not in allowlist — {sender}): "
+                     f"'{subject[:60]}'")
                 continue
 
-            # ── Body DL check — wording does not matter, only DL presence does ──
+            # ── Body DL check ──
             if not body_contains_dl(mail_item):
                 skipped += 1
-                _log(f"   ⏭️  SKIP ('{TRIGGER_DL}' not found in body): '{subject[:60]}'")
+                _log(f"   ⏭️  SKIP ('{TRIGGER_DL}' not found in body): "
+                     f"'{subject[:60]}'")
                 continue
 
             # ── Hostname extraction ──
@@ -1083,11 +1112,6 @@ def main():
                 continue
 
             # ── QRadar query — read only ──
-            # Always fetch ALL sources when OS_TYPE_GROUPS is configured so
-            # detect_os_group has the full source list to work with.
-            # query_log_source_readonly returns a single-source dict with no
-            # 'sources' key — passing that to build_reply_body would break
-            # OS detection and falsely report Not Found.
             _log(f"      🔍 Querying QRadar...")
             if OS_TYPE_GROUPS:
                 qradar_result = query_all_log_sources_readonly(hostname)
@@ -1100,7 +1124,8 @@ def main():
 
             # ── Build and save draft ──
             body, needs_cc = build_reply_body(hostname, qradar_result)
-            success = create_draft_reply(mail_item, body, hostname, needs_cc=needs_cc)
+            success = create_draft_reply(mail_item, body, hostname,
+                                         needs_cc=needs_cc)
 
             if success:
                 drafted += 1
@@ -1116,7 +1141,6 @@ def main():
         _log(f"{'='*60}\n")
 
     finally:
-        # Always release lock even if an exception occurs mid-run
         release_lock()
 
 
