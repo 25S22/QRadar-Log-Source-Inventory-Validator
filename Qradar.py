@@ -414,7 +414,10 @@ def process_sheet(df, sheet_name, qradar_host, username, password,
                 df.at[original_idx, 'last_seen']       = 'N/A'
                 continue
 
-            print(f"\n🔹 [{processed_count}/{target_count}] {name_val or 'Unknown'} -> {details['status']}")
+            _sep = '─' * 56
+            print(f"\n  {_sep}")
+            print(f"  [{processed_count}/{target_count}]  {name_val or 'Unknown'}")
+            print(f"  {_sep}")
 
             df.at[idx, 'QRadar Actual Name'] = details['actual_name']
             df.at[idx, 'Log Source Type']    = details['ls_type']
@@ -427,21 +430,29 @@ def process_sheet(df, sheet_name, qradar_host, username, password,
                 df.at[idx, 'days_since_last_event'] = details['days_since_last_event']
 
                 base_remark = f"Found by {search_method}"
+
+                # Always show resolution details
+                print(f"  🔍 Match Via   : {search_method}")
+                print(f"  📛 QRadar Name : {details['actual_name']}")
+                print(f"  🏷️  LS Type     : {details['ls_type']}")
+                print(f"  🆔 QRadar ID   : {details['qradar_id']}")
+
                 if details.get('is_older_expected'):
                     base_remark += " | ⚠️ Bypassed newer unexpected source"
-                    print(f"      🚨 Bypassed newer unexpected log source!")
+                    print(f"  🚨 WARNING     : Bypassed a newer unexpected log source!")
 
                 if details['enabled'] == 'No':
                     df.at[idx, 'status']          = 'Found'
                     df.at[idx, 'remarks']         = "Disabled on QRadar"
                     df.at[idx, 'activity_status'] = "Disabled"
-                    print(f"      ⚪ Status: Disabled")
+                    print(f"  ⚪ Status      : DISABLED")
                 else:
                     df.at[idx, 'status']          = 'Found'
                     df.at[idx, 'remarks']         = base_remark
                     df.at[idx, 'activity_status'] = details['activity_status']
-                    print(f"      📊 Activity: {details['activity_status']}")
-                    print(f"      📅 Last Event: {details['last_seen']} ({details['days_since_last_event']} days ago)")
+                    _activity_icon = '✅' if details['activity_status'] == 'Active' else '🔴'
+                    print(f"  {_activity_icon} Activity    : {details['activity_status']}")
+                    print(f"  📅 Last Event  : {details['last_seen']}  ({details['days_since_last_event']} days ago)")
             else:
                 status_val = details['status']
                 remark_val = f"❌ {status_val}"
@@ -451,14 +462,14 @@ def process_sheet(df, sheet_name, qradar_host, username, password,
                     status_val = "Inferred"
                     remark_val = "Under WLC (Inferred)"
                     act_val    = "Inferred"
-                    print("      ℹ️  Inferred as WLC")
+                    print(f"  ℹ️  Status      : INFERRED — grouped under WLC")
                 elif name_val and "FW" in name_val:
                     status_val = "Inferred"
                     remark_val = "Under Forti (Inferred)"
                     act_val    = "Inferred"
-                    print("      ℹ️  Inferred as FortiGate")
+                    print(f"  ℹ️  Status      : INFERRED — grouped under FortiGate")
                 else:
-                    print(f"      ❌ Result: {status_val.upper()}")
+                    print(f"  ❌ Status      : {status_val.upper()}")
 
                 df.at[idx, 'status']                = status_val
                 df.at[idx, 'remarks']               = remark_val
@@ -684,69 +695,75 @@ def _build_actionable_table(report_df, logsource_col, ip_col):
         left_color = meta['accent']
 
         rows_html += f"""
-        <tr style="background:{row_bg};border-left:3px solid {left_color}20;">
-          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
-                     font-size:11px;color:{P['text_primary']};max-width:230px;">
+        <tr bgcolor="{row_bg}" style="background:{row_bg};">
+          <td bgcolor="{row_bg}"
+              style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
+                     background:{row_bg};font-size:11px;color:{P['text_primary']};
+                     max-width:230px;">
             <span title="{hostname}" style="font-family:monospace;">
               {hostname_display}
             </span>
           </td>
-          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
-                     font-size:11px;color:{P['text_secondary']};text-align:center;
-                     white-space:nowrap;font-family:monospace;">{ip_val}</td>
-          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
-                     font-size:11px;color:{P['purple_light']};text-align:center;
-                     white-space:nowrap;font-family:monospace;">{qradar_id}</td>
-          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
-                     font-size:11px;color:{P['text_secondary']};text-align:center;">
+          <td bgcolor="{row_bg}"
+              style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
+                     background:{row_bg};font-size:11px;color:{P['text_secondary']};
+                     text-align:center;white-space:nowrap;font-family:monospace;">
+            {ip_val}
+          </td>
+          <td bgcolor="{row_bg}"
+              style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
+                     background:{row_bg};font-size:11px;color:{P['purple_light']};
+                     text-align:center;white-space:nowrap;font-family:monospace;">
+            {qradar_id}
+          </td>
+          <td bgcolor="{row_bg}"
+              style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
+                     background:{row_bg};font-size:11px;color:{P['text_secondary']};
+                     text-align:center;">
             {last_seen}{days_str}
           </td>
-          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
-                     text-align:center;">
-            <span style="
-              background:{meta['badge_bg']};
-              color:#f0eaff;
-              font-size:9px;
-              font-weight:700;
-              padding:3px 10px;
-              border-radius:4px;
-              letter-spacing:0.6px;
-              white-space:nowrap;
-              font-family:monospace;
-            ">{meta['icon']}&nbsp;{meta['label']}</span>
+          <td bgcolor="{row_bg}"
+              style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
+                     background:{row_bg};text-align:center;">
+            <span style="background:{meta['badge_bg']};color:#f0eaff;font-size:9px;
+                         font-weight:700;padding:3px 10px;border-radius:4px;
+                         letter-spacing:0.6px;white-space:nowrap;
+                         font-family:monospace;">
+              {meta['icon']}&nbsp;{meta['label']}
+            </span>
           </td>
         </tr>"""
 
     P = _P
     return f"""
     <table width="100%" cellpadding="0" cellspacing="0"
-           style="border-collapse:collapse;margin-top:10px;border-radius:6px;overflow:hidden;">
+           style="border-collapse:collapse;margin-top:10px;">
       <thead>
-        <tr style="background:{P['bg3']};">
-          <th style="padding:8px 14px;text-align:left;font-size:9px;
-                     color:{P['purple_light']};font-weight:700;
-                     text-transform:uppercase;letter-spacing:1.2px;
-                     border-bottom:2px solid {P['purple_deep']};
+        <tr bgcolor="{P['bg3']}" style="background:{P['bg3']};">
+          <th bgcolor="{P['bg3']}"
+              style="padding:8px 14px;text-align:left;font-size:9px;background:{P['bg3']};
+                     color:{P['purple_light']};font-weight:700;text-transform:uppercase;
+                     letter-spacing:1.2px;border-bottom:2px solid {P['purple_deep']};
                      font-family:monospace;">Hostname / Log Source</th>
-          <th style="padding:8px 14px;text-align:center;font-size:9px;
-                     color:{P['purple_light']};font-weight:700;
-                     text-transform:uppercase;letter-spacing:1.2px;
-                     border-bottom:2px solid {P['purple_deep']};
+          <th bgcolor="{P['bg3']}"
+              style="padding:8px 14px;text-align:center;font-size:9px;background:{P['bg3']};
+                     color:{P['purple_light']};font-weight:700;text-transform:uppercase;
+                     letter-spacing:1.2px;border-bottom:2px solid {P['purple_deep']};
                      font-family:monospace;">IP Address</th>
-          <th style="padding:8px 14px;text-align:center;font-size:9px;
-                     color:{P['purple_light']};font-weight:700;
-                     text-transform:uppercase;letter-spacing:1.2px;
-                     border-bottom:2px solid {P['purple_deep']};
+          <th bgcolor="{P['bg3']}"
+              style="padding:8px 14px;text-align:center;font-size:9px;background:{P['bg3']};
+                     color:{P['purple_light']};font-weight:700;text-transform:uppercase;
+                     letter-spacing:1.2px;border-bottom:2px solid {P['purple_deep']};
                      font-family:monospace;">QRadar ID</th>
-          <th style="padding:8px 14px;text-align:center;font-size:9px;
-                     color:{P['purple_light']};font-weight:700;
-                     text-transform:uppercase;letter-spacing:1.2px;
-                     border-bottom:2px solid {P['purple_deep']};
+          <th bgcolor="{P['bg3']}"
+              style="padding:8px 14px;text-align:center;font-size:9px;background:{P['bg3']};
+                     color:{P['purple_light']};font-weight:700;text-transform:uppercase;
+                     letter-spacing:1.2px;border-bottom:2px solid {P['purple_deep']};
                      font-family:monospace;">Last Event</th>
-          <th style="padding:8px 14px;text-align:center;font-size:9px;
-                     color:{P['purple_light']};font-weight:700;
-                     text-transform:uppercase;letter-spacing:1.2px;
-                     border-bottom:2px solid {P['purple_deep']};
+          <th bgcolor="{P['bg3']}"
+              style="padding:8px 14px;text-align:center;font-size:9px;background:{P['bg3']};
+                     color:{P['purple_light']};font-weight:700;text-transform:uppercase;
+                     letter-spacing:1.2px;border-bottom:2px solid {P['purple_deep']};
                      font-family:monospace;">Status</th>
         </tr>
       </thead>
@@ -794,7 +811,7 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
             f'margin-top:4px;font-family:monospace;">{sub}</div>'
         ) if sub else ''
         return f"""
-        <td style="padding:5px 4px;">
+        <td style="padding:5px 4px;" bgcolor="{P['bg1']}">
           <div style="
             background:{P['bg2']};
             border:1px solid {P['border']};
@@ -813,13 +830,12 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
           </div>
         </td>"""
 
-    # Inferred is folded into Active — no separate card
+    # Inferred is folded into Active — no separate card; API Errors omitted from summary
     overall_cards = (
-        metric_card('Active',         active_display,                  P['green'],  'incl. inferred') +
-        metric_card('Inactive',       global_stats['Inactive'],        P['red'])    +
-        metric_card('Not Found',      global_stats['Not Found'],       P['gray'])   +
-        metric_card('Disabled',       global_stats['Disabled'],        P['cyan'])   +
-        metric_card('API Errors',     global_stats['API Errors'],      P['orange']) +
+        metric_card('Active',         active_display,                      P['green'], 'incl. inferred') +
+        metric_card('Inactive',       global_stats['Inactive'],            P['red'])   +
+        metric_card('Not Found',      global_stats['Not Found'],           P['gray'])  +
+        metric_card('Disabled',       global_stats['Disabled'],            P['cyan'])  +
         metric_card('Pending Maint.', global_stats['Pending-Maintenance'], P['blue'])
     )
 
@@ -941,165 +957,156 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
     ) if 'overall_chart' in images_to_embed else ''
 
     # ── Full HTML ──
+    # Solid hex fallbacks used for bgcolor attributes (no gradients — Outlook ignores them)
+    _HDR_BG   = '#1a1035'   # header panel solid fallback
+    _BAN_BG   = '#1a0810'   # action banner
+    _DIV_BG   = '#0e0820'   # divider row
+    _FTR_BG   = '#1a1035'   # footer
+
     return f"""<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:{P['bg0']};
-             font-family:'Segoe UI',Helvetica,Arial,sans-serif;">
+<head><meta charset="UTF-8">
+<!--[if mso]>
+<noscript><xml><o:OfficeDocumentSettings>
+<o:AllowPNG/><o:PixelsPerInch>96</o:PixelsPerInch>
+</o:OfficeDocumentSettings></xml></noscript>
+<![endif]-->
+</head>
+<body bgcolor="{P['bg0']}" style="margin:0;padding:0;background:{P['bg0']};
+      font-family:'Segoe UI',Helvetica,Arial,sans-serif;">
 
-<table width="100%" cellpadding="0" cellspacing="0"
+<!-- Outermost full-width wrapper — forces dark bg edge-to-edge in Outlook -->
+<table width="100%" cellpadding="0" cellspacing="0" border="0"
+       bgcolor="{P['bg0']}"
        style="background:{P['bg0']};padding:28px 0;">
-<tr><td align="center">
-<table width="720" cellpadding="0" cellspacing="0"
-       style="max-width:720px;width:100%;">
+<tr>
+  <td align="center" bgcolor="{P['bg0']}"
+      style="background:{P['bg0']};padding:0;">
 
-  <!-- ══ HEADER ══════════════════════════════════════════════════ -->
-  <tr>
-    <td style="
-      background:linear-gradient(135deg,{P['bg3']} 0%,#1f1045 55%,{P['purple_deep']} 100%);
-      border-radius:10px 10px 0 0;
-      padding:30px 34px 26px;
-      border-bottom:2px solid {P['purple_mid']};
-    ">
-      <table width="100%" cellpadding="0" cellspacing="0"><tr>
-        <td>
-          <div style="
-            font-size:9px;
-            color:{P['purple_light']};
-            letter-spacing:3.5px;
-            text-transform:uppercase;
-            margin-bottom:10px;
-            font-family:monospace;
-          ">QRadar · Inventory Validation</div>
-          <div style="
-            font-size:22px;
-            font-weight:800;
-            color:{P['text_primary']};
-            letter-spacing:-0.5px;
-            line-height:1.3;
-          ">Log Source<br>Validation Report</div>
-          <div style="
-            margin-top:10px;
-            font-size:11px;
-            color:{P['text_muted']};
-            font-family:monospace;
-            letter-spacing:0.3px;
-          ">{run_time}</div>
-        </td>
-        <td align="right" valign="top">
-          <div style="
-            background:{badge_bg};
-            color:#f0eaff;
-            font-size:11px;
-            font-weight:700;
-            padding:9px 20px;
-            border-radius:4px;
-            letter-spacing:1px;
-            white-space:nowrap;
-            font-family:monospace;
-          ">{badge_label}</div>
-        </td>
-      </tr></table>
-    </td>
-  </tr>
+  <!-- Inner 720px container -->
+  <table width="720" cellpadding="0" cellspacing="0" border="0"
+         style="max-width:720px;width:100%;">
 
-  <!-- ══ ACTION BANNER ══════════════════════════════════════════ -->
-  <tr>
-    <td style="
-      background:#1a0810;
-      border-left:4px solid {P['red']};
-      padding:12px 22px;
-    ">
-      <span style="color:{P['red']};font-size:12px;font-weight:700;
-                   font-family:monospace;letter-spacing:0.5px;">
-        ACTION REQUIRED &nbsp;·&nbsp;
-      </span>
-      <span style="color:{P['text_secondary']};font-size:12px;">
-        {total_issues} issues require attention.
-        Attached Excel contains <strong style="color:{P['text_primary']};">actionable items only</strong>.
-      </span>
-    </td>
-  </tr>
+    <!-- ══ HEADER ══════════════════════════════════════════════ -->
+    <tr>
+      <td bgcolor="{_HDR_BG}"
+          style="background:linear-gradient(135deg,{P['bg3']} 0%,#1f1045 55%,{P['purple_deep']} 100%);
+                 border-radius:10px 10px 0 0;padding:30px 34px 26px;
+                 border-bottom:2px solid {P['purple_mid']};">
+        <table width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td bgcolor="{_HDR_BG}"
+                style="background:transparent;">
+              <div style="font-size:9px;color:{P['purple_light']};letter-spacing:3.5px;
+                          text-transform:uppercase;margin-bottom:10px;font-family:monospace;">
+                QRadar &nbsp;·&nbsp; Inventory Validation
+              </div>
+              <div style="font-size:22px;font-weight:800;color:{P['text_primary']};
+                          letter-spacing:-0.5px;line-height:1.3;">
+                Log Source<br>Validation Report
+              </div>
+              <div style="margin-top:10px;font-size:11px;color:{P['text_muted']};
+                          font-family:monospace;letter-spacing:0.3px;">
+                {run_time}
+              </div>
+            </td>
+            <td align="right" valign="top" bgcolor="{_HDR_BG}"
+                style="background:transparent;">
+              <div style="background:{badge_bg};color:#f0eaff;font-size:11px;
+                          font-weight:700;padding:9px 20px;border-radius:4px;
+                          letter-spacing:1px;white-space:nowrap;font-family:monospace;">
+                {badge_label}
+              </div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
 
-  <!-- ══ OVERALL METRICS ════════════════════════════════════════ -->
-  <tr>
-    <td style="background:{P['bg1']};padding:24px 24px 16px;">
-      <div style="
-        font-size:9px;
-        color:{P['purple_light']};
-        text-transform:uppercase;
-        letter-spacing:2.5px;
-        margin-bottom:16px;
-        font-family:monospace;
-      ">Overall Summary &nbsp;·&nbsp; {total_scanned} Sources Validated</div>
-      <table cellpadding="0" cellspacing="0">
-        <tr>{overall_cards}</tr>
-      </table>
-    </td>
-  </tr>
+    <!-- ══ ACTION BANNER ════════════════════════════════════════ -->
+    <tr>
+      <td bgcolor="{_BAN_BG}"
+          style="background:{_BAN_BG};border-left:4px solid {P['red']};
+                 padding:12px 22px;">
+        <span style="color:{P['red']};font-size:12px;font-weight:700;
+                     font-family:monospace;letter-spacing:0.5px;">
+          ACTION REQUIRED &nbsp;·&nbsp;
+        </span>
+        <span style="color:{P['text_secondary']};font-size:12px;">
+          {total_issues} issues require attention.
+          Attached Excel contains
+          <strong style="color:{P['text_primary']};">actionable items only</strong>.
+        </span>
+      </td>
+    </tr>
 
-  <!-- ══ OVERALL DONUT CHART ════════════════════════════════════ -->
-  <tr>
-    <td style="background:{P['bg1']};padding:4px 24px 26px;text-align:center;">
-      <div style="
-        font-size:9px;
-        color:{P['purple_light']};
-        text-transform:uppercase;
-        letter-spacing:2.5px;
-        margin-bottom:8px;
-        font-family:monospace;
-      ">Inventory Health Distribution</div>
-      {overall_chart_html}
-    </td>
-  </tr>
+    <!-- ══ OVERALL METRICS ══════════════════════════════════════ -->
+    <tr>
+      <td bgcolor="{P['bg1']}"
+          style="background:{P['bg1']};padding:24px 24px 16px;">
+        <div style="font-size:9px;color:{P['purple_light']};text-transform:uppercase;
+                    letter-spacing:2.5px;margin-bottom:16px;font-family:monospace;">
+          Overall Summary &nbsp;·&nbsp; {total_scanned} Sources Validated
+        </div>
+        <table cellpadding="0" cellspacing="0" border="0">
+          <tr bgcolor="{P['bg1']}">{overall_cards}</tr>
+        </table>
+      </td>
+    </tr>
 
-  <!-- ══ DIVIDER ════════════════════════════════════════════════ -->
-  <tr>
-    <td style="padding:0;">
-      <div style="height:1px;background:linear-gradient(90deg,
-        {P['bg0']},{P['purple_mid']} 35%,{P['purple_mid']} 65%,{P['bg0']});"></div>
-    </td>
-  </tr>
+    <!-- ══ OVERALL DONUT CHART ══════════════════════════════════ -->
+    <tr>
+      <td bgcolor="{P['bg1']}"
+          style="background:{P['bg1']};padding:4px 24px 26px;text-align:center;">
+        <div style="font-size:9px;color:{P['purple_light']};text-transform:uppercase;
+                    letter-spacing:2.5px;margin-bottom:8px;font-family:monospace;">
+          Inventory Health Distribution
+        </div>
+        {overall_chart_html}
+      </td>
+    </tr>
 
-  <!-- ══ PER-SHEET BREAKDOWN ════════════════════════════════════ -->
-  <tr>
-    <td style="background:{P['bg1']};padding:24px 24px 20px;">
-      <div style="
-        font-size:9px;
-        color:{P['purple_light']};
-        text-transform:uppercase;
-        letter-spacing:2.5px;
-        margin-bottom:4px;
-        font-family:monospace;
-      ">Breakdown by Sheet</div>
-      <div style="font-size:10px;color:{P['text_muted']};margin-bottom:18px;">
-        Each section shows health metrics, distribution chart,
-        and a table of sources requiring remediation.
-      </div>
-      {sheet_blocks}
-    </td>
-  </tr>
+    <!-- ══ DIVIDER ══════════════════════════════════════════════ -->
+    <tr>
+      <td bgcolor="{_DIV_BG}"
+          style="background:{_DIV_BG};padding:0;height:2px;
+                 border-top:2px solid {P['purple_mid']};">
+      </td>
+    </tr>
 
-  <!-- ══ FOOTER ════════════════════════════════════════════════ -->
-  <tr>
-    <td style="
-      background:{P['bg3']};
-      border-radius:0 0 10px 10px;
-      padding:16px 34px;
-      text-align:center;
-      border-top:1px solid {P['border']};
-    ">
-      <div style="
-        font-size:9px;
-        color:{P['text_muted']};
-        letter-spacing:0.8px;
-        font-family:monospace;
-      ">QRadar Inventory Validation &nbsp;·&nbsp; Auto-generated {run_time}</div>
-    </td>
-  </tr>
+    <!-- ══ PER-SHEET BREAKDOWN ══════════════════════════════════ -->
+    <tr>
+      <td bgcolor="{P['bg1']}"
+          style="background:{P['bg1']};padding:24px 24px 20px;">
+        <div style="font-size:9px;color:{P['purple_light']};text-transform:uppercase;
+                    letter-spacing:2.5px;margin-bottom:4px;font-family:monospace;">
+          Breakdown by Sheet
+        </div>
+        <div style="font-size:10px;color:{P['text_muted']};margin-bottom:18px;">
+          Each section shows health metrics, distribution chart,
+          and a table of sources requiring remediation.
+        </div>
+        {sheet_blocks}
+      </td>
+    </tr>
 
-</table>
-</td></tr>
+    <!-- ══ FOOTER ════════════════════════════════════════════════ -->
+    <tr>
+      <td bgcolor="{_FTR_BG}"
+          style="background:{_FTR_BG};border-radius:0 0 10px 10px;
+                 padding:16px 34px;text-align:center;
+                 border-top:1px solid {P['border']};">
+        <div style="font-size:9px;color:{P['text_muted']};
+                    letter-spacing:0.8px;font-family:monospace;">
+          QRadar Inventory Validation &nbsp;·&nbsp; Auto-generated {run_time}
+        </div>
+      </td>
+    </tr>
+
+  </table>
+
+  </td>
+</tr>
 </table>
 </body>
 </html>"""
