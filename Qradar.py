@@ -16,6 +16,7 @@ import traceback
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 # ─── LOGGING SETUP ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -468,7 +469,61 @@ def process_sheet(df, sheet_name, qradar_host, username, password,
     return df
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  VISUAL / AESTHETIC SECTION — all changes below here are purely cosmetic
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─── COLOUR PALETTE ───────────────────────────────────────────────────────────
+_P = {
+    'bg0':          '#07030f',   # deepest background
+    'bg1':          '#0e0820',   # main background
+    'bg2':          '#130b28',   # card surface
+    'bg3':          '#1a1035',   # elevated / header panels
+    'border':       '#2d1b5e',   # panel borders
+    'border_soft':  '#1e1240',   # subtle row dividers
+    'purple_deep':  '#3b1f7a',   # deep accent fill
+    'purple_mid':   '#6d28d9',   # brand purple
+    'purple_bright':'#8b5cf6',   # bright violet
+    'purple_light': '#a78bfa',   # lavender
+    'purple_pale':  '#c4b5fd',   # text highlight
+    'text_primary': '#e2d9f3',   # primary body text
+    'text_secondary':'#9381b5',  # secondary labels
+    'text_muted':   '#5a4a80',   # muted / disabled
+    # Status colours
+    'green':        '#10b981',
+    'red':          '#ef4444',
+    'orange':       '#f59e0b',
+    'gray':         '#6b7280',
+    'cyan':         '#06b6d4',
+    'blue':         '#3b82f6',
+}
+
+# ─── STATUS METADATA ──────────────────────────────────────────────────────────
+_STATUS_META = {
+    'Inactive':    {'bg': '#1a0810', 'accent': _P['red'],    'badge_bg': '#7f1d1d', 'label': 'INACTIVE',    'icon': '●'},
+    'No Activity': {'bg': '#1a0810', 'accent': _P['red'],    'badge_bg': '#7f1d1d', 'label': 'NO ACTIVITY', 'icon': '●'},
+    'Not Found':   {'bg': '#0f0b1e', 'accent': _P['gray'],   'badge_bg': '#374151', 'label': 'NOT FOUND',   'icon': '◌'},
+    'Error':       {'bg': '#150c04', 'accent': _P['orange'],  'badge_bg': '#78350f', 'label': 'API ERROR',   'icon': '▲'},
+}
+
+def _get_status_meta(activity_status):
+    s = str(activity_status).strip()
+    for key, meta in _STATUS_META.items():
+        if key.lower() in s.lower():
+            return meta
+    return {
+        'bg': '#0f0b1e', 'accent': _P['gray'],
+        'badge_bg': '#374151', 'label': s.upper()[:12], 'icon': '◌'
+    }
+
+
+# ─── DONUT CHART GENERATOR ────────────────────────────────────────────────────
 def generate_pie_chart(data_dict, title, prefix='qradar_chart'):
+    """
+    Renders a donut chart on a deep-purple background that matches the email
+    aesthetic. Inferred is already merged into Active by _chart_stats() before
+    this function is called — no logic change here.
+    """
     filtered_data = {k: v for k, v in data_dict.items() if v > 0}
     if not filtered_data:
         return None
@@ -476,34 +531,84 @@ def generate_pie_chart(data_dict, title, prefix='qradar_chart'):
     labels = list(filtered_data.keys())
     sizes  = list(filtered_data.values())
 
+    # Cohesive palette that reads well on dark purple
     color_map = {
-        'Active':              '#28a745',
-        'Inactive':            '#dc3545',
-        'Not Found':           '#6c757d',
-        'API Errors':          '#fd7e14',
-        'Disabled':            '#17a2b8',
-        'Inferred':            '#6f42c1',
-        'Pending-Maintenance': '#007bff'
+        'Active':              '#10b981',   # emerald
+        'Inactive':            '#ef4444',   # red
+        'Not Found':           '#6b7280',   # slate
+        'API Errors':          '#f59e0b',   # amber
+        'Disabled':            '#06b6d4',   # cyan
+        'Inferred':            '#8b5cf6',   # violet (fallback if ever shown)
+        'Pending-Maintenance': '#3b82f6',   # blue
     }
-    colors = [color_map.get(label, '#cccccc') for label in labels]
+    colors = [color_map.get(lbl, '#a78bfa') for lbl in labels]
 
-    fig, ax = plt.subplots(figsize=(4.5, 3.5))
-    ax.pie(
-        sizes, labels=labels, colors=colors, autopct='%1.1f%%',
-        startangle=140, textprops={'fontsize': 9},
-        wedgeprops={'edgecolor': 'white'}
+    bg_color = '#0e0820'
+
+    fig, ax = plt.subplots(figsize=(5, 3.8), facecolor=bg_color)
+    ax.set_facecolor(bg_color)
+
+    wedges, texts, autotexts = ax.pie(
+        sizes,
+        labels=None,           # legend handles labels instead
+        colors=colors,
+        autopct=lambda pct: f'{pct:.1f}%' if pct > 4 else '',
+        startangle=140,
+        wedgeprops={'edgecolor': bg_color, 'linewidth': 2.5, 'width': 0.52},
+        pctdistance=0.78,
+        textprops={'fontsize': 7.5}
     )
+
+    for at in autotexts:
+        at.set_color('#f0eaff')
+        at.set_fontweight('bold')
+        at.set_fontsize(7.5)
+
+    # Centre hole annotation — total count
+    total = sum(sizes)
+    ax.text(0, 0.08, str(total), ha='center', va='center',
+            fontsize=18, fontweight='bold', color='#c4b5fd')
+    ax.text(0, -0.22, 'TOTAL', ha='center', va='center',
+            fontsize=6.5, color='#6d5a9a', fontweight='600',
+            fontfamily='monospace')
+
+    # Legend on the right
+    legend_patches = [
+        mpatches.Patch(color=color_map.get(lbl, '#a78bfa'),
+                       label=f'{lbl}  {v}')
+        for lbl, v in zip(labels, sizes)
+    ]
+    leg = ax.legend(
+        handles=legend_patches,
+        loc='center left',
+        bbox_to_anchor=(1.02, 0.5),
+        fontsize=7.5,
+        frameon=False,
+        labelcolor='#a78bfa',
+        handlelength=1.2,
+        handleheight=1.0,
+        borderpad=0.6,
+        labelspacing=0.65,
+    )
+    for text in leg.get_texts():
+        text.set_color('#c4b5fd')
+
+    ax.set_title(title, color='#a78bfa', fontsize=9.5, fontweight='700',
+                 pad=12, fontfamily='monospace')
+
     ax.axis('equal')
-    plt.title(title, pad=15, fontsize=11, fontweight='bold')
+    plt.tight_layout(pad=0.4)
 
     tmp      = tempfile.NamedTemporaryFile(suffix='.png', delete=False, prefix=f'{prefix}_')
     filepath = tmp.name
     tmp.close()
-    plt.savefig(filepath, bbox_inches='tight', dpi=100)
+    plt.savefig(filepath, bbox_inches='tight', dpi=110,
+                facecolor=bg_color, edgecolor='none')
     plt.close()
     return filepath
 
 
+# ─── OUTLOOK DRAFT HELPER ─────────────────────────────────────────────────────
 def create_html_outlook_draft(attachment_path, subject, html_body, image_paths):
     try:
         outlook = win32com.client.Dispatch('Outlook.Application')
@@ -535,352 +640,461 @@ def create_html_outlook_draft(attachment_path, subject, html_body, image_paths):
                     print(f"⚠️ Could not delete temp image {img_path}: {cleanup_err}")
 
 
-# ─── STATUS METADATA ───────────────────────────────────────────────────────────
-_STATUS_META = {
-    'Inactive':   {'bg': '#2a0d0d', 'accent': '#dc3545', 'badge_bg': '#dc3545', 'label': 'INACTIVE',   'icon': '🔴'},
-    'No Activity':{'bg': '#2a0d0d', 'accent': '#dc3545', 'badge_bg': '#dc3545', 'label': 'NO ACTIVITY','icon': '🔴'},
-    'Not Found':  {'bg': '#1a1c22', 'accent': '#6c757d', 'badge_bg': '#6c757d', 'label': 'NOT FOUND',  'icon': '⚫'},
-    'Error':      {'bg': '#1f1608', 'accent': '#fd7e14', 'badge_bg': '#fd7e14', 'label': 'API ERROR',  'icon': '🟠'},
-}
-
-def _get_status_meta(activity_status):
-    s = str(activity_status).strip()
-    for key, meta in _STATUS_META.items():
-        if key.lower() in s.lower():
-            return meta
-    return {'bg': '#1a1c22', 'accent': '#6c757d', 'badge_bg': '#6c757d',
-            'label': s.upper()[:12], 'icon': '⚫'}
-
-
+# ─── ACTIONABLE TABLE ─────────────────────────────────────────────────────────
 def _build_actionable_table(report_df, logsource_col, ip_col):
     """
-    Builds a compact inline HTML table for one sheet's actionable rows.
-    Shows: hostname, IP, QRadar ID, status, last event time.
-    Rows are colour-coded by severity tier.
+    Inline HTML table of actionable rows — purple dark theme.
+    Columns: Hostname · IP · QRadar ID · Last Event · Status
     """
     if report_df is None or len(report_df) == 0:
-        return '<p style="color:#3a4a6a;font-size:12px;font-style:italic;padding:8px 0;">No actionable items.</p>'
+        return (
+            f'<p style="color:{_P["text_muted"]};font-size:11px;'
+            f'font-style:italic;padding:10px 2px;">No actionable items for this sheet.</p>'
+        )
 
+    P = _P
     rows_html = ''
     for i, (_, row) in enumerate(report_df.iterrows()):
-        hostname      = str(row.get(logsource_col, 'N/A') or 'N/A')
-        ip_val        = str(row.get(ip_col,        'N/A') or 'N/A')
-        qradar_id     = str(row.get('qradar_id',   'N/A') or 'N/A')
-        last_seen     = str(row.get('last_seen',   'N/A') or 'N/A')
-        act_status    = str(row.get('activity_status', 'Unknown') or 'Unknown')
+        hostname   = str(row.get(logsource_col, 'N/A') or 'N/A')
+        ip_val     = str(row.get(ip_col,        'N/A') or 'N/A')
+        qradar_id  = str(row.get('qradar_id',   'N/A') or 'N/A')
+        last_seen  = str(row.get('last_seen',   'N/A') or 'N/A')
+        act_status = str(row.get('activity_status', 'Unknown') or 'Unknown')
 
-        meta    = _get_status_meta(act_status)
-        row_bg  = meta['bg'] if i % 2 == 0 else '#131929'
+        meta   = _get_status_meta(act_status)
+        row_bg = P['bg2'] if i % 2 == 0 else P['bg1']
 
         days = row.get('days_since_last_event')
         if pd.notna(days) and days is not None:
             try:
-                days_str = (f"<span style='color:#888;font-size:10px;display:block;'>"
-                            f"{'Today' if int(days) == 0 else str(int(days)) + 'd ago'}</span>")
+                d = int(days)
+                days_str = (
+                    f'<span style="color:{P["text_muted"]};font-size:9px;'
+                    f'display:block;margin-top:2px;font-family:monospace;">'
+                    f'{"today" if d == 0 else f"{d}d ago"}</span>'
+                )
             except Exception:
                 days_str = ''
         else:
             days_str = ''
 
-        # Truncate long hostnames gracefully
-        hostname_display = hostname if len(hostname) <= 38 else hostname[:36] + '…'
+        hostname_display = hostname if len(hostname) <= 40 else hostname[:38] + '…'
+
+        # Left accent stripe colour based on severity
+        left_color = meta['accent']
 
         rows_html += f"""
-        <tr style="background:{row_bg};">
-          <td style="padding:8px 12px;border-bottom:1px solid #1e2840;
-                     font-size:11px;color:#c8d0e8;max-width:220px;">
-            <span title="{hostname}">{hostname_display}</span>
+        <tr style="background:{row_bg};border-left:3px solid {left_color}20;">
+          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
+                     font-size:11px;color:{P['text_primary']};max-width:230px;">
+            <span title="{hostname}" style="font-family:monospace;">
+              {hostname_display}
+            </span>
           </td>
-          <td style="padding:8px 12px;border-bottom:1px solid #1e2840;
-                     font-size:11px;color:#8090b0;text-align:center;
-                     white-space:nowrap;">{ip_val}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #1e2840;
-                     font-size:11px;color:#6a80b0;text-align:center;
-                     white-space:nowrap;">{qradar_id}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #1e2840;
-                     font-size:11px;color:#8090b0;text-align:center;">
+          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
+                     font-size:11px;color:{P['text_secondary']};text-align:center;
+                     white-space:nowrap;font-family:monospace;">{ip_val}</td>
+          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
+                     font-size:11px;color:{P['purple_light']};text-align:center;
+                     white-space:nowrap;font-family:monospace;">{qradar_id}</td>
+          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
+                     font-size:11px;color:{P['text_secondary']};text-align:center;">
             {last_seen}{days_str}
           </td>
-          <td style="padding:8px 12px;border-bottom:1px solid #1e2840;
+          <td style="padding:9px 14px;border-bottom:1px solid {P['border_soft']};
                      text-align:center;">
-            <span style="background:{meta['badge_bg']};color:#fff;font-size:9px;
-                         font-weight:700;padding:3px 9px;border-radius:8px;
-                         letter-spacing:0.3px;white-space:nowrap;">
-              {meta['icon']}&nbsp;{meta['label']}
-            </span>
+            <span style="
+              background:{meta['badge_bg']};
+              color:#f0eaff;
+              font-size:9px;
+              font-weight:700;
+              padding:3px 10px;
+              border-radius:4px;
+              letter-spacing:0.6px;
+              white-space:nowrap;
+              font-family:monospace;
+            ">{meta['icon']}&nbsp;{meta['label']}</span>
           </td>
         </tr>"""
 
+    P = _P
     return f"""
     <table width="100%" cellpadding="0" cellspacing="0"
-           style="border-collapse:collapse;margin-top:12px;">
-      <tr style="background:#1a2240;">
-        <th style="padding:7px 12px;text-align:left;font-size:10px;color:#6a80b0;
-                   font-weight:600;text-transform:uppercase;letter-spacing:0.8px;
-                   border-bottom:2px solid #2a3d6b;">Hostname / Log Source</th>
-        <th style="padding:7px 12px;text-align:center;font-size:10px;color:#6a80b0;
-                   font-weight:600;text-transform:uppercase;letter-spacing:0.8px;
-                   border-bottom:2px solid #2a3d6b;">IP Address</th>
-        <th style="padding:7px 12px;text-align:center;font-size:10px;color:#6a80b0;
-                   font-weight:600;text-transform:uppercase;letter-spacing:0.8px;
-                   border-bottom:2px solid #2a3d6b;">QRadar ID</th>
-        <th style="padding:7px 12px;text-align:center;font-size:10px;color:#6a80b0;
-                   font-weight:600;text-transform:uppercase;letter-spacing:0.8px;
-                   border-bottom:2px solid #2a3d6b;">Last Event</th>
-        <th style="padding:7px 12px;text-align:center;font-size:10px;color:#6a80b0;
-                   font-weight:600;text-transform:uppercase;letter-spacing:0.8px;
-                   border-bottom:2px solid #2a3d6b;">Status</th>
-      </tr>
-      {rows_html}
+           style="border-collapse:collapse;margin-top:10px;border-radius:6px;overflow:hidden;">
+      <thead>
+        <tr style="background:{P['bg3']};">
+          <th style="padding:8px 14px;text-align:left;font-size:9px;
+                     color:{P['purple_light']};font-weight:700;
+                     text-transform:uppercase;letter-spacing:1.2px;
+                     border-bottom:2px solid {P['purple_deep']};
+                     font-family:monospace;">Hostname / Log Source</th>
+          <th style="padding:8px 14px;text-align:center;font-size:9px;
+                     color:{P['purple_light']};font-weight:700;
+                     text-transform:uppercase;letter-spacing:1.2px;
+                     border-bottom:2px solid {P['purple_deep']};
+                     font-family:monospace;">IP Address</th>
+          <th style="padding:8px 14px;text-align:center;font-size:9px;
+                     color:{P['purple_light']};font-weight:700;
+                     text-transform:uppercase;letter-spacing:1.2px;
+                     border-bottom:2px solid {P['purple_deep']};
+                     font-family:monospace;">QRadar ID</th>
+          <th style="padding:8px 14px;text-align:center;font-size:9px;
+                     color:{P['purple_light']};font-weight:700;
+                     text-transform:uppercase;letter-spacing:1.2px;
+                     border-bottom:2px solid {P['purple_deep']};
+                     font-family:monospace;">Last Event</th>
+          <th style="padding:8px 14px;text-align:center;font-size:9px;
+                     color:{P['purple_light']};font-weight:700;
+                     text-transform:uppercase;letter-spacing:1.2px;
+                     border-bottom:2px solid {P['purple_deep']};
+                     font-family:monospace;">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows_html}
+      </tbody>
     </table>"""
 
 
+# ─── FULL EMAIL HTML ───────────────────────────────────────────────────────────
 def _build_email_html(global_stats, sheet_stats, total_issues,
                       images_to_embed, report_frames,
                       logsource_col, ip_col):
     """
-    Builds the full HTML email body — dark SOC aesthetic matching the
-    onboarding tracker. Each sheet section now includes:
-      • stat counters + mini pie chart (unchanged)
-      • inline actionable table: hostname · IP · QRadar ID · last event · status
+    Builds the complete HTML email — deep purple QRadar Inventory Validation theme.
+
+    Visual changes vs previous version:
+      • Full deep-purple palette, no white/light backgrounds
+      • Inferred folded into the Active metric card (no separate Inferred card)
+      • Title: QRadar Inventory Validation Report
+      • Donut charts replace old flat pies
+      • Refined monospace data typography throughout
+      • Per-sheet blocks with purple gradient headers
     """
-    run_time      = datetime.now().strftime('%d %B %Y  •  %H:%M:%S')
+    P        = _P
+    run_time = datetime.now().strftime('%d %b %Y  ·  %H:%M:%S')
+
+    # Active = physical active + inferred (display only; logic unchanged)
+    active_display = global_stats['Active'] + global_stats['Inferred']
+
     total_scanned = sum(global_stats.values()) - global_stats['Pending-Maintenance']
 
-    # ── Header severity badge ──
+    # ── Severity badge ──
     if total_issues == 0:
-        badge_bg, badge_label = '#1a7a4a', '✔&nbsp; ALL CLEAR'
+        badge_bg, badge_label = '#065f46', '✔ &nbsp;ALL CLEAR'
     elif total_issues <= 10:
-        badge_bg, badge_label = '#c87800', f'⚠&nbsp; {total_issues} ISSUES'
+        badge_bg, badge_label = '#78350f', f'⚠ &nbsp;{total_issues} ISSUES'
     else:
-        badge_bg, badge_label = '#c0392b', f'⚠&nbsp; {total_issues} ISSUES'
+        badge_bg, badge_label = '#7f1d1d', f'⚠ &nbsp;{total_issues} ISSUES'
 
-    # ── Overall metric cards ──
+    # ── Metric card builder ──
     def metric_card(label, value, accent, sub=''):
-        sub_html = (f'<div style="font-size:9px;color:#4a5a7a;margin-top:3px;">'
-                    f'{sub}</div>') if sub else ''
+        sub_html = (
+            f'<div style="font-size:9px;color:{P["text_muted"]};'
+            f'margin-top:4px;font-family:monospace;">{sub}</div>'
+        ) if sub else ''
         return f"""
-        <td style="padding:5px;">
-          <div style="background:#1e2535;border-left:4px solid {accent};
-                      border-radius:6px;padding:14px 16px;min-width:100px;
-                      text-align:center;">
-            <div style="font-size:26px;font-weight:700;color:{accent};
-                        letter-spacing:-1px;line-height:1;">{value}</div>
-            <div style="font-size:10px;color:#7a86a0;margin-top:5px;
-                        text-transform:uppercase;letter-spacing:0.6px;">{label}</div>
+        <td style="padding:5px 4px;">
+          <div style="
+            background:{P['bg2']};
+            border:1px solid {P['border']};
+            border-top:3px solid {accent};
+            border-radius:6px;
+            padding:14px 16px;
+            min-width:95px;
+            text-align:center;
+          ">
+            <div style="font-size:28px;font-weight:800;color:{accent};
+                        letter-spacing:-1.5px;line-height:1;
+                        font-family:monospace;">{value}</div>
+            <div style="font-size:9px;color:{P['text_secondary']};margin-top:6px;
+                        text-transform:uppercase;letter-spacing:1px;">{label}</div>
             {sub_html}
           </div>
         </td>"""
 
+    # Inferred is folded into Active — no separate card
     overall_cards = (
-        metric_card('Active',         global_stats['Active'] + global_stats['Inferred'],
-                    '#28a745', 'incl. inferred') +
-        metric_card('Inactive',       global_stats['Inactive'],        '#dc3545') +
-        metric_card('Not Found',      global_stats['Not Found'],       '#6c757d') +
-        metric_card('Disabled',       global_stats['Disabled'],        '#17a2b8') +
-        metric_card('Inferred',       global_stats['Inferred'],        '#6f42c1') +
-        metric_card('API Errors',     global_stats['API Errors'],      '#fd7e14') +
-        metric_card('Pending Maint.', global_stats['Pending-Maintenance'], '#007bff')
+        metric_card('Active',         active_display,                  P['green'],  'incl. inferred') +
+        metric_card('Inactive',       global_stats['Inactive'],        P['red'])    +
+        metric_card('Not Found',      global_stats['Not Found'],       P['gray'])   +
+        metric_card('Disabled',       global_stats['Disabled'],        P['cyan'])   +
+        metric_card('API Errors',     global_stats['API Errors'],      P['orange']) +
+        metric_card('Pending Maint.', global_stats['Pending-Maintenance'], P['blue'])
     )
 
-    # ── Per-sheet blocks ──
+    # ── Per-sheet section builder ──
     def stat_pill(label, value, color):
         if value == 0:
             return ''
-        return f"""
-        <span style="display:inline-block;background:{color}22;border:1px solid {color}55;
-                     color:{color};font-size:10px;font-weight:700;padding:3px 10px;
-                     border-radius:10px;margin:3px 4px 3px 0;letter-spacing:0.3px;">
-          {label}&nbsp;{value}
-        </span>"""
+        return (
+            f'<span style="display:inline-block;background:{color}18;'
+            f'border:1px solid {color}50;color:{color};font-size:9.5px;'
+            f'font-weight:700;padding:3px 11px;border-radius:3px;'
+            f'margin:3px 4px 3px 0;letter-spacing:0.4px;font-family:monospace;">'
+            f'{label}&nbsp;&nbsp;{value}</span>'
+        )
 
     sheet_blocks = ''
     for sheet_name, counts in sheet_stats.items():
         cid         = f"chart_{sheet_name.replace(' ', '_')}"
         sheet_total = sum(counts.values()) - counts['Pending-Maintenance']
+        issue_count = counts['Inactive'] + counts['Not Found'] + counts['API Errors']
 
-        # Pill summary row
         pills = (
-            stat_pill('Active',     counts['Active'] + counts['Inferred'], '#28a745') +
-            stat_pill('Inactive',   counts['Inactive'],                    '#dc3545') +
-            stat_pill('Not Found',  counts['Not Found'],                   '#6c757d') +
-            stat_pill('Disabled',   counts['Disabled'],                    '#17a2b8') +
-            stat_pill('API Errors', counts['API Errors'],                  '#fd7e14') +
-            stat_pill('Pending',    counts['Pending-Maintenance'],         '#007bff')
+            stat_pill('ACTIVE',   counts['Active'] + counts['Inferred'], P['green'])  +
+            stat_pill('INACTIVE', counts['Inactive'],                    P['red'])    +
+            stat_pill('NOT FOUND',counts['Not Found'],                   P['gray'])   +
+            stat_pill('DISABLED', counts['Disabled'],                    P['cyan'])   +
+            stat_pill('ERRORS',   counts['API Errors'],                  P['orange']) +
+            stat_pill('PENDING',  counts['Pending-Maintenance'],         P['blue'])
         )
 
         chart_html = (
             f'<img src="cid:{cid}" '
-            f'style="display:block;max-width:280px;margin:14px auto 0;">'
+            f'style="display:block;max-width:340px;margin:14px auto 0;border-radius:4px;">'
         ) if cid in images_to_embed else ''
 
-        # Inline actionable table for this sheet
-        report_df       = report_frames.get(sheet_name)
-        actionable_html = _build_actionable_table(report_df, logsource_col, ip_col)
+        actionable_html = _build_actionable_table(
+            report_frames.get(sheet_name), logsource_col, ip_col
+        )
 
-        issue_count  = counts['Inactive'] + counts['Not Found'] + counts['API Errors']
-        section_accent = '#dc3545' if issue_count > 0 else '#28a745'
+        if issue_count > 0:
+            hdr_gradient = f'linear-gradient(90deg,{P["purple_deep"]}cc,{P["bg3"]})'
+            hdr_border   = P['purple_mid']
+            issue_badge  = (
+                f'<span style="background:{P["red"]}22;color:{P["red"]};'
+                f'font-size:9px;font-weight:700;padding:4px 13px;'
+                f'border-radius:3px;border:1px solid {P["red"]}44;'
+                f'font-family:monospace;letter-spacing:0.5px;">'
+                f'{issue_count} ISSUE{"S" if issue_count != 1 else ""}</span>'
+            )
+        else:
+            hdr_gradient = f'linear-gradient(90deg,#0a2a1a,{P["bg3"]})'
+            hdr_border   = P['green']
+            issue_badge  = (
+                f'<span style="background:{P["green"]}18;color:{P["green"]};'
+                f'font-size:9px;font-weight:700;padding:4px 13px;'
+                f'border-radius:3px;border:1px solid {P["green"]}44;'
+                f'font-family:monospace;letter-spacing:0.5px;">✔ CLEAR</span>'
+            )
 
         sheet_blocks += f"""
-        <div style="background:#161d2e;border:1px solid #252f47;border-radius:10px;
-                    margin-bottom:22px;overflow:hidden;">
-
-          <!-- Sheet header -->
-          <div style="background:{section_accent}18;border-left:4px solid {section_accent};
-                      padding:13px 18px;">
-            <table width="100%" cellpadding="0" cellspacing="0">
-              <tr>
-                <td>
-                  <span style="font-size:14px;font-weight:700;color:#d0d8f0;">
-                    📋&nbsp;{sheet_name}
-                  </span>
-                  <span style="font-size:10px;color:#6a80b0;margin-left:10px;">
-                    {sheet_total} scanned
-                  </span>
-                </td>
-                <td align="right">
-                  {'<span style="background:#dc354522;color:#dc3545;font-size:10px;font-weight:700;padding:4px 12px;border-radius:10px;border:1px solid #dc354555;">' + str(issue_count) + ' ISSUE' + ('S' if issue_count != 1 else '') + '</span>' if issue_count > 0 else '<span style="background:#28a74522;color:#28a745;font-size:10px;font-weight:700;padding:4px 12px;border-radius:10px;border:1px solid #28a74555;">ALL CLEAR</span>'}
-                </td>
-              </tr>
-            </table>
+        <div style="
+          background:{P['bg2']};
+          border:1px solid {P['border']};
+          border-radius:8px;
+          margin-bottom:20px;
+          overflow:hidden;
+        ">
+          <!-- Sheet header bar -->
+          <div style="
+            background:{hdr_gradient};
+            border-left:4px solid {hdr_border};
+            padding:13px 18px;
+          ">
+            <table width="100%" cellpadding="0" cellspacing="0"><tr>
+              <td>
+                <span style="font-size:13px;font-weight:700;
+                             color:{P['text_primary']};letter-spacing:0.3px;">
+                  {sheet_name}
+                </span>
+                <span style="font-size:10px;color:{P['text_muted']};
+                             margin-left:12px;font-family:monospace;">
+                  {sheet_total} sources scanned
+                </span>
+              </td>
+              <td align="right">{issue_badge}</td>
+            </tr></table>
           </div>
 
-          <!-- Stat pills + mini chart -->
-          <div style="padding:14px 18px 10px;">
-            <div style="margin-bottom:10px;">{pills}</div>
+          <!-- Stat pills + chart -->
+          <div style="padding:14px 18px 12px;">
+            <div style="margin-bottom:8px;">{pills}</div>
             {chart_html}
           </div>
 
-          <!-- Actionable items table -->
-          <div style="border-top:1px solid #252f47;padding:14px 18px 16px;">
-            <div style="font-size:10px;color:#3a5a9a;text-transform:uppercase;
-                        letter-spacing:2px;margin-bottom:2px;">
-              Actionable Items
-            </div>
-            <div style="font-size:10px;color:#3a4a6a;margin-bottom:8px;">
-              Inactive · Not Found · API Errors only — full data in attached Excel.
+          <!-- Actionable table -->
+          <div style="
+            border-top:1px solid {P['border']};
+            padding:12px 18px 16px;
+          ">
+            <div style="
+              font-size:9px;
+              color:{P['purple_bright']};
+              text-transform:uppercase;
+              letter-spacing:2px;
+              font-family:monospace;
+              margin-bottom:4px;
+            ">Requires Attention</div>
+            <div style="font-size:10px;color:{P['text_muted']};margin-bottom:6px;">
+              Inactive · Not Found · API Errors — full dataset in attached Excel.
             </div>
             {actionable_html}
           </div>
         </div>"""
 
-    # ── Overall pie chart ──
+    # ── Overall chart ──
     overall_chart_html = (
-        '<img src="cid:overall_chart" '
-        'style="display:block;max-width:340px;margin:16px auto 4px;">'
-    ) if "overall_chart" in images_to_embed else ''
+        f'<img src="cid:overall_chart" '
+        f'style="display:block;max-width:400px;margin:14px auto 6px;border-radius:4px;">'
+    ) if 'overall_chart' in images_to_embed else ''
 
+    # ── Full HTML ──
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#0d1117;
+<body style="margin:0;padding:0;background:{P['bg0']};
              font-family:'Segoe UI',Helvetica,Arial,sans-serif;">
 
 <table width="100%" cellpadding="0" cellspacing="0"
-       style="background:#0d1117;padding:24px 0;">
+       style="background:{P['bg0']};padding:28px 0;">
 <tr><td align="center">
 <table width="720" cellpadding="0" cellspacing="0"
        style="max-width:720px;width:100%;">
 
-  <!-- ═══ HEADER ═══ -->
+  <!-- ══ HEADER ══════════════════════════════════════════════════ -->
   <tr>
-    <td style="background:linear-gradient(135deg,#0c1628 0%,#172040 60%,#1a2a50 100%);
-               border-radius:12px 12px 0 0;padding:28px 32px 24px;
-               border-bottom:2px solid #2a3d6b;">
-      <table width="100%" cellpadding="0" cellspacing="0">
-        <tr>
-          <td>
-            <div style="font-size:10px;color:#3a5a9a;letter-spacing:3px;
-                        text-transform:uppercase;margin-bottom:8px;">
-              Automated SOC Intelligence Report
-            </div>
-            <div style="font-size:24px;font-weight:700;color:#e8ecf4;
-                        letter-spacing:-0.5px;line-height:1.25;">
-              QRadar Log Source<br>Status Report
-            </div>
-            <div style="margin-top:10px;font-size:11px;color:#4a6590;">
-              {run_time}
-            </div>
-          </td>
-          <td align="right" valign="top">
-            <div style="background:{badge_bg};color:#fff;font-size:12px;
-                        font-weight:700;padding:9px 18px;border-radius:20px;
-                        letter-spacing:0.8px;white-space:nowrap;
-                        box-shadow:0 2px 8px rgba(0,0,0,0.4);">
-              {badge_label}
-            </div>
-          </td>
-        </tr>
-      </table>
+    <td style="
+      background:linear-gradient(135deg,{P['bg3']} 0%,#1f1045 55%,{P['purple_deep']} 100%);
+      border-radius:10px 10px 0 0;
+      padding:30px 34px 26px;
+      border-bottom:2px solid {P['purple_mid']};
+    ">
+      <table width="100%" cellpadding="0" cellspacing="0"><tr>
+        <td>
+          <div style="
+            font-size:9px;
+            color:{P['purple_light']};
+            letter-spacing:3.5px;
+            text-transform:uppercase;
+            margin-bottom:10px;
+            font-family:monospace;
+          ">QRadar · Inventory Validation</div>
+          <div style="
+            font-size:22px;
+            font-weight:800;
+            color:{P['text_primary']};
+            letter-spacing:-0.5px;
+            line-height:1.3;
+          ">Log Source<br>Validation Report</div>
+          <div style="
+            margin-top:10px;
+            font-size:11px;
+            color:{P['text_muted']};
+            font-family:monospace;
+            letter-spacing:0.3px;
+          ">{run_time}</div>
+        </td>
+        <td align="right" valign="top">
+          <div style="
+            background:{badge_bg};
+            color:#f0eaff;
+            font-size:11px;
+            font-weight:700;
+            padding:9px 20px;
+            border-radius:4px;
+            letter-spacing:1px;
+            white-space:nowrap;
+            font-family:monospace;
+          ">{badge_label}</div>
+        </td>
+      </tr></table>
     </td>
   </tr>
 
-  <!-- ═══ ACTION BANNER ═══ -->
+  <!-- ══ ACTION BANNER ══════════════════════════════════════════ -->
   <tr>
-    <td style="background:#1c0b0b;border-left:4px solid #c0392b;
-               padding:13px 24px;">
-      <span style="color:#e74c3c;font-size:13px;font-weight:700;">
-        ACTION REQUIRED:&nbsp;
+    <td style="
+      background:#1a0810;
+      border-left:4px solid {P['red']};
+      padding:12px 22px;
+    ">
+      <span style="color:{P['red']};font-size:12px;font-weight:700;
+                   font-family:monospace;letter-spacing:0.5px;">
+        ACTION REQUIRED &nbsp;·&nbsp;
       </span>
-      <span style="color:#b8b8c8;font-size:13px;">
-        {total_issues} issues (Inactive + Not Found + API Errors) require
-        attention. The attached Excel contains
-        <strong style="color:#e8ecf4;">only actionable items</strong>.
+      <span style="color:{P['text_secondary']};font-size:12px;">
+        {total_issues} issues require attention.
+        Attached Excel contains <strong style="color:{P['text_primary']};">actionable items only</strong>.
       </span>
     </td>
   </tr>
 
-  <!-- ═══ OVERALL METRICS ═══ -->
+  <!-- ══ OVERALL METRICS ════════════════════════════════════════ -->
   <tr>
-    <td style="background:#131929;padding:22px 24px 18px;">
-      <div style="font-size:10px;color:#3a5a9a;text-transform:uppercase;
-                  letter-spacing:2px;margin-bottom:14px;">
-        Overall Summary &nbsp;·&nbsp; {total_scanned} Assets Scanned
-      </div>
+    <td style="background:{P['bg1']};padding:24px 24px 16px;">
+      <div style="
+        font-size:9px;
+        color:{P['purple_light']};
+        text-transform:uppercase;
+        letter-spacing:2.5px;
+        margin-bottom:16px;
+        font-family:monospace;
+      ">Overall Summary &nbsp;·&nbsp; {total_scanned} Sources Validated</div>
       <table cellpadding="0" cellspacing="0">
         <tr>{overall_cards}</tr>
       </table>
     </td>
   </tr>
 
-  <!-- ═══ OVERALL PIE CHART ═══ -->
+  <!-- ══ OVERALL DONUT CHART ════════════════════════════════════ -->
   <tr>
-    <td style="background:#131929;padding:4px 24px 22px;text-align:center;">
-      <div style="font-size:10px;color:#3a5a9a;text-transform:uppercase;
-                  letter-spacing:2px;margin-bottom:6px;">System Health Overview</div>
+    <td style="background:{P['bg1']};padding:4px 24px 26px;text-align:center;">
+      <div style="
+        font-size:9px;
+        color:{P['purple_light']};
+        text-transform:uppercase;
+        letter-spacing:2.5px;
+        margin-bottom:8px;
+        font-family:monospace;
+      ">Inventory Health Distribution</div>
       {overall_chart_html}
     </td>
   </tr>
 
-  <!-- ═══ DIVIDER ═══ -->
+  <!-- ══ DIVIDER ════════════════════════════════════════════════ -->
   <tr>
     <td style="padding:0;">
       <div style="height:1px;background:linear-gradient(90deg,
-                  #0d1117,#2a3d6b 30%,#2a3d6b 70%,#0d1117);"></div>
+        {P['bg0']},{P['purple_mid']} 35%,{P['purple_mid']} 65%,{P['bg0']});"></div>
     </td>
   </tr>
 
-  <!-- ═══ PER-SHEET BREAKDOWN ═══ -->
+  <!-- ══ PER-SHEET BREAKDOWN ════════════════════════════════════ -->
   <tr>
-    <td style="background:#131929;padding:22px 24px;">
-      <div style="font-size:10px;color:#3a5a9a;text-transform:uppercase;
-                  letter-spacing:2px;margin-bottom:4px;">Breakdown by Sheet</div>
-      <div style="font-size:10px;color:#3a4a6a;margin-bottom:18px;">
-        Each section shows a stat summary, health chart, and inline table
-        of assets requiring attention.
+    <td style="background:{P['bg1']};padding:24px 24px 20px;">
+      <div style="
+        font-size:9px;
+        color:{P['purple_light']};
+        text-transform:uppercase;
+        letter-spacing:2.5px;
+        margin-bottom:4px;
+        font-family:monospace;
+      ">Breakdown by Sheet</div>
+      <div style="font-size:10px;color:{P['text_muted']};margin-bottom:18px;">
+        Each section shows health metrics, distribution chart,
+        and a table of sources requiring remediation.
       </div>
       {sheet_blocks}
     </td>
   </tr>
 
-  <!-- ═══ FOOTER ═══ -->
+  <!-- ══ FOOTER ════════════════════════════════════════════════ -->
   <tr>
-    <td style="background:#0a0f1a;border-radius:0 0 12px 12px;
-               padding:16px 32px;text-align:center;
-               border-top:1px solid #141c2e;">
-      <div style="font-size:10px;color:#2a3a5a;letter-spacing:0.5px;">
-        Automated Cyber Defense Reporting &nbsp;·&nbsp; Generated {run_time}
-      </div>
+    <td style="
+      background:{P['bg3']};
+      border-radius:0 0 10px 10px;
+      padding:16px 34px;
+      text-align:center;
+      border-top:1px solid {P['border']};
+    ">
+      <div style="
+        font-size:9px;
+        color:{P['text_muted']};
+        letter-spacing:0.8px;
+        font-family:monospace;
+      ">QRadar Inventory Validation &nbsp;·&nbsp; Auto-generated {run_time}</div>
     </td>
   </tr>
 
@@ -891,15 +1105,12 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
 </html>"""
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  END OF VISUAL SECTION — logic below is unchanged
+# ══════════════════════════════════════════════════════════════════════════════
+
 def filter_and_email(processed_sheets_only, draft_path,
                      logsource_col=LOGSOURCE_COLUMN, ip_col=IP_COLUMN):
-    """
-    Calculates final SOC metrics, generates charts, saves the actionable
-    Excel attachment, and builds the polished HTML email draft.
-
-    report_frames is now passed into _build_email_html so the inline
-    per-sheet actionable tables can be rendered in the email body.
-    """
     report_frames   = {}
     sheet_stats     = {}
     images_to_embed = {}
@@ -991,7 +1202,7 @@ def filter_and_email(processed_sheets_only, draft_path,
     for name, counts in sheet_stats.items():
         cid        = f"chart_{name.replace(' ', '_')}"
         chart_path = generate_pie_chart(
-            _chart_stats(counts), f"{name} Status",
+            _chart_stats(counts), f"{name} — Status",
             prefix=f'qradar_{name}'
         )
         if chart_path:
@@ -1007,15 +1218,12 @@ def filter_and_email(processed_sheets_only, draft_path,
         logsource_col, ip_col
     )
 
-    subject = f"QRadar Action Report — {total_issues} Issues Require Attention"
+    subject = (f"QRadar Inventory Validation — "
+               f"{total_issues} Source{'s' if total_issues != 1 else ''} Require Attention")
     create_html_outlook_draft(draft_path, subject, html_body, images_to_embed)
 
 
 def save_surgical_updates_to_excel(filepath, processed_dataframes):
-    """
-    Opens the original workbook with openpyxl and updates only the specific
-    status columns. Applies conditional highlighting for expected/rogue types.
-    """
     try:
         wb = openpyxl.load_workbook(filepath)
 
