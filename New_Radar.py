@@ -44,11 +44,17 @@ REQUEST_TIMEOUT          = 30
 MAX_WORKERS              = 10
 
 # ─── RETRY CONFIGURATION ───────────────────────────────────────────────────────
-# Transient network failures (Timeout, ConnectionError) will be retried up to
-# MAX_RETRIES times.  Each wait = RETRY_DELAY_BASE * 2^attempt  (exponential
-# backoff).  Set MAX_RETRIES = 1 to disable retries.
-MAX_RETRIES       = 3     # total attempts (1 = no retry)
-RETRY_DELAY_BASE  = 1.5   # seconds — attempt 0→1.5 s, 1→3 s, 2→6 s
+MAX_RETRIES      = 3     # total attempts (1 = no retry)
+RETRY_DELAY_BASE = 1.5   # seconds — attempt 0→1.5 s, 1→3 s, 2→6 s
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── PAGINATION CONFIGURATION ──────────────────────────────────────────────────
+# QRadar defaults to returning only the first 50 items when no Range header is
+# supplied.  Any log-source name filter broad enough to match more than 50
+# sources would silently truncate results, causing the target to appear as
+# "Not Found".  We request up to LS_RANGE_MAX items per call; raise this if
+# your console has an unusually high number of similarly-named sources.
+LS_RANGE_MAX = 9999
 # ─────────────────────────────────────────────────────────────────────────────
 
 EXPECTED_LS_TYPES = ['Microsoft Security', 'Linux OS']
@@ -65,6 +71,13 @@ MAX_TIMESTAMP = 2147483647
 LOG_SOURCE_TYPES_CACHE = {}
 
 _MAPI_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+
+# ─── STATUS STRINGS THAT REPRESENT RETRIEVAL FAILURES ─────────────────────────
+# Used in filter_and_email to widen mask_error beyond just 'API Error XXX'.
+# 'Timeout', 'Connection Error', 'Worker Error', and 'Error: ...' are all
+# retrieval failures and belong in the same API Errors bucket.
+_ERROR_STATUS_PREFIXES = ('api error', 'timeout', 'connection error',
+                          'worker error', 'error:')
 
 
 # ─── GROUP THRESHOLD RESOLVER ──────────────────────────────────────────────────
@@ -83,14 +96,47 @@ def resolve_threshold(group_name=None):
 # ─── CHART STATS HELPER ────────────────────────────────────────────────────────
 def _chart_stats(stats_dict):
     """
-    Merges 'Inferred' into 'Active' for cleaner chart display.
-    'No Activity' is kept as its own wedge — it is a distinct failure mode
-    (source registered but never produced a single event) and should not be
-    collapsed into either Active or Inactive.
+    Merges 'Inferred' into 'Active' for chart display.
+    'No Activity' keeps its own wedge — it is a distinct failure mode
+    (source registered but never forwarded a single event).
     """
     d = dict(stats_dict)
     d['Active'] = d.get('Active', 0) + d.pop('Inferred', 0)
     return d
+
+
+def _is_error_status(status_str):
+    """
+    Returns True for any status that represents a retrieval failure:
+    'API Error XXX', 'Timeout', 'Connection Error', 'Worker Error', 'Error: ...'
+
+    Previously only 'API Error' was caught; the others were invisible in all
+    stats, charts, and actionable reports.
+    """
+    s = str(status_str).strip().lower()
+    return any(s.startswith(p) for p in _ERROR_STATUS_PREFIXES)
+
+
+def _sanitise_identifier(raw):
+    """
+    Strips characters that carry special meaning in QRadar AQL/filter ilike
+    expressions:
+      · quotes      — already stripped in original code
+      · %           — SQL LIKE wildcard; a literal % in a hostname would widen
+                      the filter to match everything or cause a parse error
+      · backslash   — escape character in some DB drivers
+      · _           — SQL LIKE single-char wildcard (escaped so ilike treats it
+                      as a literal underscore)
+
+    Preserves hyphens, dots, forward-slashes and all other valid hostname chars.
+    """
+    return (str(raw)
+            .replace('\\', '')
+            .replace('"', '')
+            .replace("'", "")
+            .replace('%', '')
+            .replace('_', r'\_')
+            .strip())
 
 
 def test_qradar_connection(qradar_host, username, password):
@@ -129,14 +175,16 @@ def test_qradar_connection(qradar_host, username, password):
 def fetch_log_source_types(qradar_host, username, password):
     print("📥 Fetching Log Source Types Dictionary into memory...")
     qradar_host = qradar_host.rstrip('/')
-    endpoint    = f"{qradar_host}/api/config/event_sources/log_source_management/log_source_types"
+    endpoint    = (f"{qradar_host}/api/config/event_sources"
+                   f"/log_source_management/log_source_types")
     try:
         resp = requests.get(
             endpoint,
             auth=(username, password),
             verify=VERIFY_SSL,
             timeout=REQUEST_TIMEOUT,
-            headers={'Accept': 'application/json', 'Version': '14.0'}
+            headers={'Accept': 'application/json', 'Version': '14.0',
+                     'Range': f'items=0-{LS_RANGE_MAX}'}
         )
         if resp.status_code == 200:
             for t in resp.json():
@@ -199,14 +247,28 @@ def get_log_source_details(qradar_host, username, password, identifier,
     """
     Queries the QRadar log-source management API for a single identifier.
 
+    Pagination fix
+    ──────────────
+    The Range header requests up to LS_RANGE_MAX items in a single call.
+    Without this, QRadar defaults to 50 items — any filtered result set larger
+    than 50 would silently truncate and the actual target would appear as
+    "Not Found".  The Content-Range response header is checked and a warning
+    is logged if the cap was hit so you know to raise LS_RANGE_MAX.
+
+    Identifier sanitisation
+    ───────────────────────
+    SQL wildcard characters (%, _) and escape characters are stripped/escaped
+    before being embedded in the ilike filter so a hostname like 'PROD_%SRV'
+    does not inadvertently widen the match or break the server-side query.
+
     Retry strategy
     ──────────────
     Transient failures (Timeout, ConnectionError) are retried up to
-    MAX_RETRIES times with exponential backoff (RETRY_DELAY_BASE * 2^attempt).
-    Non-retriable conditions (HTTP 4xx, JSON parse errors, logic exceptions)
-    return immediately so we don't waste time on deterministic failures.
+    MAX_RETRIES times with exponential backoff.  Non-retriable conditions
+    (HTTP 4xx, parse errors, logic exceptions) return immediately.
     """
-    clean_identifier = str(identifier).replace('"', '').replace("'", "").strip()
+    clean_identifier = _sanitise_identifier(identifier)
+
     if is_ip:
         query_filter = (
             f'protocol_parameters contains value="{clean_identifier}" '
@@ -220,11 +282,18 @@ def get_log_source_details(qradar_host, username, password, identifier,
         f"/log_source_management/log_sources"
     )
 
-    last_retriable_error = None   # track the most recent transient error
+    request_headers = {
+        'Accept':  'application/json',
+        'Version': '14.0',
+        # Fetch up to LS_RANGE_MAX items so a broad ilike filter never
+        # silently truncates results and produces a false Not Found.
+        'Range':   f'items=0-{LS_RANGE_MAX}',
+    }
+
+    last_retriable_error = None
 
     for attempt in range(MAX_RETRIES):
 
-        # ── Exponential back-off (skip on first attempt) ──────────────────────
         if attempt > 0:
             wait = RETRY_DELAY_BASE * (2 ** (attempt - 1))
             logger.warning(
@@ -241,12 +310,30 @@ def get_log_source_details(qradar_host, username, password, identifier,
                 auth=(username, password),
                 verify=VERIFY_SSL,
                 timeout=REQUEST_TIMEOUT,
-                headers={'Accept': 'application/json', 'Version': '14.0'}
+                headers=request_headers
             )
 
             # ── Non-retriable HTTP errors ─────────────────────────────────────
             if resp.status_code != 200:
                 return {'status': f'API Error {resp.status_code}', **_empty_details()}
+
+            # ── Pagination overflow guard ─────────────────────────────────────
+            # QRadar returns Content-Range: items X-Y/TOTAL.
+            # If TOTAL > LS_RANGE_MAX+1 our cap was hit and results are truncated.
+            content_range = resp.headers.get('Content-Range', '')
+            if content_range:
+                try:
+                    total_str = content_range.split('/')[-1].strip()
+                    if total_str.isdigit() and int(total_str) > LS_RANGE_MAX + 1:
+                        logger.warning(
+                            "Pagination cap hit for '%s': QRadar reports %s total "
+                            "matching sources but LS_RANGE_MAX is %d.  Raise "
+                            "LS_RANGE_MAX or narrow EXPECTED_LS_TYPES to avoid "
+                            "false Not Found results.",
+                            identifier, total_str, LS_RANGE_MAX
+                        )
+                except Exception:
+                    pass   # non-fatal, best-effort check only
 
             ls_data = resp.json()
             if not ls_data:
@@ -267,9 +354,9 @@ def get_log_source_details(qradar_host, username, password, identifier,
             if not valid_sources:
                 return {'status': 'Not Found', **_empty_details()}
 
+            # ── Separate expected vs. unexpected source types ─────────────────
             expected_sources   = []
             unexpected_sources = []
-
             for src in valid_sources:
                 type_name      = LOG_SOURCE_TYPES_CACHE.get(src.get('type_id'), "")
                 api_name_clean = str(type_name).lower()
@@ -330,13 +417,11 @@ def get_log_source_details(qradar_host, username, password, identifier,
         except requests.exceptions.Timeout as exc:
             last_retriable_error = exc
             logger.warning("Timeout on attempt %d for '%s'", attempt + 1, identifier)
-            # Fall through to next retry iteration
 
         except requests.exceptions.ConnectionError as exc:
             last_retriable_error = exc
             logger.warning("ConnectionError on attempt %d for '%s': %s",
                            attempt + 1, identifier, exc)
-            # Fall through to next retry iteration
 
         # ── Non-retriable unexpected exceptions ───────────────────────────────
         except Exception as exc:
@@ -508,8 +593,7 @@ def process_sheet(df, sheet_name, qradar_host, username, password,
 
                 elif details['activity_status'] == 'No Activity':
                     # Source exists on QRadar but has NEVER sent a single event.
-                    # This is deliberately distinct from 'Inactive' (which means
-                    # the source sent events in the past but has since gone quiet).
+                    # Distinct from 'Inactive' (went quiet after previously sending).
                     df.at[idx, 'status']          = 'Found'
                     df.at[idx, 'remarks']         = "No events ever recorded on QRadar"
                     df.at[idx, 'activity_status'] = 'No Activity'
@@ -525,7 +609,9 @@ def process_sheet(df, sheet_name, qradar_host, username, password,
             else:
                 status_val = details['status']
                 remark_val = f"❌ {status_val}"
-                act_val    = "Error" if "Error" in status_val or "Timeout" in status_val else "Not Found"
+                # Use the shared helper so error classification is consistent
+                # with what filter_and_email uses for its mask_error bucket.
+                act_val = "Error" if _is_error_status(status_val) else "Not Found"
 
                 if name_val and "AP" in name_val:
                     status_val = "Inferred"
@@ -560,22 +646,20 @@ _C = {
     'dim':      '#7c6fa0',
     'green':    '#10b981',
     'red':      '#ef4444',
-    'orange':   '#f97316',   # No Activity — distinct orange (was amber, now vivid orange)
-    'amber':    '#f59e0b',   # API Errors  — kept separate from No Activity
+    'orange':   '#f97316',   # No Activity — vivid orange
+    'amber':    '#f59e0b',   # API Errors  — amber
     'gray':     '#8b9ab0',
     'cyan':     '#06b6d4',
     'blue':     '#3b82f6',
-    # badge fills
     'badge_red':    '#7f1d1d',
     'badge_gray':   '#2d3748',
-    'badge_orange': '#7c2d12',   # No Activity badge (dark burnt-orange)
-    'badge_amber':  '#78350f',   # API Errors  badge
+    'badge_orange': '#7c2d12',
+    'badge_amber':  '#78350f',
     'badge_green':  '#065f46',
     'badge_cyan':   '#164e63',
     'badge_blue':   '#1e3a5f',
 }
 
-# Keep _P alias for legacy references inside _build_actionable_table
 _P = {
     'bg0': '', 'bg1': '', 'bg2': '', 'bg3': '',
     'border': '#4c3a8a', 'border_soft': '#3a2d6a',
@@ -589,11 +673,8 @@ _P = {
     'gray':  _C['gray'],  'cyan': _C['cyan'], 'blue': _C['blue'],
 }
 
-# ─── STATUS METADATA ──────────────────────────────────────────────────────────
 _STATUS_META = {
     'Inactive':    {'accent': _C['red'],    'badge_bg': _C['badge_red'],    'label': 'INACTIVE',     'icon': '●'},
-    # 'No Activity' = source found on QRadar but zero events ever recorded.
-    # Uses orange so it is visually distinct from red 'Inactive'.
     'No Activity': {'accent': _C['orange'], 'badge_bg': _C['badge_orange'], 'label': 'NO ACTIVITY',  'icon': '◌'},
     'Not Found':   {'accent': _C['gray'],   'badge_bg': _C['badge_gray'],   'label': 'NOT FOUND',    'icon': '◌'},
     'Error':       {'accent': _C['amber'],  'badge_bg': _C['badge_amber'],  'label': 'API ERROR',    'icon': '▲'},
@@ -608,7 +689,6 @@ def _get_status_meta(activity_status):
             'label': s.upper()[:12], 'icon': '◌'}
 
 
-# ─── DONUT CHART GENERATOR ────────────────────────────────────────────────────
 def generate_pie_chart(data_dict, title, prefix='qradar_chart'):
     filtered_data = {k: v for k, v in data_dict.items() if v > 0}
     if not filtered_data:
@@ -620,9 +700,9 @@ def generate_pie_chart(data_dict, title, prefix='qradar_chart'):
     color_map = {
         'Active':              '#10b981',
         'Inactive':            '#ef4444',
-        'No Activity':         '#f97316',   # orange — never sent events
+        'No Activity':         '#f97316',
         'Not Found':           '#6b7280',
-        'API Errors':          '#f59e0b',   # amber — distinct from No Activity orange
+        'API Errors':          '#f59e0b',
         'Disabled':            '#06b6d4',
         'Inferred':            '#8b5cf6',
         'Pending-Maintenance': '#3b82f6',
@@ -682,7 +762,6 @@ def generate_pie_chart(data_dict, title, prefix='qradar_chart'):
     return filepath
 
 
-# ─── OUTLOOK DRAFT HELPER ─────────────────────────────────────────────────────
 def create_html_outlook_draft(attachment_path, subject, html_body, image_paths):
     try:
         outlook = win32com.client.Dispatch('Outlook.Application')
@@ -714,7 +793,6 @@ def create_html_outlook_draft(attachment_path, subject, html_body, image_paths):
                     print(f"⚠️ Could not delete temp image {img_path}: {cleanup_err}")
 
 
-# ─── ACTIONABLE TABLE ─────────────────────────────────────────────────────────
 def _build_actionable_table(report_df, logsource_col, ip_col):
     C = _C
     if report_df is None or len(report_df) == 0:
@@ -805,7 +883,6 @@ def _build_actionable_table(report_df, logsource_col, ip_col):
     </table>"""
 
 
-# ─── FULL EMAIL HTML ───────────────────────────────────────────────────────────
 def _build_email_html(global_stats, sheet_stats, total_issues,
                       images_to_embed, report_frames,
                       logsource_col, ip_col):
@@ -815,7 +892,6 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
     active_display = global_stats['Active'] + global_stats['Inferred']
     total_scanned  = sum(global_stats.values()) - global_stats['Pending-Maintenance']
 
-    # ── Badge chip ─────────────────────────────────────────────────────────────
     if total_issues == 0:
         badge_bg, badge_txt = C['badge_green'], '✔  ALL CLEAR'
     elif total_issues <= 10:
@@ -830,7 +906,6 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
         f'{badge_txt}</span>'
     )
 
-    # ── Metric row ─────────────────────────────────────────────────────────────
     def metric_cell(label, value, color, note=''):
         note_html = (
             f'<div style="font-size:9px;color:{C["dim"]};margin-top:3px;'
@@ -849,18 +924,18 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
           {note_html}
         </td>"""
 
-    # 'No Activity' sits between Inactive and Not Found — same severity tier
-    # but a distinct failure mode (source registered, zero events ever sent).
+    # API Errors is now shown as its own metric cell — previously Timeout and
+    # Connection Error statuses were invisible; now they surface here.
     metric_row = (
         metric_cell('Active',      active_display,                       C['green'],  'incl. inferred') +
         metric_cell('Inactive',    global_stats['Inactive'],             C['red'])    +
         metric_cell('No Activity', global_stats['No Activity'],          C['orange'], 'zero events ever') +
         metric_cell('Not Found',   global_stats['Not Found'],            C['gray'])   +
+        metric_cell('API Errors',  global_stats['API Errors'],           C['amber'])  +
         metric_cell('Disabled',    global_stats['Disabled'],             C['cyan'])   +
         metric_cell('Pending',     global_stats['Pending-Maintenance'],  C['blue'])
     )
 
-    # ── Stat chips ─────────────────────────────────────────────────────────────
     def stat_chip(label, value, color):
         if value == 0:
             return ''
@@ -877,7 +952,6 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
         f'style="display:block;max-width:420px;margin:16px auto 0;">'
     ) if 'overall_chart' in images_to_embed else ''
 
-    # ── Per-sheet blocks ───────────────────────────────────────────────────────
     sheet_blocks = ''
     for sheet_name, counts in sheet_stats.items():
         cid         = f"chart_{sheet_name.replace(' ', '_')}"
@@ -890,6 +964,7 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
             stat_chip('Inactive',    counts['Inactive'],                    C['red'])    +
             stat_chip('No Activity', counts['No Activity'],                 C['orange']) +
             stat_chip('Not Found',   counts['Not Found'],                   C['gray'])   +
+            stat_chip('API Errors',  counts['API Errors'],                  C['amber'])  +
             stat_chip('Disabled',    counts['Disabled'],                    C['cyan'])   +
             stat_chip('Pending',     counts['Pending-Maintenance'],         C['blue'])
         )
@@ -936,7 +1011,7 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
               Requires Attention
             </span>
             <span style="font-size:10px;color:{C['dim']};margin-left:10px;">
-              Inactive · No Activity · Not Found — full dataset in Excel attachment
+              Inactive · No Activity · Not Found · API Errors — full dataset in Excel
             </span>
           </td>
         </tr>
@@ -956,7 +1031,6 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
   <td align="center" style="padding:0;">
   <table width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%;">
 
-    <!-- ══ MASTHEAD ════════════════════════════════════════════ -->
     <tr>
       <td style="padding:0 0 10px;border-bottom:3px solid {C['purple']};">
         <table width="100%" cellpadding="0" cellspacing="0"><tr>
@@ -979,7 +1053,6 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
       </td>
     </tr>
 
-    <!-- ══ ACTION NOTICE ════════════════════════════════════════ -->
     <tr>
       <td style="padding:14px 0 18px;border-bottom:1px solid {C['purple']}30;">
         <span style="color:{C['red']};font-size:12px;font-weight:700;
@@ -993,7 +1066,6 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
       </td>
     </tr>
 
-    <!-- ══ OVERALL METRICS ══════════════════════════════════════ -->
     <tr>
       <td style="padding:22px 0 8px;">
         <div style="font-size:9px;color:{C['purple']};text-transform:uppercase;
@@ -1005,7 +1077,6 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
       </td>
     </tr>
 
-    <!-- ══ OVERALL CHART ════════════════════════════════════════ -->
     <tr>
       <td style="padding:10px 0 6px;text-align:center;">
         <div style="font-size:9px;color:{C['dim']};text-transform:uppercase;
@@ -1016,7 +1087,6 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
       </td>
     </tr>
 
-    <!-- ══ SHEET BREAKDOWN HEADING ══════════════════════════════ -->
     <tr>
       <td style="padding:26px 0 2px;border-top:1px solid {C['purple']}30;">
         <span style="font-size:9px;color:{C['purple']};text-transform:uppercase;
@@ -1029,10 +1099,8 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
       </td>
     </tr>
 
-    <!-- ══ PER-SHEET BLOCKS ══════════════════════════════════════ -->
     {sheet_blocks}
 
-    <!-- ══ FOOTER ═══════════════════════════════════════════════ -->
     <tr>
       <td style="padding:16px 0 20px;border-top:1px solid {C['purple']}30;">
         <div style="font-size:9px;color:{C['dim']};font-family:monospace;
@@ -1060,11 +1128,6 @@ def filter_and_email(processed_sheets_only, draft_path,
     sheet_stats     = {}
     images_to_embed = {}
 
-    # 'No Activity' is a separate bucket: source EXISTS on QRadar but has
-    # NEVER generated a single event (last_event_time is null / zero).
-    # It must NOT be folded into 'Inactive' (which means "went quiet after
-    # previously sending events") or 'Not Found' (which means the source
-    # could not be located in the QRadar API at all).
     global_stats = {
         'Active': 0, 'Inactive': 0, 'No Activity': 0,
         'Not Found': 0, 'API Errors': 0, 'Disabled': 0,
@@ -1078,40 +1141,48 @@ def filter_and_email(processed_sheets_only, draft_path,
         if len(processed_df) == 0:
             continue
 
-        # ── Active: Found + truly active ────────────────────────────────────
+        # ── Active ───────────────────────────────────────────────────────────
         active_count = len(processed_df[
             (processed_df['status'] == 'Found') &
             (processed_df['activity_status'] == 'Active')
         ])
 
-        # ── Inactive: Found + went quiet (had events, now silent) ───────────
-        # Strictly excludes 'No Activity' — they are different failure modes.
+        # ── Inactive: Found + went quiet after previously sending events ─────
         mask_inactive = (
             (processed_df['status'] == 'Found') &
             (processed_df['activity_status'] == 'Inactive')
         )
         inactive_count = mask_inactive.sum()
 
-        # ── No Activity: Found + zero events ever recorded ──────────────────
-        # 'No Activity' is set in safe_timestamp_conversion when last_event_time
-        # is null/zero, meaning the source registered but never forwarded a log.
+        # ── No Activity: Found + zero events ever recorded ───────────────────
         mask_no_activity = (
             (processed_df['status'] == 'Found') &
             (processed_df['activity_status'] == 'No Activity')
         )
         no_activity_count = mask_no_activity.sum()
 
-        # ── Disabled, Inferred, Not Found, Errors, Pending ──────────────────
+        # ── Disabled ─────────────────────────────────────────────────────────
         disabled_count = len(processed_df[
             (processed_df['status'] == 'Found') &
             (processed_df['activity_status'] == 'Disabled')
         ])
-        inferred_count  = len(processed_df[processed_df['status'] == 'Inferred'])
+
+        # ── Inferred ─────────────────────────────────────────────────────────
+        inferred_count = len(processed_df[processed_df['status'] == 'Inferred'])
+
+        # ── Not Found: only genuine API confirmed-absence ────────────────────
         mask_not_found  = processed_df['status'] == 'Not Found'
         not_found_count = mask_not_found.sum()
-        mask_error      = processed_df['status'].astype(str).str.startswith('API Error', na=False)
-        error_count     = mask_error.sum()
-        pending_count   = len(processed_df[processed_df['status'] == 'Pending-Maintenance'])
+
+        # ── API Errors: widened via _is_error_status to catch Timeout, ───────
+        # ConnectionError, Worker Error, and generic Error: prefixes.
+        # Previously only 'API Error XXX' was caught; all other failure types
+        # were silently invisible in every stat, chart, and report.
+        mask_error  = processed_df['status'].apply(_is_error_status)
+        error_count = mask_error.sum()
+
+        # ── Pending ───────────────────────────────────────────────────────────
+        pending_count = len(processed_df[processed_df['status'] == 'Pending-Maintenance'])
 
         sheet_counts = {
             'Active': active_count, 'Inactive': inactive_count,
@@ -1125,13 +1196,12 @@ def filter_and_email(processed_sheets_only, draft_path,
         for k in global_stats:
             global_stats[k] += sheet_counts.get(k, 0)
 
-        # ── Actionable rows: Inactive + No Activity + Not Found + Errors ────
+        # ── Actionable: Inactive + No Activity + Not Found + all Errors ──────
         mask_report = mask_inactive | mask_no_activity | mask_not_found | mask_error
 
         if mask_report.any():
             sub = processed_df[mask_report].copy()
 
-            # Build human-readable remarks per failure category
             for idx in sub[mask_inactive.loc[sub.index]].index:
                 days = sub.at[idx, 'days_since_last_event']
                 if pd.notna(days):
@@ -1148,7 +1218,7 @@ def filter_and_email(processed_sheets_only, draft_path,
         print("✅ No Actionable Issues detected; skipping email.")
         return
 
-    # ── Save actionable Excel ──
+    # ── Save actionable Excel ──────────────────────────────────────────────────
     try:
         with pd.ExcelWriter(draft_path, engine='openpyxl') as writer:
             for sheet_name, df in report_frames.items():
@@ -1160,7 +1230,7 @@ def filter_and_email(processed_sheets_only, draft_path,
         print(f"❌ Could not save report to '{draft_path}'. Is the file open?")
         return
 
-    # ── Generate charts ──
+    # ── Generate charts ────────────────────────────────────────────────────────
     overall_path = generate_pie_chart(
         _chart_stats(global_stats), "Overall Inventory Status",
         prefix='qradar_overall'
@@ -1177,7 +1247,6 @@ def filter_and_email(processed_sheets_only, draft_path,
         if chart_path:
             images_to_embed[cid] = chart_path
 
-    # total_issues now includes No Activity as a distinct actionable category
     total_issues = (global_stats['Inactive'] +
                     global_stats['No Activity'] +
                     global_stats['Not Found'] +
@@ -1271,8 +1340,9 @@ def main():
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     print("🚀 Starting QRadar Log Source Checker (Multi-threaded & Surgical)...")
-    print(f"🔁 Retry config: {MAX_RETRIES} attempts, "
+    print(f"🔁 Retry config    : {MAX_RETRIES} attempts, "
           f"{RETRY_DELAY_BASE}s base backoff (exponential)")
+    print(f"📄 Pagination range: items=0-{LS_RANGE_MAX} per API call")
 
     if GROUP_COLUMN:
         print(f"🏷️  Group Threshold: ENABLED  "
