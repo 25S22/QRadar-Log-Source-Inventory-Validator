@@ -105,7 +105,7 @@ def wait_for_search(search_id):
             raise RuntimeError(f"Failed while polling search {search_id}: HTTP {response.status_code} - {response.text}")
         payload = response.json()
         status = payload.get('status', '').upper()
-        if status in {'COMPLETED', 'EXECUTE', 'DONE'}:
+        if status in {'COMPLETED', 'DONE'}:
             return
         if status in {'CANCELED', 'ERROR', 'FAILED'}:
             raise RuntimeError(f"AQL search {search_id} failed with status {status}.")

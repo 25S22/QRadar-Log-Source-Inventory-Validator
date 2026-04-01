@@ -93,7 +93,7 @@ def wait_for_search(search_id):
             raise RuntimeError(f"Failed while polling search {search_id}: HTTP {response.status_code} - {response.text}")
         payload = response.json()
         status = payload.get('status', '').upper()
-        if status in {'COMPLETED', 'EXECUTE', 'DONE'}:
+        if status in {'COMPLETED', 'DONE'}:
             return
         if status in {'CANCELED', 'ERROR', 'FAILED'}:
             raise RuntimeError(f"AQL search {search_id} failed with status {status}.")
@@ -132,8 +132,8 @@ def _project_days_until_cap(current_total_eps, previous_total_eps, period_days):
         return None
     if current_total_eps >= LICENSE_CAP_EPS:
         return 0.0
-    # current_total_eps and previous_total_eps are period averages (EPS), so we
-    # convert their delta into a daily slope using the actual period length.
+    # current_total_eps and previous_total_eps are period-average EPS values;
+    # dividing their delta by period_days yields average daily EPS change.
     daily_growth = (current_total_eps - previous_total_eps) / max(float(period_days), 1.0)
     if daily_growth <= 0:
         return math.inf
