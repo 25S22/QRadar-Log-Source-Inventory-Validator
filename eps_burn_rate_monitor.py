@@ -25,6 +25,7 @@ REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 1.5
 RANGE_MAX = 9999
+SECONDS_PER_DAY = 86400.0
 
 EPS_LOOKBACK_DAYS = 7
 TOP_N_SOURCES = 100
@@ -152,8 +153,8 @@ def build_eps_query(days):
 SELECT
   LOGSOURCENAME(logsourceid) AS log_source_name,
   logsourceid AS log_source_id,
-  DATEFORMAT(starttime, 'yyyy-MM-dd') AS day_bucket,
-  COUNT(*) / 86400.0 AS avg_eps
+  DATEFORMAT(devicetime, 'yyyy-MM-dd') AS day_bucket,
+  COUNT(*) / {SECONDS_PER_DAY} AS avg_eps
 FROM events
 WHERE logsourceid IS NOT NULL
 GROUP BY log_source_id, log_source_name, day_bucket
@@ -168,7 +169,7 @@ def normalize_rows(rows):
         normalized.append({
             'log_source_id': row.get('log_source_id') or row.get('logsourceid'),
             'log_source_name': row.get('log_source_name') or row.get('logsourcename(logsourceid)') or 'Unknown',
-            'day_bucket': row.get('day_bucket') or row.get("dateformat(starttime, 'yyyy-MM-dd')"),
+            'day_bucket': row.get('day_bucket') or row.get("dateformat(devicetime, 'yyyy-MM-dd')"),
             'avg_eps': _to_float(row.get('avg_eps') or row.get('count(*) / 86400.0') or row.get('count') or 0),
         })
     return pd.DataFrame(normalized)
@@ -183,11 +184,11 @@ def build_report_dataframe(df_daily):
 
     df_daily['day_bucket'] = pd.to_datetime(df_daily['day_bucket'], errors='coerce')
     now_utc = datetime.utcnow()
-    current_start = now_utc - timedelta(days=EPS_LOOKBACK_DAYS)
-    previous_start = now_utc - timedelta(days=EPS_LOOKBACK_DAYS * 2)
+    current_period_start = now_utc - timedelta(days=EPS_LOOKBACK_DAYS)
+    previous_period_start = now_utc - timedelta(days=EPS_LOOKBACK_DAYS * 2)
 
-    current_df = df_daily[(df_daily['day_bucket'] >= current_start) & (df_daily['day_bucket'] <= now_utc)]
-    previous_df = df_daily[(df_daily['day_bucket'] >= previous_start) & (df_daily['day_bucket'] < current_start)]
+    current_df = df_daily[(df_daily['day_bucket'] >= current_period_start) & (df_daily['day_bucket'] <= now_utc)]
+    previous_df = df_daily[(df_daily['day_bucket'] >= previous_period_start) & (df_daily['day_bucket'] < current_period_start)]
 
     current_agg = current_df.groupby(['log_source_id', 'log_source_name'], as_index=False)['avg_eps'].mean()
     current_agg.rename(columns={'avg_eps': 'current_week_avg_eps'}, inplace=True)

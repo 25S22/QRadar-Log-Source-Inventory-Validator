@@ -124,13 +124,20 @@ def fetch_search_results(search_id):
     return rows
 
 
+def _to_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def build_rule_fires_query(days):
     return f"""
 SELECT
-  rulename AS rule_name,
+  RULENAME(creeventlist) AS rule_name,
   COUNT(*) AS fire_count
 FROM events
-WHERE rulename IS NOT NULL
+WHERE RULENAME(creeventlist) IS NOT NULL
 GROUP BY rule_name
 ORDER BY fire_count DESC
 LAST {int(days)} DAYS
@@ -142,7 +149,7 @@ def normalize_rule_fire_rows(rows):
     for row in rows:
         normalized.append({
             'rule_name': row.get('rule_name') or row.get('rulename') or 'Unknown',
-            'fire_count': int(float(row.get('fire_count') or row.get('count(*)') or 0)),
+            'fire_count': _to_int(row.get('fire_count') or row.get('count(*)') or 0),
         })
     return pd.DataFrame(normalized)
 
