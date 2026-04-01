@@ -1,6 +1,6 @@
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
@@ -140,7 +140,7 @@ FROM events
 WHERE RULENAME(creeventlist) IS NOT NULL
 GROUP BY rule_name
 ORDER BY fire_count DESC
-LAST {int(days)} DAYS
+LAST {days} DAYS
 """
 
 
@@ -204,7 +204,7 @@ def main():
     noise_df = audit_df[audit_df['classification'] == 'noise_generator'].copy()
 
     summary = pd.DataFrame([
-        {'metric': 'report_generated_utc', 'value': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')},
+        {'metric': 'report_generated_utc', 'value': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')},
         {'metric': 'lookback_days', 'value': RULE_LOOKBACK_DAYS},
         {'metric': 'enabled_rules_total', 'value': len(enabled_rules)},
         {'metric': 'dead_rules_total', 'value': int(len(dead_df))},

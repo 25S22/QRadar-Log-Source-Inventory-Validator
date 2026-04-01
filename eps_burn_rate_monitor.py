@@ -1,7 +1,7 @@
 import logging
 import math
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -159,7 +159,7 @@ FROM events
 WHERE logsourceid IS NOT NULL
 GROUP BY log_source_id, log_source_name, day_bucket
 ORDER BY avg_eps DESC
-LAST {int(days)} DAYS
+LAST {days} DAYS
 """
 
 
@@ -183,7 +183,7 @@ def build_report_dataframe(df_daily):
         ])
 
     df_daily['day_bucket'] = pd.to_datetime(df_daily['day_bucket'], errors='coerce')
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     current_period_start = now_utc - timedelta(days=EPS_LOOKBACK_DAYS)
     previous_period_start = now_utc - timedelta(days=EPS_LOOKBACK_DAYS * 2)
 
@@ -240,11 +240,12 @@ def main():
     projection_text = _projection_text(projected_days)
 
     summary = pd.DataFrame([
-        {'metric': 'report_generated_utc', 'value': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')},
+        {'metric': 'report_generated_utc', 'value': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')},
         {'metric': 'current_week_total_avg_eps', 'value': round(current_total_eps, 3)},
         {'metric': 'previous_week_total_avg_eps', 'value': round(previous_total_eps, 3)},
         {'metric': 'license_cap_eps', 'value': LICENSE_CAP_EPS},
         {'metric': 'days_until_cap_projection', 'value': projection_text},
+        {'metric': 'eps_window_note', 'value': 'Daily EPS assumes full-day buckets from AQL results'},
     ])
 
     with pd.ExcelWriter(OUTPUT_XLSX, engine='openpyxl') as writer:
