@@ -126,15 +126,25 @@ def _trend_arrow(current_value, previous_value):
     return '→'
 
 
-def _project_days_until_cap(current_total_eps, previous_total_eps):
+def _project_days_until_cap(current_total_eps, previous_total_eps, period_days):
     if not LICENSE_CAP_EPS or LICENSE_CAP_EPS <= 0:
         return None
     if current_total_eps >= LICENSE_CAP_EPS:
         return 0.0
-    daily_growth = (current_total_eps - previous_total_eps) / max(EPS_LOOKBACK_DAYS, 1)
+    # current_total_eps and previous_total_eps are period averages (EPS), so we
+    # convert their delta into a daily slope using the actual period length.
+    daily_growth = (current_total_eps - previous_total_eps) / max(float(period_days), 1.0)
     if daily_growth <= 0:
         return math.inf
     return (LICENSE_CAP_EPS - current_total_eps) / daily_growth
+
+
+def _projection_text(projected_days):
+    if projected_days == 0:
+        return "Cap already reached"
+    if projected_days == math.inf:
+        return "No projected cap (stable/decreasing)"
+    return f"{projected_days:.1f}"
 
 
 def build_eps_query(days):
@@ -221,13 +231,12 @@ def main():
 
     current_total_eps = _to_float(df_ranked['current_week_avg_eps'].sum()) if not df_ranked.empty else 0.0
     previous_total_eps = _to_float(df_ranked['previous_week_avg_eps'].sum()) if not df_ranked.empty else 0.0
-    projected_days = _project_days_until_cap(current_total_eps, previous_total_eps)
-
-    projection_text = (
-        "Cap already reached"
-        if projected_days == 0
-        else ("No projected cap (stable/decreasing)" if projected_days == math.inf else f"{projected_days:.1f}")
+    projected_days = _project_days_until_cap(
+        current_total_eps,
+        previous_total_eps,
+        period_days=EPS_LOOKBACK_DAYS,
     )
+    projection_text = _projection_text(projected_days)
 
     summary = pd.DataFrame([
         {'metric': 'report_generated_utc', 'value': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')},
