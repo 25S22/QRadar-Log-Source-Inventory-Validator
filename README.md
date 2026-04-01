@@ -135,7 +135,17 @@ ACTIVITY_THRESHOLD_DAYS = 7  # Consider inactive if no events in X days
 python qradar_log_source_checker.py
 ```
 
-### 4. Review Results
+### 4. Run the EPS Burn Rate Monitor
+```bash
+python eps_burn_rate_monitor.py
+```
+
+### 5. Run the Rule Effectiveness Auditor
+```bash
+python rule_effectiveness_auditor.py
+```
+
+### 6. Review Results
 - **Console Output**: Real-time progress and statistics
 - **Updated Excel**: Original file with new status columns
 - **Filtered Report**: `inactive_and_errors.xlsx` with issues only
@@ -256,6 +266,29 @@ GET /api/config/event_sources/log_source_management/log_sources
   - `last_event_time`: Last event timestamp (milliseconds)
   - `ip_address`: Configured IP address
 
+#### 3. Ariel Search Submission
+```http
+POST /api/ariel/searches
+```
+- **Purpose**: Submit AQL queries for EPS analytics and rule fire counts
+- **Usage in this repo**:
+  - `eps_burn_rate_monitor.py`: 7-day EPS by log source and trend calculations
+  - `rule_effectiveness_auditor.py`: 30-day rule fire counts for enabled rules
+
+#### 4. Ariel Search Polling and Results
+```http
+GET /api/ariel/searches/{search_id}
+GET /api/ariel/searches/{search_id}/results
+```
+- **Purpose**: Poll async AQL search status and retrieve results
+
+#### 5. Analytics Rules
+```http
+GET /api/analytics/rules
+```
+- **Purpose**: Retrieve all enabled rules for effectiveness auditing
+- **Filter**: `enabled=true`
+
 ### API Response Handling
 
 #### Successful Response
@@ -310,6 +343,20 @@ Summary:
 
 Please review the attached Excel file for detailed information.
 ```
+
+### 4. EPS Burn Rate Report (`eps_burn_rate_report.xlsx`)
+**Location**: Script working directory  
+**Sheets**:
+- `Summary`: Current/previous weekly EPS totals, license cap, days-until-cap projection
+- `Source_Ranking`: Ranked log sources with EPS trend arrows and license-share %
+
+### 5. Rule Effectiveness Audit (`rule_effectiveness_audit.xlsx`)
+**Location**: Script working directory  
+**Sheets**:
+- `Summary`: Enabled rule counts with dead/noise totals
+- `All_Enabled_Rules`: Full enabled-rule list with 30-day fire counts and classification
+- `Dead_Rules`: Rules with 0 fires in lookback window
+- `Noise_Generators`: Rules over configured fire threshold (default 500)
 
 ## 🎛 Customization
 
