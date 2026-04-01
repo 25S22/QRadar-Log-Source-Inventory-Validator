@@ -160,7 +160,7 @@ def _format_license_cap():
     return f"{LICENSE_CAP_EPS:,.2f}"
 
 
-def build_eps_query(days):
+def build_daily_eps_query(days):
     return f"""
 SELECT
   LOGSOURCENAME(logsourceid) AS log_source_name,
@@ -234,7 +234,7 @@ def main():
     logger.info("Starting EPS burn-rate monitor...")
     test_qradar_connection()
 
-    search_id = submit_aql_search(build_eps_query(EPS_LOOKBACK_DAYS * 2))
+    search_id = submit_aql_search(build_daily_eps_query(EPS_LOOKBACK_DAYS * 2))
     logger.info("Submitted AQL search: %s", search_id)
     wait_for_search(search_id)
     rows = fetch_search_results(search_id)

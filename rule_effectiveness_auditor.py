@@ -140,7 +140,7 @@ def _to_int(value, default=0):
         return default
 
 
-def build_rule_fires_query(days):
+def build_rule_fire_count_query(days):
     return f"""
 SELECT
   RULENAME(creeventlist) AS rule_name,
@@ -208,7 +208,7 @@ def main():
     enabled_rules = list_enabled_rules()
     logger.info("Enabled rules fetched: %d", len(enabled_rules))
 
-    search_id = submit_aql_search(build_rule_fires_query(RULE_LOOKBACK_DAYS))
+    search_id = submit_aql_search(build_rule_fire_count_query(RULE_LOOKBACK_DAYS))
     logger.info("Submitted AQL search: %s", search_id)
     wait_for_search(search_id)
     fire_rows = fetch_search_results(search_id)
