@@ -28,6 +28,10 @@ RANGE_MAX = 9999
 RULE_LOOKBACK_DAYS = 30
 DEAD_RULE_FIRE_THRESHOLD = 0
 NOISE_RULE_FIRE_THRESHOLD = 500
+# Classification bands:
+#   dead_rule       -> fire_count <= DEAD_RULE_FIRE_THRESHOLD
+#   healthy         -> DEAD_RULE_FIRE_THRESHOLD < fire_count < NOISE_RULE_FIRE_THRESHOLD
+#   noise_generator -> fire_count >= NOISE_RULE_FIRE_THRESHOLD
 
 OUTPUT_XLSX = 'rule_effectiveness_audit.xlsx'
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
@@ -151,9 +155,15 @@ LAST {days} DAYS
 
 def normalize_rule_fire_rows(rows):
     normalized = []
+    unknown_counter = 0
     for row in rows:
+        rule_name = row.get('rule_name') or row.get('rulename')
+        if not rule_name:
+            unknown_counter += 1
+            rule_name = f'Unknown_{unknown_counter}'
+            logger.warning("Rule fire row missing rule_name; using placeholder: %s", rule_name)
         normalized.append({
-            'rule_name': row.get('rule_name') or row.get('rulename') or 'Unknown',
+            'rule_name': rule_name,
             'fire_count': _to_int(row.get('fire_count') or row.get('count(*)') or 0),
         })
     return pd.DataFrame(normalized)

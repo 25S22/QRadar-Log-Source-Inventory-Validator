@@ -145,11 +145,19 @@ def _project_days_until_cap(current_total_eps, previous_total_eps, period_days):
 
 
 def _projection_text(projected_days):
+    if not LICENSE_CAP_EPS or LICENSE_CAP_EPS <= 0:
+        return "Not configured"
     if projected_days == 0:
         return "Cap already reached"
     if projected_days == math.inf:
         return "No projected cap (stable/decreasing)"
     return f"{projected_days:.1f}"
+
+
+def _format_license_cap():
+    if not LICENSE_CAP_EPS or LICENSE_CAP_EPS <= 0:
+        return "Not configured"
+    return f"{LICENSE_CAP_EPS:,.2f}"
 
 
 def build_eps_query(days):
@@ -247,7 +255,7 @@ def main():
         {'metric': 'report_generated_utc', 'value': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')},
         {'metric': 'current_week_total_avg_eps', 'value': round(current_total_eps, 3)},
         {'metric': 'previous_week_total_avg_eps', 'value': round(previous_total_eps, 3)},
-        {'metric': 'license_cap_eps', 'value': LICENSE_CAP_EPS},
+        {'metric': 'license_cap_eps', 'value': _format_license_cap()},
         {'metric': 'days_until_cap_projection', 'value': projection_text},
         {'metric': 'eps_window_note', 'value': 'Daily EPS assumes full-day buckets from AQL results'},
     ])
