@@ -66,6 +66,7 @@ def _request(method, url, **kwargs):
 
 
 def test_qradar_connection():
+    """Validate QRadar connectivity/authentication and raise RuntimeError on non-200."""
     endpoint = f"{QRADAR_HOST.rstrip('/')}/api/help/versions"
     response = _request('GET', endpoint)
     if response.status_code != 200:
@@ -74,6 +75,7 @@ def test_qradar_connection():
 
 
 def submit_aql_search(query):
+    """Submit an AQL query_expression and return search_id, raising RuntimeError on failure."""
     endpoint = f"{QRADAR_HOST.rstrip('/')}/api/ariel/searches"
     response = _request('POST', endpoint, params={'query_expression': query})
     if response.status_code not in (200, 201):
@@ -86,6 +88,7 @@ def submit_aql_search(query):
 
 
 def wait_for_search(search_id):
+    """Poll Ariel search until terminal status (COMPLETED/DONE) or raise RuntimeError on failure."""
     endpoint = f"{QRADAR_HOST.rstrip('/')}/api/ariel/searches/{search_id}"
     while True:
         response = _request('GET', endpoint)
@@ -101,6 +104,7 @@ def wait_for_search(search_id):
 
 
 def fetch_search_results(search_id):
+    """Return Ariel result rows from events/flows/results as a list of dicts, or raise RuntimeError."""
     endpoint = f"{QRADAR_HOST.rstrip('/')}/api/ariel/searches/{search_id}/results"
     response = _request('GET', endpoint)
     if response.status_code != 200:
