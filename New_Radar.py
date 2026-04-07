@@ -425,10 +425,15 @@ def get_log_source_details(qradar_host, username, password, identifier,
         return {'status': 'Connection Error', **_empty_details()}
 
 
-def process_single_row(idx, name_val, ip_val, qradar_host, username, password, group_val=None):
+def process_single_row(idx, name_val, ip_val, qradar_host, username, password,
+                       group_val=None):
     if name_val and str(name_val).lower() in ['nan', 'none', '', 'null']: name_val = None
     if ip_val   and str(ip_val).lower()   in ['nan', 'none', '', 'null']: ip_val   = None
 
+    # ── Group-aware threshold ─────────────────────────────────────────────────
+    # resolve_threshold() checks GROUP_COLUMN (global).  If set, it looks up
+    # group_val in GROUP_THRESHOLDS (case-insensitive).  Falls back to
+    # ACTIVITY_THRESHOLD_DAYS when no match or when GROUP_COLUMN is None.
     effective_threshold = resolve_threshold(group_val)
     details             = None
     search_method       = "None"
@@ -603,18 +608,30 @@ def _run_scan(df, rows_to_scan, total_count, qradar_host, username, password,
 
                 if details['enabled'] == 'No':
                     # ── All sources in result set are disabled ─────────────────
-                    # (enabled_str is 'No' only when found_source is disabled,
-                    #  which only happens when zero enabled sources existed.)
-                    df.at[idx, 'status']          = 'Found'
-                    df.at[idx, 'remarks']         = "Disabled on QRadar (no enabled source found)"
-                    df.at[idx, 'activity_status'] = "Disabled"
-                    print(f"  ⚪ Status      : DISABLED (confirmed — no enabled source in result)")
+                    if is_pending:
+                        # Stay pending — disabled during maintenance is expected
+                        df.at[idx, 'status']          = 'Pending-Maintenance'
+                        df.at[idx, 'activity_status'] = 'Pending-Maintenance'
+                        df.at[idx, 'remarks']         = "Pending Maintenance — Disabled on QRadar"
+                        print(f"  ⚪ Status      : DISABLED (maintenance — staying Pending)")
+                    else:
+                        df.at[idx, 'status']          = 'Found'
+                        df.at[idx, 'remarks']         = "Disabled on QRadar (no enabled source found)"
+                        df.at[idx, 'activity_status'] = "Disabled"
+                        print(f"  ⚪ Status      : DISABLED (confirmed — no enabled source in result)")
 
                 elif details['activity_status'] == 'No Activity':
-                    df.at[idx, 'status']          = 'Found'
-                    df.at[idx, 'remarks']         = "No events ever recorded on QRadar"
-                    df.at[idx, 'activity_status'] = 'No Activity'
-                    print(f"  🟠 Activity    : NO ACTIVITY (zero events ever recorded)")
+                    if is_pending:
+                        # Stay pending — no activity during maintenance is expected
+                        df.at[idx, 'status']          = 'Pending-Maintenance'
+                        df.at[idx, 'activity_status'] = 'Pending-Maintenance'
+                        df.at[idx, 'remarks']         = "Pending Maintenance — No events ever recorded"
+                        print(f"  🟠 Activity    : NO ACTIVITY (maintenance — staying Pending)")
+                    else:
+                        df.at[idx, 'status']          = 'Found'
+                        df.at[idx, 'remarks']         = "No events ever recorded on QRadar"
+                        df.at[idx, 'activity_status'] = 'No Activity'
+                        print(f"  🟠 Activity    : NO ACTIVITY (zero events ever recorded)")
 
                 else:
                     # Active or Inactive
@@ -643,15 +660,19 @@ def _run_scan(df, rows_to_scan, total_count, qradar_host, username, password,
                               f"({details['days_since_last_event']} days ago)")
 
                     elif is_pending:
-                        # Found during maintenance but not active — record data,
-                        # keep In Qradar? as "Pending-Maintenance"
-                        df.at[idx, 'status']          = 'Found'
-                        df.at[idx, 'activity_status'] = act
+                        # ══════════════════════════════════════════════════════
+                        # Found during maintenance but NOT yet active.
+                        # We record all QRadar data for reference / insight, but
+                        # status and activity_status stay "Pending-Maintenance"
+                        # so the source is NOT counted in Inactive/Disabled/etc.
+                        # In Qradar? column is left untouched.
+                        # ══════════════════════════════════════════════════════
+                        df.at[idx, 'status']          = 'Pending-Maintenance'
+                        df.at[idx, 'activity_status'] = 'Pending-Maintenance'
                         df.at[idx, 'remarks']         = (
-                            f"Found during maintenance ({act}) — {base_remark}"
+                            f"Pending Maintenance — Found on QRadar ({act}) — {base_remark}"
                         )
-                        _icon = '✅' if act == 'Active' else '🔴'
-                        print(f"  {_icon} Activity    : {act} (maintenance window)")
+                        print(f"  🔧 Maint Status: {act} — kept as Pending-Maintenance")
                         print(f"  📅 Last Event  : {details['last_seen']}  "
                               f"({details['days_since_last_event']} days ago)")
 
@@ -816,11 +837,70 @@ def generate_pie_chart(data_dict, title, prefix='qradar_chart'):
     return filepath
 
 
-# ── Typography helpers ─────────────────────────────────────────────────────────
-# _SF  = clean sans-serif for all prose / labels
-# _MON = monospace for IDs, timestamps, IP addresses, hostnames
-_SF  = "'Segoe UI', Helvetica Neue, Arial, sans-serif"
+# ── Typography ────────────────────────────────────────────────────────────────
+# _SF  = clean sans-serif for all prose, labels, badges
+# _MON = monospace strictly for IDs, IPs, hostnames, timestamps
+_SF  = "'Segoe UI', 'Segoe UI Historic', Helvetica, Arial, sans-serif"
 _MON = "Consolas, 'Courier New', monospace"
+
+# ── Palette tuned for a white / Outlook-default background ───────────────────
+# Header band is deep indigo; cards are white; text is near-black slate.
+# Metric numbers stay vivid; badges stay coloured; the dark pie charts
+# pop as floating "chart panels" against the white card.
+_E = {
+    # Header band
+    'hdr_bg':     '#3b0764',   # deep violet/indigo — hero strip
+    'hdr_text':   '#f5f3ff',
+    'hdr_sub':    '#c4b5fd',
+    # Card
+    'card_bg':    '#ffffff',
+    'card_border':'#e5e7eb',
+    # Dividers / rows
+    'row_alt':    '#faf9ff',   # every-other table row
+    'divider':    '#ede9fe',
+    # Text
+    'txt_primary':'#1e1b4b',   # near-black indigo
+    'txt_body':   '#374151',
+    'txt_muted':  '#6b7280',
+    'txt_mono':   '#4c1d95',   # indigo for IDs / hostnames
+    # Accents
+    'purple':     '#7c3aed',
+    'purple_lt':  '#ede9fe',
+    'green':      '#059669',
+    'red':        '#dc2626',
+    'orange':     '#ea580c',
+    'amber':      '#d97706',
+    'gray':       '#6b7280',
+    'cyan':       '#0891b2',
+    'blue':       '#2563eb',
+    'magenta':    '#a21caf',
+    # Badge backgrounds (dark for contrast on white)
+    'bdg_green':  '#065f46',
+    'bdg_red':    '#7f1d1d',
+    'bdg_orange': '#7c2d12',
+    'bdg_amber':  '#78350f',
+    'bdg_gray':   '#374151',
+    'bdg_cyan':   '#164e63',
+    'bdg_blue':   '#1e3a5f',
+    'bdg_magenta':'#701a75',
+    'bdg_purple': '#4c1d95',
+}
+
+# Override _STATUS_META to use the light-card palette
+_STATUS_META_LIGHT = {
+    'Inactive':           {'badge_bg': _E['bdg_red'],    'label': 'INACTIVE',      'icon': '●'},
+    'No Activity':        {'badge_bg': _E['bdg_orange'], 'label': 'NO ACTIVITY',   'icon': '◌'},
+    'Not Found':          {'badge_bg': _E['bdg_gray'],   'label': 'NOT FOUND',     'icon': '◌'},
+    'Error':              {'badge_bg': _E['bdg_amber'],  'label': 'API ERROR',     'icon': '▲'},
+    'Maintenance-Active': {'badge_bg': _E['bdg_magenta'],'label': 'MAINT ACTIVE ★','icon': '★'},
+}
+
+def _get_status_meta_light(activity_status):
+    s = str(activity_status).strip()
+    for key, meta in _STATUS_META_LIGHT.items():
+        if key.lower() in s.lower():
+            return meta
+    return {'badge_bg': _E['bdg_gray'], 'label': s.upper()[:14], 'icon': '◌'}
 
 
 def create_html_outlook_draft(attachment_path, subject, html_body, image_paths):
@@ -855,22 +935,24 @@ def create_html_outlook_draft(attachment_path, subject, html_body, image_paths):
 
 
 def _build_actionable_table(report_df, logsource_col, ip_col):
-    C = _C
+    E = _E
     if report_df is None or len(report_df) == 0:
         return (
-            f'<p style="color:#64748b;font-size:13px;font-style:italic;'
-            f'font-family:{_SF};padding:8px 0 4px;">No actionable items for this sheet.</p>'
+            f'<p style="color:{E["txt_muted"]};font-size:13px;font-style:italic;'
+            f'font-family:{_SF};padding:10px 0 4px;margin:0;">'
+            f'No actionable items for this sheet.</p>'
         )
 
     rows_html = ''
-    for _, row in report_df.iterrows():
+    for i, (_, row) in enumerate(report_df.iterrows()):
         hostname   = str(row.get(logsource_col, 'N/A') or 'N/A')
         ip_val     = str(row.get(ip_col,        'N/A') or 'N/A')
         qradar_id  = str(row.get('qradar_id',   'N/A') or 'N/A')
         last_seen  = str(row.get('last_seen',   'N/A') or 'N/A')
         act_status = str(row.get('activity_status', 'Unknown') or 'Unknown')
 
-        meta = _get_status_meta(act_status)
+        meta = _get_status_meta_light(act_status)
+        row_bg = E['row_alt'] if i % 2 == 1 else E['card_bg']
 
         days = row.get('days_since_last_event')
         days_str = ''
@@ -878,61 +960,57 @@ def _build_actionable_table(report_df, logsource_col, ip_col):
             try:
                 d = int(days)
                 days_str = (
-                    f'<span style="color:#94a3b8;font-size:10px;'
-                    f'display:block;margin-top:2px;font-family:{_MON};">'
+                    f'<span style="color:{E["txt_muted"]};font-size:10px;'
+                    f'display:block;margin-top:2px;font-family:{_SF};">'
                     f'{"today" if d == 0 else f"{d}d ago"}</span>'
                 )
             except Exception:
                 pass
 
-        hostname_display = hostname if len(hostname) <= 42 else hostname[:40] + '…'
-        _row_border = 'border-bottom:1px solid #1e1535;'
+        hostname_display = hostname if len(hostname) <= 40 else hostname[:38] + '…'
 
         rows_html += f"""
-        <tr>
-          <td style="padding:9px 14px;{_row_border}font-size:12px;
-                     color:#ddd6fe;font-family:{_MON};max-width:230px;line-height:1.4;">
+        <tr style="background:{row_bg};">
+          <td style="padding:9px 12px;border-bottom:1px solid {E['divider']};
+                     font-size:12px;color:{E['txt_mono']};font-family:{_MON};
+                     max-width:210px;line-height:1.4;">
             <span title="{hostname}">{hostname_display}</span>
           </td>
-          <td style="padding:9px 14px;{_row_border}font-size:12px;
-                     color:#94a3b8;text-align:center;white-space:nowrap;
-                     font-family:{_MON};">{ip_val}</td>
-          <td style="padding:9px 14px;{_row_border}font-size:12px;
-                     color:#a78bfa;text-align:center;white-space:nowrap;
-                     font-family:{_MON};">{qradar_id}</td>
-          <td style="padding:9px 14px;{_row_border}font-size:12px;
-                     color:#cbd5e1;text-align:center;font-family:{_MON};
-                     white-space:nowrap;">{last_seen}{days_str}</td>
-          <td style="padding:9px 14px;{_row_border}text-align:center;">
-            <span style="background:{meta['badge_bg']};color:#f0eaff;
-                         font-size:10px;font-weight:700;padding:4px 10px;
-                         border-radius:4px;letter-spacing:0.4px;
+          <td style="padding:9px 12px;border-bottom:1px solid {E['divider']};
+                     font-size:12px;color:{E['txt_muted']};text-align:center;
+                     white-space:nowrap;font-family:{_MON};">{ip_val}</td>
+          <td style="padding:9px 12px;border-bottom:1px solid {E['divider']};
+                     font-size:12px;color:{E['purple']};text-align:center;
+                     white-space:nowrap;font-family:{_MON};font-weight:600;">{qradar_id}</td>
+          <td style="padding:9px 12px;border-bottom:1px solid {E['divider']};
+                     font-size:12px;color:{E['txt_body']};text-align:center;
+                     white-space:nowrap;font-family:{_MON};">{last_seen}{days_str}</td>
+          <td style="padding:9px 12px;border-bottom:1px solid {E['divider']};
+                     text-align:center;">
+            <span style="background:{meta['badge_bg']};color:#ffffff;
+                         font-size:10px;font-weight:700;padding:3px 9px;
+                         border-radius:3px;letter-spacing:0.3px;
                          white-space:nowrap;font-family:{_SF};">
               {meta['icon']}&nbsp;{meta['label']}
             </span>
           </td>
         </tr>"""
 
-    _hdr_style = (f'padding:8px 14px;text-align:left;font-size:10px;'
-                  f'color:#9b72f5;font-weight:700;text-transform:uppercase;'
-                  f'letter-spacing:1px;font-family:{_SF};'
-                  f'border-top:2px solid #9b72f5;border-bottom:1px solid #3b1f7a;'
-                  f'background:#0d0a1f;')
-    _hdr_c = (f'padding:8px 14px;text-align:center;font-size:10px;'
-              f'color:#9b72f5;font-weight:700;text-transform:uppercase;'
-              f'letter-spacing:1px;font-family:{_SF};'
-              f'border-top:2px solid #9b72f5;border-bottom:1px solid #3b1f7a;'
-              f'background:#0d0a1f;')
+    th = (f'padding:8px 12px;font-size:10px;font-weight:700;'
+          f'text-transform:uppercase;letter-spacing:0.8px;font-family:{_SF};'
+          f'color:{E["txt_muted"]};background:{E["purple_lt"]};'
+          f'border-top:2px solid {E["purple"]};border-bottom:1px solid {E["divider"]};')
     return f"""
     <table width="100%" cellpadding="0" cellspacing="0"
-           style="border-collapse:collapse;margin-top:10px;border-radius:6px;overflow:hidden;">
+           style="border-collapse:collapse;margin-top:10px;
+                  border:1px solid {E['divider']};border-radius:4px;">
       <thead>
         <tr>
-          <th style="{_hdr_style}">Hostname / Log Source</th>
-          <th style="{_hdr_c}">IP Address</th>
-          <th style="{_hdr_c}">QRadar ID</th>
-          <th style="{_hdr_c}">Last Event</th>
-          <th style="{_hdr_c}">Status</th>
+          <th style="{th}text-align:left;">Hostname / Log Source</th>
+          <th style="{th}text-align:center;">IP Address</th>
+          <th style="{th}text-align:center;">QRadar ID</th>
+          <th style="{th}text-align:center;">Last Event</th>
+          <th style="{th}text-align:center;">Status</th>
         </tr>
       </thead>
       <tbody>{rows_html}</tbody>
@@ -942,82 +1020,107 @@ def _build_actionable_table(report_df, logsource_col, ip_col):
 def _build_email_html(global_stats, sheet_stats, total_issues,
                       images_to_embed, report_frames,
                       logsource_col, ip_col):
-    C        = _C
+    E        = _E
     run_time = datetime.now().strftime('%d %b %Y  ·  %H:%M:%S')
 
     active_display = global_stats['Active'] + global_stats['Inferred']
     total_scanned  = sum(global_stats.values()) - global_stats['Pending-Maintenance']
     maint_active   = global_stats.get('Maintenance-Active', 0)
 
+    # ── Top badge ─────────────────────────────────────────────────────────────
     if maint_active > 0:
-        badge_bg  = C['badge_magenta']
-        badge_txt = f'🚨 {maint_active} MAINT ACTIVE'
+        bdg_bg  = E['bdg_magenta']
+        bdg_txt = f'🚨 {maint_active} MAINTENANCE ACTIVE'
     elif total_issues == 0:
-        badge_bg  = C['badge_green']
-        badge_txt = '✔  ALL CLEAR'
+        bdg_bg  = E['bdg_green']
+        bdg_txt = '✔  ALL CLEAR'
     elif total_issues <= 10:
-        badge_bg  = C['badge_amber']
-        badge_txt = f'⚠  {total_issues} ISSUES'
+        bdg_bg  = E['bdg_amber']
+        bdg_txt = f'⚠  {total_issues} ISSUES'
     else:
-        badge_bg  = C['badge_red']
-        badge_txt = f'⚠  {total_issues} ISSUES'
+        bdg_bg  = E['bdg_red']
+        bdg_txt = f'⚠  {total_issues} ISSUES'
 
     badge_html = (
-        f'<span style="background:{badge_bg};color:#f0eaff;font-size:11px;'
-        f'font-weight:700;padding:6px 16px;border-radius:4px;'
-        f'letter-spacing:0.6px;font-family:{_SF};white-space:nowrap;">'
-        f'{badge_txt}</span>'
+        f'<span style="background:{bdg_bg};color:#ffffff;font-size:11px;'
+        f'font-weight:700;padding:6px 16px;border-radius:20px;'
+        f'letter-spacing:0.4px;font-family:{_SF};white-space:nowrap;">'
+        f'{bdg_txt}</span>'
     )
 
-    # ── Metric cell ────────────────────────────────────────────────────────────
+    # ── Metric block ──────────────────────────────────────────────────────────
     def metric_cell(label, value, color, note=''):
         note_html = (
-            f'<div style="font-size:10px;color:#94a3b8;margin-top:4px;'
+            f'<div style="font-size:10px;color:{E["txt_muted"]};margin-top:3px;'
             f'font-family:{_SF};">{note}</div>'
         ) if note else ''
         return f"""
-        <td style="padding:0 22px 0 0;text-align:center;vertical-align:top;">
-          <div style="font-size:32px;font-weight:800;color:{color};
-                      line-height:1;font-family:{_MON};letter-spacing:-1px;">
-            {value}
-          </div>
-          <div style="font-size:11px;color:#94a3b8;margin-top:6px;
-                      text-transform:uppercase;letter-spacing:1px;
-                      font-family:{_SF};font-weight:600;">
-            {label}
-          </div>
+        <td style="padding:0 20px 0 0;text-align:center;vertical-align:top;">
+          <div style="font-size:30px;font-weight:800;color:{color};
+                      line-height:1;font-family:{_MON};">{value}</div>
+          <div style="font-size:10px;color:{E['txt_muted']};margin-top:5px;
+                      text-transform:uppercase;letter-spacing:0.8px;
+                      font-family:{_SF};font-weight:600;">{label}</div>
           {note_html}
         </td>"""
 
     metric_row = (
-        metric_cell('Active',         active_display,                       C['green'],   'incl. inferred') +
-        metric_cell('Inactive',       global_stats['Inactive'],             C['red'])     +
-        metric_cell('No Activity',    global_stats['No Activity'],          C['orange'],  'zero events ever') +
-        metric_cell('Not Found',      global_stats['Not Found'],            C['gray'])    +
-        metric_cell('API Errors',     global_stats['API Errors'],           C['amber'])   +
-        metric_cell('Disabled',       global_stats['Disabled'],             C['cyan'])    +
-        metric_cell('Maint Active',   maint_active,                         C['magenta'], 'back online!') +
-        metric_cell('Pending',        global_stats['Pending-Maintenance'],  C['blue'])
+        metric_cell('Active',       active_display,                       E['green'],   'incl. inferred') +
+        metric_cell('Inactive',     global_stats['Inactive'],             E['red'])     +
+        metric_cell('No Activity',  global_stats['No Activity'],          E['orange'],  'zero events ever') +
+        metric_cell('Not Found',    global_stats['Not Found'],            E['gray'])    +
+        metric_cell('API Errors',   global_stats['API Errors'],           E['amber'])   +
+        metric_cell('Disabled',     global_stats['Disabled'],             E['cyan'])    +
+        metric_cell('Maint Active', maint_active,                         E['magenta'], 'back online!') +
+        metric_cell('Pending',      global_stats['Pending-Maintenance'],  E['blue'])
     )
 
-    # ── Stat chip ──────────────────────────────────────────────────────────────
-    def stat_chip(label, value, color):
+    # ── Stat pill ─────────────────────────────────────────────────────────────
+    def stat_pill(label, value, color):
         if value == 0:
             return ''
         return (
-            f'<span style="display:inline-block;border-left:3px solid {color};'
-            f'padding:2px 10px 2px 8px;margin:3px 8px 3px 0;'
-            f'font-size:11px;font-family:{_SF};color:{color};'
-            f'font-weight:700;letter-spacing:0.2px;">'
-            f'{value}&nbsp;{label}</span>'
+            f'<span style="display:inline-block;background:{color}15;'
+            f'border:1px solid {color}50;color:{color};'
+            f'padding:3px 10px;border-radius:20px;margin:3px 5px 3px 0;'
+            f'font-size:11px;font-family:{_SF};font-weight:700;">'
+            f'{value} {label}</span>'
         )
 
     overall_chart_html = (
         f'<img src="cid:overall_chart" alt="Overall health chart" '
-        f'style="display:block;max-width:420px;margin:16px auto 0;">'
+        f'style="display:block;max-width:420px;margin:12px auto 0;border-radius:8px;">'
     ) if 'overall_chart' in images_to_embed else ''
 
-    # ── Per-sheet blocks ───────────────────────────────────────────────────────
+    # ── Maintenance banner (inline, not nested tr/td trick) ───────────────────
+    maint_banner_html = ''
+    if maint_active > 0:
+        maint_banner_html = f"""
+    <tr>
+      <td style="padding:0 0 0 0;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="padding:14px 20px;background:#fdf4ff;
+                       border-left:4px solid {E['magenta']};
+                       border-top:1px solid {E['divider']};
+                       border-bottom:1px solid {E['divider']};">
+              <span style="font-size:13px;font-weight:700;color:{E['magenta']};
+                           font-family:{_SF};">🚨 Maintenance Alert &nbsp;—&nbsp;</span>
+              <span style="font-size:13px;color:{E['txt_body']};font-family:{_SF};">
+                {maint_active} source{"s" if maint_active != 1 else ""} under maintenance
+                {"are" if maint_active != 1 else "is"} now
+                <strong>actively sending events</strong> to QRadar.
+                The <em>In Qradar?</em> column has been updated to
+                <strong>Yes</strong> in Excel. Please review and close the
+                maintenance window.
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>"""
+
+    # ── Per-sheet blocks ──────────────────────────────────────────────────────
     sheet_blocks = ''
     for sheet_name, counts in sheet_stats.items():
         cid         = f"chart_{sheet_name.replace(' ', '_')}"
@@ -1026,40 +1129,41 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
         issue_count = (counts['Inactive'] + counts['No Activity'] +
                        counts['Not Found'] + counts['API Errors'] + sh_maint)
 
-        chips = (
-            stat_chip('Active',         counts['Active'] + counts['Inferred'], C['green'])   +
-            stat_chip('Inactive',       counts['Inactive'],                    C['red'])     +
-            stat_chip('No Activity',    counts['No Activity'],                 C['orange'])  +
-            stat_chip('Not Found',      counts['Not Found'],                   C['gray'])    +
-            stat_chip('API Errors',     counts['API Errors'],                  C['amber'])   +
-            stat_chip('Disabled',       counts['Disabled'],                    C['cyan'])    +
-            stat_chip('Maint Active',   sh_maint,                              C['magenta']) +
-            stat_chip('Pending',        counts['Pending-Maintenance'],         C['blue'])
+        pills = (
+            stat_pill('Active',       counts['Active'] + counts['Inferred'], E['green'])   +
+            stat_pill('Inactive',     counts['Inactive'],                    E['red'])     +
+            stat_pill('No Activity',  counts['No Activity'],                 E['orange'])  +
+            stat_pill('Not Found',    counts['Not Found'],                   E['gray'])    +
+            stat_pill('API Errors',   counts['API Errors'],                  E['amber'])   +
+            stat_pill('Disabled',     counts['Disabled'],                    E['cyan'])    +
+            stat_pill('Maint Active', sh_maint,                              E['magenta']) +
+            stat_pill('Pending',      counts['Pending-Maintenance'],         E['blue'])
         )
 
-        hdr_color = C['magenta'] if sh_maint > 0 else (C['purple'] if issue_count > 0 else C['green'])
-
         if sh_maint > 0:
-            hdr_badge = (
-                f'<span style="background:{C["badge_magenta"]};color:#f0eaff;'
-                f'font-size:10px;font-weight:700;padding:4px 12px;border-radius:4px;'
+            accent       = E['magenta']
+            hdr_badge_html = (
+                f'<span style="background:{E["bdg_magenta"]};color:#fff;'
+                f'font-size:10px;font-weight:700;padding:3px 12px;border-radius:20px;'
                 f'font-family:{_SF};">🚨 {sh_maint} MAINT ACTIVE</span>'
             )
         elif issue_count > 0:
-            hdr_badge = (
-                f'<span style="background:{C["badge_red"]};color:#f0eaff;'
-                f'font-size:10px;font-weight:700;padding:4px 12px;border-radius:4px;'
-                f'font-family:{_SF};">{issue_count} ISSUE{"S" if issue_count != 1 else ""}</span>'
+            accent       = E['red']
+            hdr_badge_html = (
+                f'<span style="background:{E["bdg_red"]};color:#fff;'
+                f'font-size:10px;font-weight:700;padding:3px 12px;border-radius:20px;'
+                f'font-family:{_SF};">{issue_count} ISSUE{"S" if issue_count!=1 else ""}</span>'
             )
         else:
-            hdr_badge = (
-                f'<span style="color:{C["green"]};font-size:11px;font-weight:700;'
-                f'font-family:{_SF};">✔ ALL CLEAR</span>'
+            accent       = E['green']
+            hdr_badge_html = (
+                f'<span style="color:{E["green"]};font-size:11px;font-weight:700;'
+                f'font-family:{_SF};">✔ All Clear</span>'
             )
 
         chart_html = (
             f'<img src="cid:{cid}" alt="{sheet_name} chart" '
-            f'style="display:block;max-width:360px;margin:12px auto 0;">'
+            f'style="display:block;max-width:340px;margin:14px auto 0;border-radius:8px;">'
         ) if cid in images_to_embed else ''
 
         actionable_html = _build_actionable_table(
@@ -1068,117 +1172,105 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
 
         sheet_blocks += f"""
         <tr>
-          <td style="padding:24px 0 6px;border-top:2px solid {hdr_color};">
-            <table width="100%" cellpadding="0" cellspacing="0"><tr>
-              <td>
-                <span style="font-size:14px;font-weight:700;color:{hdr_color};
-                             font-family:{_SF};letter-spacing:0.2px;">{sheet_name}</span>
-                <span style="font-size:11px;color:#64748b;margin-left:12px;
-                             font-family:{_SF};">{sheet_total} sources scanned</span>
-              </td>
-              <td align="right">{hdr_badge}</td>
-            </tr></table>
+          <td style="padding:22px 0 0;">
+            <table width="100%" cellpadding="0" cellspacing="0"
+                   style="border-left:3px solid {accent};padding-left:14px;">
+              <tr>
+                <td>
+                  <span style="font-size:14px;font-weight:700;color:{E['txt_primary']};
+                               font-family:{_SF};">{sheet_name}</span>
+                  <span style="font-size:11px;color:{E['txt_muted']};margin-left:10px;
+                               font-family:{_SF};">{sheet_total} sources scanned</span>
+                </td>
+                <td align="right">{hdr_badge_html}</td>
+              </tr>
+            </table>
           </td>
         </tr>
-        <tr><td style="padding:10px 0 6px;">{chips}</td></tr>
-        <tr><td style="padding:4px 0 16px;text-align:center;">{chart_html}</td></tr>
         <tr>
-          <td style="padding:4px 0 6px;">
-            <span style="font-size:11px;color:{C['purple']};text-transform:uppercase;
-                         letter-spacing:1.5px;font-family:{_SF};font-weight:700;">
-              Requires Attention
-            </span>
-            <span style="font-size:11px;color:#64748b;margin-left:10px;font-family:{_SF};">
-              Inactive · No Activity · Not Found · API Errors · Maintenance Active — full data in Excel
+          <td style="padding:10px 0 6px;border-bottom:1px solid {E['divider']};">
+            {pills}
+          </td>
+        </tr>
+        <tr><td style="padding:0;text-align:center;">{chart_html}</td></tr>
+        <tr>
+          <td style="padding:16px 0 4px;">
+            <span style="font-size:11px;font-weight:700;color:{E['purple']};
+                         text-transform:uppercase;letter-spacing:0.8px;
+                         font-family:{_SF};">Requires Attention</span>
+            <span style="font-size:11px;color:{E['txt_muted']};margin-left:8px;
+                         font-family:{_SF};">
+              Inactive · No Activity · Not Found · API Errors · Maintenance Active
+              — full dataset in Excel
             </span>
           </td>
         </tr>
-        <tr><td style="padding:0 0 32px;">{actionable_html}</td></tr>"""
+        <tr><td style="padding:0 0 28px;">{actionable_html}</td></tr>"""
 
-    # ── Maintenance-Active callout banner (shown at top if any) ───────────────
-    maint_banner = ''
-    if maint_active > 0:
-        maint_banner = f"""
-    <tr>
-      <td style="padding:14px 18px;background:#2d1057;border-radius:6px;
-                 border-left:4px solid {C['magenta']};margin:12px 0;">
-        <span style="font-size:13px;font-weight:700;color:{C['magenta']};
-                     font-family:{_SF};">
-          🚨 Maintenance Alert &nbsp;—&nbsp;
-        </span>
-        <span style="font-size:13px;color:#e2e8f0;font-family:{_SF};">
-          {maint_active} source{"s" if maint_active != 1 else ""} under maintenance
-          {"are" if maint_active != 1 else "is"} now <strong>actively sending events</strong>
-          to QRadar. Their <em>In Qradar?</em> column has been updated to <strong>Yes</strong>
-          in the Excel file. Please review and close the maintenance window.
-        </span>
-      </td>
-    </tr>"""
-
+    # ── Assemble full email ───────────────────────────────────────────────────
+    # No background forced on the outer body or wrapper table.
+    # Outlook renders its own default reading-pane background (white/light-gray).
+    # The card sits centred with a white background and a border — it pops cleanly.
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="color-scheme" content="light dark">
-<meta name="supported-color-schemes" content="light dark">
-<style>
-  body {{ margin:0; padding:0; font-family:{_SF}; background:#06040f; color:#e2e8f0; }}
-  * {{ box-sizing:border-box; }}
-</style>
 </head>
-<body style="margin:0;padding:0;background:#06040f;">
+<body style="margin:0;padding:0;font-family:{_SF};">
 
-<table width="100%" cellpadding="0" cellspacing="0"
-       style="background:#06040f;padding:28px 0;">
+<table width="100%" cellpadding="0" cellspacing="0" style="padding:20px 0;">
 <tr>
   <td align="center" style="padding:0;">
-  <table width="660" cellpadding="0" cellspacing="0"
-         style="max-width:660px;width:100%;background:#0a0618;">
+  <table width="640" cellpadding="0" cellspacing="0"
+         style="max-width:640px;width:100%;background:{E['card_bg']};
+                border:1px solid {E['card_border']};border-radius:6px;
+                border-collapse:separate;">
 
-    <!-- ═══ HEADER ══════════════════════════════════════════════════════════ -->
+    <!-- ══ HEADER BAND ══════════════════════════════════════════════════════ -->
     <tr>
-      <td style="padding:28px 28px 20px;border-bottom:3px solid {C['purple']};">
+      <td style="padding:28px 28px 22px;background:{E['hdr_bg']};
+                 border-radius:6px 6px 0 0;">
         <table width="100%" cellpadding="0" cellspacing="0"><tr>
           <td style="padding:0;">
-            <div style="font-size:10px;color:#6b7280;letter-spacing:3px;
+            <div style="font-size:10px;color:{E['hdr_sub']};letter-spacing:3px;
                         text-transform:uppercase;font-family:{_SF};margin-bottom:10px;">
               QRadar &nbsp;·&nbsp; Inventory Validation
             </div>
-            <div style="font-size:26px;font-weight:800;color:#ddd6fe;
-                        letter-spacing:-0.5px;line-height:1.2;font-family:{_SF};">
+            <div style="font-size:24px;font-weight:800;color:{E['hdr_text']};
+                        line-height:1.2;font-family:{_SF};">
               Log Source Validation Report
             </div>
-            <div style="margin-top:10px;font-size:12px;color:#6b7280;
+            <div style="margin-top:10px;font-size:12px;color:{E['hdr_sub']};
                         font-family:{_MON};">{run_time}</div>
           </td>
-          <td align="right" valign="middle" style="padding-left:20px;">
+          <td align="right" valign="middle" style="padding-left:20px;
+                                                    white-space:nowrap;">
             {badge_html}
           </td>
         </tr></table>
       </td>
     </tr>
 
-    <!-- ═══ ACTION REQUIRED BAR ═════════════════════════════════════════════ -->
+    <!-- ══ ACTION BAR ═══════════════════════════════════════════════════════ -->
     <tr>
-      <td style="padding:14px 28px 14px;border-bottom:1px solid #1e1535;">
-        <span style="color:{C['red']};font-size:13px;font-weight:700;
-                     font-family:{_SF};">
-          ACTION REQUIRED &nbsp;·&nbsp;
-        </span>
-        <span style="color:#94a3b8;font-size:13px;font-family:{_SF};">
-          {total_issues} source{"s" if total_issues != 1 else ""} need attention.
-          Full dataset attached in Excel.
+      <td style="padding:14px 28px;background:{E['purple_lt']};
+                 border-bottom:1px solid {E['divider']};">
+        <span style="color:{E['red']};font-size:13px;font-weight:700;
+                     font-family:{_SF};">ACTION REQUIRED &nbsp;·&nbsp;</span>
+        <span style="color:{E['txt_body']};font-size:13px;font-family:{_SF};">
+          {total_issues} source{"s" if total_issues != 1 else ""} need{"s" if total_issues == 1 else ""} attention.
+          Full dataset in attached Excel.
         </span>
       </td>
     </tr>
 
-    {f'<tr><td style="padding:16px 28px 0;">{maint_banner[maint_banner.find("<tr>"):maint_banner.rfind("</tr>")+5]}</td></tr>' if maint_active > 0 else ''}
+    {maint_banner_html}
 
-    <!-- ═══ OVERALL METRICS ══════════════════════════════════════════════════ -->
+    <!-- ══ OVERALL METRICS ══════════════════════════════════════════════════ -->
     <tr>
-      <td style="padding:24px 28px 12px;">
-        <div style="font-size:10px;color:{C['purple']};text-transform:uppercase;
-                    letter-spacing:2px;margin-bottom:20px;font-family:{_SF};
+      <td style="padding:24px 28px 8px;">
+        <div style="font-size:10px;color:{E['purple']};text-transform:uppercase;
+                    letter-spacing:1.5px;margin-bottom:18px;font-family:{_SF};
                     font-weight:700;">
           Overall &nbsp;·&nbsp; {total_scanned} Sources Validated
         </div>
@@ -1186,43 +1278,44 @@ def _build_email_html(global_stats, sheet_stats, total_issues,
       </td>
     </tr>
 
-    <!-- ═══ OVERALL CHART ════════════════════════════════════════════════════ -->
+    <!-- ══ OVERALL CHART ════════════════════════════════════════════════════ -->
     <tr>
-      <td style="padding:12px 28px 8px;text-align:center;">
-        <div style="font-size:10px;color:#6b7280;text-transform:uppercase;
-                    letter-spacing:1.5px;margin-bottom:6px;font-family:{_SF};">
+      <td style="padding:8px 28px 20px;text-align:center;
+                 border-bottom:1px solid {E['divider']};">
+        <div style="font-size:10px;color:{E['txt_muted']};text-transform:uppercase;
+                    letter-spacing:1px;margin-bottom:4px;font-family:{_SF};">
           Inventory Health Distribution
         </div>
         {overall_chart_html}
       </td>
     </tr>
 
-    <!-- ═══ PER-SHEET BREAKDOWN ══════════════════════════════════════════════ -->
+    <!-- ══ PER-SHEET BREAKDOWN ══════════════════════════════════════════════ -->
     <tr>
-      <td style="padding:28px 28px 4px;border-top:1px solid #1e1535;">
-        <span style="font-size:10px;color:{C['purple']};text-transform:uppercase;
-                     letter-spacing:2px;font-family:{_SF};font-weight:700;">
+      <td style="padding:22px 28px 2px;">
+        <div style="font-size:10px;color:{E['purple']};text-transform:uppercase;
+                    letter-spacing:1.5px;font-family:{_SF};font-weight:700;
+                    margin-bottom:2px;">
           Breakdown by Sheet
-        </span>
-        <span style="font-size:12px;color:#64748b;margin-left:12px;font-family:{_SF};">
-          metrics · chart · sources requiring action
-        </span>
+        </div>
+        <div style="font-size:11px;color:{E['txt_muted']};font-family:{_SF};">
+          Metrics · chart · sources requiring action
+        </div>
       </td>
     </tr>
-
     <tr>
-      <td style="padding:0 28px;">
+      <td style="padding:0 28px 4px;">
         <table width="100%" cellpadding="0" cellspacing="0">
           {sheet_blocks}
         </table>
       </td>
     </tr>
 
-    <!-- ═══ FOOTER ═══════════════════════════════════════════════════════════ -->
+    <!-- ══ FOOTER ════════════════════════════════════════════════════════════ -->
     <tr>
-      <td style="padding:20px 28px 24px;border-top:1px solid #1e1535;">
-        <div style="font-size:10px;color:#4b5563;font-family:{_SF};
-                    letter-spacing:0.3px;">
+      <td style="padding:16px 28px 20px;border-top:1px solid {E['divider']};
+                 background:{E['purple_lt']};border-radius:0 0 6px 6px;">
+        <div style="font-size:10px;color:{E['txt_muted']};font-family:{_SF};">
           QRadar Inventory Validation &nbsp;·&nbsp; Auto-generated {run_time}
         </div>
       </td>
