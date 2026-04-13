@@ -111,7 +111,7 @@ _TIME_TOKEN_RE = re.compile(
 _THRESHOLD_HINT_RE = re.compile(
     # 'sla' is intentionally included as a standalone hint because some group
     # descriptions use compact forms like "SLA: 7 days".
-    r'(keep[\s_-]*alive|inactivity(?:\s*window)?|inactive\s*after|sla)',
+    r'(keep[\s_-]*alive|inactivity(?:\s*window)?|inactive\s*after|\bsla\b)',
     flags=re.IGNORECASE
 )
 
@@ -130,7 +130,7 @@ _HINT_SEARCH_SCOPE = 100
 def _to_days(value_str, unit_str):
     # Support both decimal separators: "1.5" and "1,5".
     value = float(str(value_str).replace(',', '.'))
-    if value <= 0:
+    if value <= 1e-12:
         logger.warning("Ignoring non-positive threshold value in group description: %s %s",
                        value_str, unit_str)
         return None
@@ -156,7 +156,8 @@ def parse_threshold_from_description(description):
     if not description:
         return None
     text = str(description)
-    # Normalize NBSP + whitespace variants so regex parsing is consistent.
+    # Some QRadar descriptions contain non-breaking spaces (NBSP) and irregular
+    # spacing copied from UI text; normalize these so regex matching is stable.
     normalized = " ".join(text.replace('\u00A0', ' ').split())
 
     for hint_match in _THRESHOLD_HINT_RE.finditer(normalized):
@@ -524,14 +525,20 @@ def get_log_source_details(qradar_host, username, password, identifier,
             dynamic_threshold = None # float (days) from the first matching group
 
             for gid in group_ids:
-                g_meta = LOG_SOURCE_GROUPS_CACHE.get(gid)
-                if g_meta is None:
-                    g_meta = LOG_SOURCE_GROUPS_CACHE.get(str(gid))
-                if g_meta is None:
+                gid_keys = [gid]
+                if not isinstance(gid, str):
+                    gid_keys.append(str(gid))
+                else:
                     try:
-                        g_meta = LOG_SOURCE_GROUPS_CACHE.get(int(gid))
+                        gid_keys.append(int(gid))
                     except (TypeError, ValueError):
                         pass
+
+                g_meta = None
+                for gid_key in gid_keys:
+                    g_meta = LOG_SOURCE_GROUPS_CACHE.get(gid_key)
+                    if g_meta:
+                        break
                 if not g_meta:
                     group_parts.append(f"[Group ID {gid} — not in cache]")
                     continue
