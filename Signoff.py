@@ -606,13 +606,23 @@ def is_already_handled(mail_item, sent_folder, drafts_folder, outcome_type='norm
     Checks whether this email thread has already been handled by looking for
     any item sharing the same ConversationID in Sent Items or Drafts.
 
-    Deduplication is outcome-aware:
+    Deduplication is outcome-aware and trigger-aware:
       - normal outcome: checks recent Sent/Draft items within NORMAL_SIGNOFF_DEDUP_HOURS
       - partial/not-found outcome: checks recent Sent/Draft items within
         PARTIAL_REVALIDATION_DAYS (so older unresolved cases can be revalidated)
+      - previously handled items only block if they are newer than (or equal to)
+        the current trigger email's ReceivedTime; older replies in the same
+        conversation do not block revalidation when a newer trigger arrives.
     """
     conv_id = mail_item.ConversationID
     now = datetime.now()
+    try:
+        trigger_received_time = mail_item.ReceivedTime
+    except Exception:
+        try:
+            trigger_received_time = mail_item.CreationTime
+        except Exception:
+            trigger_received_time = None
 
     if outcome_type == 'partial_or_not_found':
         cutoff_time = now - timedelta(days=PARTIAL_REVALIDATION_DAYS)
@@ -621,13 +631,22 @@ def is_already_handled(mail_item, sent_folder, drafts_folder, outcome_type='norm
         cutoff_time = now - timedelta(hours=NORMAL_SIGNOFF_DEDUP_HOURS)
         window_desc = f"{NORMAL_SIGNOFF_DEDUP_HOURS} hour normal window"
 
+    if trigger_received_time is None:
+        trigger_received_time = cutoff_time
+        _log("⚠️  Trigger email has no ReceivedTime/CreationTime; "
+             "using dedup cutoff as fallback trigger time.")
+
     try:
         for item in sent_folder.Items:
             try:
                 if item.ConversationID != conv_id:
                     continue
                 sent_on = item.SentOn
-                if sent_on and sent_on >= cutoff_time:
+                if not sent_on:
+                    continue
+                if trigger_received_time and sent_on < trigger_received_time:
+                    continue
+                if sent_on >= cutoff_time:
                     return True, f"reply already in Sent Items ({window_desc})"
             except Exception:
                 continue
@@ -640,7 +659,11 @@ def is_already_handled(mail_item, sent_folder, drafts_folder, outcome_type='norm
                 if item.ConversationID != conv_id:
                     continue
                 created_on = item.CreationTime
-                if created_on and created_on >= cutoff_time:
+                if not created_on:
+                    continue
+                if trigger_received_time and created_on < trigger_received_time:
+                    continue
+                if created_on >= cutoff_time:
                     return True, f"draft already exists in Drafts folder ({window_desc})"
             except Exception:
                 continue
