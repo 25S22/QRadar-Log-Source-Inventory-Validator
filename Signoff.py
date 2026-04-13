@@ -20,6 +20,12 @@ SUBJECT_SEPARATOR = '|'
 # Only emails received within this window are considered
 LOOKBACK_HOURS = 24
 
+# Conversation deduplication windows:
+# - normal signoff replies use hour-based deduplication
+# - partial/not-found replies can be revalidated after this day window
+NORMAL_SIGNOFF_DEDUP_HOURS = LOOKBACK_HOURS
+PARTIAL_REVALIDATION_DAYS  = 14
+
 # Sender allowlist — only these addresses trigger a draft.
 # Use exact addresses OR @domain entries for whole-domain matching.
 # Example: 'analyst@org.com' or '@soc.org.com'
@@ -84,6 +90,13 @@ OS_TYPE_GROUPS = {
 # ONBOARD_REQUEST_NAME is how they appear in the email body e.g. '@xyz'
 ONBOARD_REQUEST_CC   = 'onboarding-owner@yourorg.com'
 ONBOARD_REQUEST_NAME = '@xyz'
+
+# Recipient override for Partial / Not Found outcomes.
+# When set, these drafts are routed ONLY to these recipients (plus trigger/onboard
+# recipients below) instead of replying to the full original thread.
+# Keep [] to use only TRIGGER_DL (To) and ONBOARD_REQUEST_CC (CC).
+PARTIAL_NOT_FOUND_TO_RECIPIENTS = []
+PARTIAL_NOT_FOUND_CC_RECIPIENTS = []
 
 # ─── REPLY TEMPLATES ───────────────────────────────────────────────────────────
 # The reply wording is built in _build_reply_html() below the config block.
@@ -538,22 +551,80 @@ def extract_hostname(subject):
     return hostname if hostname else None
 
 
+def _normalize_recipients(values):
+    """
+    Normalizes recipient inputs into a de-duplicated list while preserving order.
+    Accepts a list/tuple/set or a semicolon/comma-separated string.
+    """
+    if values is None:
+        return []
+
+    if isinstance(values, str):
+        raw_values = values.replace(',', ';').split(';')
+    else:
+        raw_values = []
+        for val in values:
+            if isinstance(val, str):
+                raw_values.extend(val.replace(',', ';').split(';'))
+
+    deduped = []
+    seen = set()
+    for value in raw_values:
+        clean = value.strip()
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(clean)
+    return deduped
+
+
+def _get_partial_not_found_recipients():
+    """
+    Builds To/CC recipient lists for Partial / Not Found outcomes.
+    """
+    to_list = _normalize_recipients(PARTIAL_NOT_FOUND_TO_RECIPIENTS)
+    cc_list = _normalize_recipients(PARTIAL_NOT_FOUND_CC_RECIPIENTS)
+
+    if TRIGGER_DL.strip():
+        to_list = _normalize_recipients(to_list + [TRIGGER_DL.strip()])
+    if ONBOARD_REQUEST_CC.strip():
+        cc_list = _normalize_recipients(cc_list + [ONBOARD_REQUEST_CC.strip()])
+
+    return to_list, cc_list
+
+
 # ─── CONVERSATION CHECK ────────────────────────────────────────────────────────
-def is_already_handled(mail_item, sent_folder, drafts_folder):
+def is_already_handled(mail_item, sent_folder, drafts_folder, outcome_type='normal'):
     """
     Checks whether this email thread has already been handled by looking for
     any item sharing the same ConversationID in Sent Items or Drafts.
 
-    This is the primary deduplication mechanism — no local storage needed.
-    If a reply was already sent OR a draft already exists, returns True.
+    Deduplication is outcome-aware:
+      - normal outcome: checks recent Sent/Draft items within NORMAL_SIGNOFF_DEDUP_HOURS
+      - partial/not-found outcome: checks recent Sent/Draft items within
+        PARTIAL_REVALIDATION_DAYS (so older unresolved cases can be revalidated)
     """
     conv_id = mail_item.ConversationID
+    now = datetime.now()
+
+    if outcome_type == 'partial_or_not_found':
+        cutoff_time = now - timedelta(days=PARTIAL_REVALIDATION_DAYS)
+        window_desc = f"{PARTIAL_REVALIDATION_DAYS} day revalidation window"
+    else:
+        cutoff_time = now - timedelta(hours=NORMAL_SIGNOFF_DEDUP_HOURS)
+        window_desc = f"{NORMAL_SIGNOFF_DEDUP_HOURS} hour normal window"
 
     try:
         for item in sent_folder.Items:
             try:
-                if item.ConversationID == conv_id:
-                    return True, "reply already in Sent Items"
+                if item.ConversationID != conv_id:
+                    continue
+                sent_on = item.SentOn
+                if sent_on and sent_on >= cutoff_time:
+                    return True, f"reply already in Sent Items ({window_desc})"
             except Exception:
                 continue
     except Exception as e:
@@ -562,8 +633,11 @@ def is_already_handled(mail_item, sent_folder, drafts_folder):
     try:
         for item in drafts_folder.Items:
             try:
-                if item.ConversationID == conv_id:
-                    return True, "draft already exists in Drafts folder"
+                if item.ConversationID != conv_id:
+                    continue
+                created_on = item.CreationTime
+                if created_on and created_on >= cutoff_time:
+                    return True, f"draft already exists in Drafts folder ({window_desc})"
             except Exception:
                 continue
     except Exception as e:
@@ -852,7 +926,10 @@ def build_reply_body(hostname, qradar_result):
       show what was found with an unrecognised device type warning.
     If OS_TYPE_GROUPS = {} → simple found reply, no type validation.
 
-    Returns (html_body, needs_cc) tuple.
+    Returns (html_body, needs_cc, outcome_type) tuple.
+    outcome_type is:
+      - 'normal'
+      - 'partial_or_not_found'
 
     FIX: needs_cc is True when ANY required type is either:
       - missing entirely (not r['found']), OR
@@ -866,12 +943,12 @@ def build_reply_body(hostname, qradar_result):
     # Genuinely not found or API error
     if status != 'Found' or not sources:
         return _build_reply_html(hostname, qradar_result,
-                                 type_validation=None, os_group=None), False
+                                 type_validation=None, os_group=None), False, 'partial_or_not_found'
 
     # No type validation configured — simple found reply
     if not OS_TYPE_GROUPS:
         return _build_reply_html(hostname, qradar_result,
-                                 type_validation=None, os_group=None), False
+                                 type_validation=None, os_group=None), False, 'normal'
 
     # Detect OS group
     group_name, group_rules = detect_os_group(sources)
@@ -882,7 +959,7 @@ def build_reply_body(hostname, qradar_result):
         _log(f"      ⚠️  OS group undetected for {hostname} — "
              f"showing raw sources, no type validation applied.")
         return _build_reply_html(hostname, qradar_result,
-                                 type_validation=None, os_group=None), False
+                                 type_validation=None, os_group=None), False, 'normal'
 
     validation = validate_expected_types(
         qradar_result,
@@ -900,16 +977,19 @@ def build_reply_body(hostname, qradar_result):
         type_validation=validation,
         os_group=group_name
     )
-    return html, needs_cc
+    outcome_type = 'partial_or_not_found' if needs_cc else 'normal'
+    return html, needs_cc, outcome_type
 
 
-def create_draft_reply(mail_item, html_body, hostname, needs_cc=False):
+def create_draft_reply(mail_item, html_body, hostname, needs_cc=False, outcome_type='normal'):
     """
     Creates a draft reply to the original email and saves it silently to Drafts.
     Uses ReplyAll so all original recipients are included.
 
     needs_cc: if True and ONBOARD_REQUEST_CC is set, adds that address to CC.
               Triggered when types are missing OR found but sending no events.
+    outcome_type: if 'partial_or_not_found', recipients are restricted to the
+                  configured escalation distribution lists.
 
     THIS IS DRAFT ONLY — mail.Save() is called, NOT mail.Send().
     No email is sent from this script under any circumstance.
@@ -919,7 +999,24 @@ def create_draft_reply(mail_item, html_body, hostname, needs_cc=False):
         reply.HTMLBody = html_body
         reply.Subject  = f"[Processed] {mail_item.Subject}"
 
-        if needs_cc and ONBOARD_REQUEST_CC.strip():
+        if outcome_type == 'partial_or_not_found':
+            to_list, cc_list = _get_partial_not_found_recipients()
+
+            if to_list:
+                reply.To = '; '.join(to_list)
+            else:
+                _log("      ⚠️  Partial/Not Found recipient override has no TO entries; "
+                     "keeping original ReplyAll recipients.")
+
+            if cc_list:
+                reply.CC = '; '.join(cc_list)
+            else:
+                reply.CC = ''
+
+            _log(f"      📬 Recipient override applied for Partial/Not Found. "
+                 f"To={reply.To} | CC={reply.CC}")
+
+        elif needs_cc and ONBOARD_REQUEST_CC.strip():
             existing_cc  = reply.CC or ''
             reply.CC     = (
                 f"{existing_cc}; {ONBOARD_REQUEST_CC}".strip('; ')
@@ -1009,6 +1106,8 @@ def main():
     _log("=" * 60)
     _log("🚀 QRadar Signoff Auto-Draft starting...")
     _log(f"   Lookback   : {LOOKBACK_HOURS}h  |  Keyword: '{SUBJECT_KEYWORD}'")
+    _log(f"   Dedup      : normal={NORMAL_SIGNOFF_DEDUP_HOURS}h | "
+         f"partial/not-found={PARTIAL_REVALIDATION_DAYS}d")
     _log(f"   Separator  : '{SUBJECT_SEPARATOR}'  |  "
          f"Allowed senders: {'ALL' if not ALLOWED_SENDERS else len(ALLOWED_SENDERS)}")
     _log(f"   Trigger DL : '{TRIGGER_DL}' (must appear in email body)")
@@ -1104,13 +1203,6 @@ def main():
             _log(f"      Sender  : {sender}")
             _log(f"      Hostname: {hostname}")
 
-            # ── Conversation deduplication ──
-            handled, handle_reason = is_already_handled(mail_item, sent, drafts)
-            if handled:
-                skipped += 1
-                _log(f"      ⏭️  SKIP ({handle_reason})")
-                continue
-
             # ── QRadar query — read only ──
             _log(f"      🔍 Querying QRadar...")
             if OS_TYPE_GROUPS:
@@ -1123,9 +1215,20 @@ def main():
                      f"Last seen: {qradar_result.get('last_seen', 'N/A')}")
 
             # ── Build and save draft ──
-            body, needs_cc = build_reply_body(hostname, qradar_result)
+            body, needs_cc, outcome_type = build_reply_body(hostname, qradar_result)
+
+            # ── Conversation deduplication (outcome-aware window) ──
+            handled, handle_reason = is_already_handled(
+                mail_item, sent, drafts, outcome_type=outcome_type
+            )
+            if handled:
+                skipped += 1
+                _log(f"      ⏭️  SKIP ({handle_reason})")
+                continue
+
             success = create_draft_reply(mail_item, body, hostname,
-                                         needs_cc=needs_cc)
+                                         needs_cc=needs_cc,
+                                         outcome_type=outcome_type)
 
             if success:
                 drafted += 1
