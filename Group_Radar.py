@@ -101,7 +101,7 @@ _TIME_TOKEN_RE = re.compile(
     r'hours?|hrs?|hr|h|'
     r'days?|d|'
     r'weeks?|wks?|wk|w|'
-    r'months?|mons?|mon|mo|m'
+    r'months?|mons?|mon|mo'
     r')\b',
     flags=re.IGNORECASE
 )
@@ -117,15 +117,19 @@ _TIME_UNIT_MULTIPLIERS = {
     'h': 1 / 24, 'hr': 1 / 24, 'hrs': 1 / 24, 'hour': 1 / 24, 'hours': 1 / 24,
     'd': 1.0, 'day': 1.0, 'days': 1.0,
     'w': 7.0, 'wk': 7.0, 'wks': 7.0, 'week': 7.0, 'weeks': 7.0,
-    'm': 30.0, 'mo': 30.0, 'mon': 30.0, 'mons': 30.0, 'month': 30.0, 'months': 30.0,
+    'mo': 30.0, 'mon': 30.0, 'mons': 30.0, 'month': 30.0, 'months': 30.0,
 }
 
+# Search only shortly after SLA hint keywords to capture the intended token
+# (e.g. "Keep Alive 7 days") while avoiding unrelated numbers later in text.
 _HINT_SEARCH_SCOPE = 100
 
 
 def _to_days(value_str, unit_str):
     value = float(str(value_str).replace(',', '.'))
     if value <= 0:
+        logger.warning("Ignoring non-positive threshold value in group description: %s %s",
+                       value_str, unit_str)
         return None
     multiplier = _TIME_UNIT_MULTIPLIERS.get(str(unit_str).strip().lower())
     if multiplier is None:
