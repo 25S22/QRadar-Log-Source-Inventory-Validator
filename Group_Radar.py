@@ -95,14 +95,40 @@ def resolve_threshold(group_name=None):
 
 
 # ─── DYNAMIC THRESHOLD PARSER ──────────────────────────────────────────────────
-# Regex patterns ordered from finest to coarsest resolution so the first
-# match wins against the most specific time unit present in the description.
-_TIME_PATTERNS = [
-    (r'(\d+(?:\.\d+)?)\s*hour',  1 / 24),   # hours  → fractional days
-    (r'(\d+(?:\.\d+)?)\s*day',   1.0),       # days   → days
-    (r'(\d+(?:\.\d+)?)\s*week',  7.0),       # weeks  → days
-    (r'(\d+(?:\.\d+)?)\s*month', 30.0),      # months → days (approximate)
-]
+_TIME_TOKEN_RE = re.compile(
+    r'(?P<value>\d+(?:[.,]\d+)?)\s*'
+    r'(?P<unit>'
+    r'hours?|hrs?|hr|h|'
+    r'days?|d|'
+    r'weeks?|wks?|wk|w|'
+    r'months?|mons?|mon|mo|m'
+    r')\b',
+    flags=re.IGNORECASE
+)
+
+# Prefer parsing values that appear after explicit SLA-style hints in the
+# description (e.g. "Keep Alive 7 days") before scanning generic tokens.
+_THRESHOLD_HINT_RE = re.compile(
+    r'(keep[\s_-]*alive|inactivity(?:\s*window)?|inactive\s*after|sla)',
+    flags=re.IGNORECASE
+)
+
+_TIME_UNIT_MULTIPLIERS = {
+    'h': 1 / 24, 'hr': 1 / 24, 'hrs': 1 / 24, 'hour': 1 / 24, 'hours': 1 / 24,
+    'd': 1.0, 'day': 1.0, 'days': 1.0,
+    'w': 7.0, 'wk': 7.0, 'wks': 7.0, 'week': 7.0, 'weeks': 7.0,
+    'm': 30.0, 'mo': 30.0, 'mon': 30.0, 'mons': 30.0, 'month': 30.0, 'months': 30.0,
+}
+
+
+def _to_days(value_str, unit_str):
+    value = float(str(value_str).replace(',', '.'))
+    if value <= 0:
+        return None
+    multiplier = _TIME_UNIT_MULTIPLIERS.get(str(unit_str).strip().lower())
+    if multiplier is None:
+        return None
+    return value * multiplier
 
 
 def parse_threshold_from_description(description):
@@ -120,11 +146,20 @@ def parse_threshold_from_description(description):
     """
     if not description:
         return None
-    text = str(description).lower()
-    for pattern, multiplier in _TIME_PATTERNS:
-        m = re.search(pattern, text)
-        if m:
-            return float(m.group(1)) * multiplier
+    text = str(description)
+    normalized = " ".join(text.replace('\u00A0', ' ').split())
+
+    for hint_match in _THRESHOLD_HINT_RE.finditer(normalized):
+        scope = normalized[hint_match.end(): hint_match.end() + 100]
+        token_match = _TIME_TOKEN_RE.search(scope)
+        if token_match:
+            days = _to_days(token_match.group('value'), token_match.group('unit'))
+            if days is not None:
+                return days
+
+    token_match = _TIME_TOKEN_RE.search(normalized)
+    if token_match:
+        return _to_days(token_match.group('value'), token_match.group('unit'))
     return None
 
 
@@ -247,10 +282,12 @@ def fetch_log_source_groups(qradar_host, username, password):
             for g in resp.json():
                 gid = g.get('id')
                 if gid is not None:
-                    LOG_SOURCE_GROUPS_CACHE[gid] = {
+                    meta = {
                         'name':        g.get('name', '') or '',
                         'description': g.get('description', '') or '',
                     }
+                    LOG_SOURCE_GROUPS_CACHE[gid] = meta
+                    LOG_SOURCE_GROUPS_CACHE[str(gid)] = meta
             print(f"✅ Cached {len(LOG_SOURCE_GROUPS_CACHE)} Log Source Groups.")
         else:
             print(f"⚠️ Failed to fetch Log Source Groups. API returned {resp.status_code}.")
@@ -480,6 +517,8 @@ def get_log_source_details(qradar_host, username, password, identifier,
 
             for gid in group_ids:
                 g_meta = LOG_SOURCE_GROUPS_CACHE.get(gid)
+                if g_meta is None:
+                    g_meta = LOG_SOURCE_GROUPS_CACHE.get(str(gid))
                 if not g_meta:
                     group_parts.append(f"[Group ID {gid} — not in cache]")
                     continue
