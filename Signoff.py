@@ -555,6 +555,7 @@ def _normalize_recipients(values):
     """
     Normalizes recipient inputs into a de-duplicated list while preserving order.
     Accepts a list/tuple/set or a semicolon/comma-separated string.
+    Non-string entries are ignored.
     """
     if values is None:
         return []
@@ -585,13 +586,16 @@ def _get_partial_not_found_recipients():
     """
     Builds To/CC recipient lists for Partial / Not Found outcomes.
     """
-    to_list = _normalize_recipients(PARTIAL_NOT_FOUND_TO_RECIPIENTS)
-    cc_list = _normalize_recipients(PARTIAL_NOT_FOUND_CC_RECIPIENTS)
+    to_candidates = list(PARTIAL_NOT_FOUND_TO_RECIPIENTS or [])
+    cc_candidates = list(PARTIAL_NOT_FOUND_CC_RECIPIENTS or [])
 
     if TRIGGER_DL.strip():
-        to_list = _normalize_recipients(to_list + [TRIGGER_DL.strip()])
+        to_candidates.append(TRIGGER_DL.strip())
     if ONBOARD_REQUEST_CC.strip():
-        cc_list = _normalize_recipients(cc_list + [ONBOARD_REQUEST_CC.strip()])
+        cc_candidates.append(ONBOARD_REQUEST_CC.strip())
+
+    to_list = _normalize_recipients(to_candidates)
+    cc_list = _normalize_recipients(cc_candidates)
 
     return to_list, cc_list
 
@@ -1001,6 +1005,7 @@ def create_draft_reply(mail_item, html_body, hostname, needs_cc=False, outcome_t
 
         if outcome_type == 'partial_or_not_found':
             to_list, cc_list = _get_partial_not_found_recipients()
+            original_cc = reply.CC or ''
 
             if to_list:
                 reply.To = '; '.join(to_list)
@@ -1010,8 +1015,10 @@ def create_draft_reply(mail_item, html_body, hostname, needs_cc=False, outcome_t
 
             if cc_list:
                 reply.CC = '; '.join(cc_list)
-            else:
+            elif to_list:
                 reply.CC = ''
+            else:
+                reply.CC = original_cc
 
             _log(f"      📬 Recipient override applied for Partial/Not Found. "
                  f"To={reply.To} | CC={reply.CC}")
