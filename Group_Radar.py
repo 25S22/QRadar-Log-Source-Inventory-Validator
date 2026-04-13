@@ -124,13 +124,16 @@ _TIME_UNIT_MULTIPLIERS = {
 
 # Search only shortly after SLA hint keywords to capture the intended token
 # (e.g. "Keep Alive 7 days") while avoiding unrelated numbers later in text.
+# Empirically, threshold tokens are usually adjacent to the hint text; 100
+# chars keeps the scan local while tolerating punctuation/extra words.
 _HINT_SEARCH_SCOPE = 100
+_MIN_THRESHOLD_EPSILON = 1e-12
 
 
 def _to_days(value_str, unit_str):
     # Support both decimal separators: "1.5" and "1,5".
     value = float(str(value_str).replace(',', '.'))
-    if value <= 1e-12:
+    if value <= _MIN_THRESHOLD_EPSILON:
         logger.warning("Ignoring non-positive threshold value in group description: %s %s",
                        value_str, unit_str)
         return None
