@@ -179,13 +179,13 @@ def parse_threshold_from_description(description):
 def parse_threshold_from_group_metadata(group_name, group_description):
     """
     Parses threshold from QRadar group metadata with priority:
-      1) group description
-      2) group name
+      1) group name
+      2) group description
     """
-    parsed = parse_threshold_from_description(group_description)
+    parsed = parse_threshold_from_description(group_name)
     if parsed is not None:
         return parsed
-    return parse_threshold_from_description(group_name)
+    return parse_threshold_from_description(group_description)
 
 
 # ─── CHART STATS HELPER ────────────────────────────────────────────────────────
