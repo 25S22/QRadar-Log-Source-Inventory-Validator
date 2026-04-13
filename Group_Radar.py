@@ -95,14 +95,51 @@ def resolve_threshold(group_name=None):
 
 
 # ─── DYNAMIC THRESHOLD PARSER ──────────────────────────────────────────────────
-# Regex patterns ordered from finest to coarsest resolution so the first
-# match wins against the most specific time unit present in the description.
-_TIME_PATTERNS = [
-    (r'(\d+(?:\.\d+)?)\s*hour',  1 / 24),   # hours  → fractional days
-    (r'(\d+(?:\.\d+)?)\s*day',   1.0),       # days   → days
-    (r'(\d+(?:\.\d+)?)\s*week',  7.0),       # weeks  → days
-    (r'(\d+(?:\.\d+)?)\s*month', 30.0),      # months → days (approximate)
-]
+_TIME_TOKEN_RE = re.compile(
+    r'(?P<value>\d+(?:[.,]\d+)?)\s*'
+    r'(?P<unit>'
+    r'hours?|hrs?|hr|h|'
+    r'days?|d|'
+    r'weeks?|wks?|wk|w|'
+    r'months?|mons?|mon|mo'
+    r')\b',
+    flags=re.IGNORECASE
+)
+
+# Prefer parsing values that appear after explicit SLA-style hints in the
+# description (e.g. "Keep Alive 7 days") before scanning generic tokens.
+_THRESHOLD_HINT_RE = re.compile(
+    # 'sla' is intentionally included as a standalone hint because some group
+    # descriptions use compact forms like "SLA: 7 days".
+    r'(keep[\s_-]*alive|inactivity(?:\s*window)?|inactive\s*after|\bsla\b)',
+    flags=re.IGNORECASE
+)
+
+_TIME_UNIT_MULTIPLIERS = {
+    'h': 1 / 24, 'hr': 1 / 24, 'hrs': 1 / 24, 'hour': 1 / 24, 'hours': 1 / 24,
+    'd': 1.0, 'day': 1.0, 'days': 1.0,
+    'w': 7.0, 'wk': 7.0, 'wks': 7.0, 'week': 7.0, 'weeks': 7.0,
+    'mo': 30.0, 'mon': 30.0, 'mons': 30.0, 'month': 30.0, 'months': 30.0,
+}
+
+# Search only shortly after SLA hint keywords to capture the intended token
+# (e.g. "Keep Alive 7 days") while avoiding unrelated numbers later in text.
+# Empirically, threshold tokens are usually adjacent to the hint text; 100
+# chars keeps the scan local while tolerating punctuation/extra words.
+_HINT_SEARCH_SCOPE = 100
+
+
+def _to_days(value_str, unit_str):
+    # Support both decimal separators: "1.5" and "1,5".
+    value = float(str(value_str).replace(',', '.'))
+    if value <= 0:
+        logger.warning("Ignoring non-positive threshold value in group description: %s %s",
+                       value_str, unit_str)
+        return None
+    multiplier = _TIME_UNIT_MULTIPLIERS.get(str(unit_str).strip().lower())
+    if multiplier is None:
+        return None
+    return value * multiplier
 
 
 def parse_threshold_from_description(description):
@@ -120,11 +157,22 @@ def parse_threshold_from_description(description):
     """
     if not description:
         return None
-    text = str(description).lower()
-    for pattern, multiplier in _TIME_PATTERNS:
-        m = re.search(pattern, text)
-        if m:
-            return float(m.group(1)) * multiplier
+    text = str(description)
+    # Some QRadar descriptions contain non-breaking spaces (NBSP) and irregular
+    # spacing copied from UI text; normalize these so regex matching is stable.
+    normalized = " ".join(text.replace('\u00A0', ' ').split())
+
+    for hint_match in _THRESHOLD_HINT_RE.finditer(normalized):
+        scope = normalized[hint_match.end(): hint_match.end() + _HINT_SEARCH_SCOPE]
+        token_match = _TIME_TOKEN_RE.search(scope)
+        if token_match:
+            days = _to_days(token_match.group('value'), token_match.group('unit'))
+            if days is not None:
+                return days
+
+    token_match = _TIME_TOKEN_RE.search(normalized)
+    if token_match:
+        return _to_days(token_match.group('value'), token_match.group('unit'))
     return None
 
 
@@ -479,7 +527,20 @@ def get_log_source_details(qradar_host, username, password, identifier,
             dynamic_threshold = None # float (days) from the first matching group
 
             for gid in group_ids:
-                g_meta = LOG_SOURCE_GROUPS_CACHE.get(gid)
+                gid_keys = [gid]
+                if not isinstance(gid, str):
+                    gid_keys.append(str(gid))
+                else:
+                    try:
+                        gid_keys.append(int(gid))
+                    except (TypeError, ValueError):
+                        pass
+
+                g_meta = None
+                for gid_key in gid_keys:
+                    g_meta = LOG_SOURCE_GROUPS_CACHE.get(gid_key)
+                    if g_meta:
+                        break
                 if not g_meta:
                     group_parts.append(f"[Group ID {gid} — not in cache]")
                     continue
