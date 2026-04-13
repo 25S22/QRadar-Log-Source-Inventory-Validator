@@ -120,6 +120,8 @@ _TIME_UNIT_MULTIPLIERS = {
     'm': 30.0, 'mo': 30.0, 'mon': 30.0, 'mons': 30.0, 'month': 30.0, 'months': 30.0,
 }
 
+_HINT_SEARCH_SCOPE = 100
+
 
 def _to_days(value_str, unit_str):
     value = float(str(value_str).replace(',', '.'))
@@ -150,7 +152,7 @@ def parse_threshold_from_description(description):
     normalized = " ".join(text.replace('\u00A0', ' ').split())
 
     for hint_match in _THRESHOLD_HINT_RE.finditer(normalized):
-        scope = normalized[hint_match.end(): hint_match.end() + 100]
+        scope = normalized[hint_match.end(): hint_match.end() + _HINT_SEARCH_SCOPE]
         token_match = _TIME_TOKEN_RE.search(scope)
         if token_match:
             days = _to_days(token_match.group('value'), token_match.group('unit'))
@@ -282,12 +284,10 @@ def fetch_log_source_groups(qradar_host, username, password):
             for g in resp.json():
                 gid = g.get('id')
                 if gid is not None:
-                    meta = {
+                    LOG_SOURCE_GROUPS_CACHE[gid] = {
                         'name':        g.get('name', '') or '',
                         'description': g.get('description', '') or '',
                     }
-                    LOG_SOURCE_GROUPS_CACHE[gid] = meta
-                    LOG_SOURCE_GROUPS_CACHE[str(gid)] = meta
             print(f"✅ Cached {len(LOG_SOURCE_GROUPS_CACHE)} Log Source Groups.")
         else:
             print(f"⚠️ Failed to fetch Log Source Groups. API returned {resp.status_code}.")
@@ -519,6 +519,11 @@ def get_log_source_details(qradar_host, username, password, identifier,
                 g_meta = LOG_SOURCE_GROUPS_CACHE.get(gid)
                 if g_meta is None:
                     g_meta = LOG_SOURCE_GROUPS_CACHE.get(str(gid))
+                if g_meta is None:
+                    try:
+                        g_meta = LOG_SOURCE_GROUPS_CACHE.get(int(gid))
+                    except (TypeError, ValueError):
+                        pass
                 if not g_meta:
                     group_parts.append(f"[Group ID {gid} — not in cache]")
                     continue
