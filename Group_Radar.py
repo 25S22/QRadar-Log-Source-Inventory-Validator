@@ -176,6 +176,18 @@ def parse_threshold_from_description(description):
     return None
 
 
+def parse_threshold_from_group_metadata(group_name, group_description):
+    """
+    Parses threshold from QRadar group metadata with priority:
+      1) group description
+      2) group name
+    """
+    parsed = parse_threshold_from_description(group_description)
+    if parsed is not None:
+        return parsed
+    return parse_threshold_from_description(group_name)
+
+
 # ─── CHART STATS HELPER ────────────────────────────────────────────────────────
 def _chart_stats(stats_dict):
     """
@@ -520,8 +532,8 @@ def get_log_source_details(qradar_host, username, password, identifier,
             # ── NEW: Resolve group description & dynamic threshold ─────────────
             # Each log source carries a list of group_ids.  We look every one up
             # in LOG_SOURCE_GROUPS_CACHE, build a human-readable summary string,
-            # and attempt to parse a time-based threshold from the description.
-            # The FIRST group whose description yields a numeric time value wins.
+            # and attempt to parse a time-based threshold from description/name.
+            # The FIRST group whose metadata yields a numeric time value wins.
             group_ids         = found_source.get('group_ids') or []
             group_parts       = []   # display labels, one per group
             dynamic_threshold = None # float (days) from the first matching group
@@ -551,7 +563,7 @@ def get_log_source_details(qradar_host, username, password, identifier,
                 # Try to parse a time value only until we've found one
                 parsed = None
                 if dynamic_threshold is None:
-                    parsed = parse_threshold_from_description(g_desc)
+                    parsed = parse_threshold_from_group_metadata(g_name, g_desc)
                     if parsed is not None:
                         dynamic_threshold = parsed
 
