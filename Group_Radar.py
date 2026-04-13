@@ -109,6 +109,8 @@ _TIME_TOKEN_RE = re.compile(
 # Prefer parsing values that appear after explicit SLA-style hints in the
 # description (e.g. "Keep Alive 7 days") before scanning generic tokens.
 _THRESHOLD_HINT_RE = re.compile(
+    # 'sla' is intentionally included as a standalone hint because some group
+    # descriptions use compact forms like "SLA: 7 days".
     r'(keep[\s_-]*alive|inactivity(?:\s*window)?|inactive\s*after|sla)',
     flags=re.IGNORECASE
 )
@@ -126,6 +128,7 @@ _HINT_SEARCH_SCOPE = 100
 
 
 def _to_days(value_str, unit_str):
+    # Support both decimal separators: "1.5" and "1,5".
     value = float(str(value_str).replace(',', '.'))
     if value <= 0:
         logger.warning("Ignoring non-positive threshold value in group description: %s %s",
@@ -153,6 +156,7 @@ def parse_threshold_from_description(description):
     if not description:
         return None
     text = str(description)
+    # Normalize NBSP + whitespace variants so regex parsing is consistent.
     normalized = " ".join(text.replace('\u00A0', ' ').split())
 
     for hint_match in _THRESHOLD_HINT_RE.finditer(normalized):
