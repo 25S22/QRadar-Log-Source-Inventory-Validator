@@ -11,9 +11,13 @@ Routing:
   Any Partial/NotFound → Escalation list only (ESCALATION_TO / ESCALATION_CC)
 
 Revalidation:
-  Partial and Not Found threads are automatically re-checked after
-  REVALIDATION_COOLDOWN_DAYS — no manual intervention needed.
+  Partial and Not Found threads are re-checked on every run — no cooldown.
+  (Set REVALIDATION_COOLDOWN_DAYS > 0 once the flow is confirmed working.)
   Confirmed Active threads are permanently skipped.
+
+Subject tags are the ONLY state store — no external file, no database.
+RE/FW/FWD prefixes are intentionally NOT filtered: the [processed tag guard
+and conversation-level deduplication handle all repeat suppression safely.
 
 THIS SCRIPT IS DRAFT-ONLY. reply.Save() is called, NEVER reply.Send().
 """
@@ -40,8 +44,19 @@ VERIFY_SSL      = False
 SUBJECT_KEYWORD   = 'Security Signoff'
 SUBJECT_SEPARATOR = '|'
 
-# Normal signoff scan window — how far back to look for NEW (unprocessed) emails.
-LOOKBACK_HOURS = 24
+# How far back to scan the inbox for signoff emails (covers both fresh and
+# previously-partial emails that need revalidation).
+LOOKBACK_DAYS = 30
+
+# How far back to scan Sent Items when checking conversation state.
+# Must be >= LOOKBACK_DAYS so Active tags are never missed.
+# FIX: previously this was tied to REVALIDATION_WINDOW_DAYS (14d), which meant
+# emails confirmed Active more than 14 days ago would be re-drafted as new.
+SENT_SCAN_DAYS = 90
+
+# Revalidation cooldown — set to 0 to re-check on every run (current mode).
+# Raise to 1 or 2 once the end-to-end flow is confirmed working.
+REVALIDATION_COOLDOWN_DAYS = 0
 
 # Sender allowlist — exact addresses or @domain wildcards. Empty list = allow all.
 ALLOWED_SENDERS = []
@@ -55,26 +70,14 @@ TRIGGER_DL = '@SOC-DL@yourorg.com'
 # ─── ESCALATION RECIPIENTS ─────────────────────────────────────────────────────
 # Partial / Not Found → ONLY these addresses. The original requestor is excluded.
 # Active (all hosts confirmed) → standard ReplyAll, no override.
-#
-# Supports exact addresses. Add as many as needed.
 ESCALATION_TO = [
     'onboarding-owner@yourorg.com',
 ]
 ESCALATION_CC = [
     '@SOC-DL@yourorg.com',
-    # 'siem-lead@yourorg.com',
-    # 'extra-analyst@yourorg.com',
 ]
 
-# ─── REVALIDATION ──────────────────────────────────────────────────────────────
-# REVALIDATION_WINDOW_DAYS  : How far back to scan for previously-flagged threads.
-# REVALIDATION_COOLDOWN_DAYS: Min gap between re-checks of the same thread.
-REVALIDATION_WINDOW_DAYS   = 14
-REVALIDATION_COOLDOWN_DAYS = 3
-
 # ─── OUTLOOK FOLDERS ───────────────────────────────────────────────────────────
-# Set SIGNOFF_FOLDER_NAME to the Outlook rule subfolder under Inbox.
-# Set to None to scan the full Inbox (not recommended for production).
 SIGNOFF_FOLDER_NAME = 'SIEM Signoffs'
 DRAFTS_FOLDER_NAME  = 'Drafts'
 SENT_FOLDER_NAME    = 'Sent Items'
@@ -82,16 +85,11 @@ SENT_FOLDER_NAME    = 'Sent Items'
 # ─── FILE PATHS ────────────────────────────────────────────────────────────────
 RUN_LOG_PATH      = r'C:\path\to\signoff_runner.log'
 LOCKFILE_PATH     = r'C:\path\to\signoff.lock'
-# Dashboard data — one JSON file, appended on every run. Point the dashboard
-# HTML to this same file using the file-picker on first load.
 SIGNOFF_DATA_PATH = r'C:\path\to\signoff_data.json'
 
 REQUEST_TIMEOUT = 30
 
 # ─── OS TYPE VALIDATION ────────────────────────────────────────────────────────
-# First entry in each 'required' list is the OS signature (used for detection).
-# All entries in 'required' are validated and shown as individual table rows.
-# Set to {} to disable type validation (simple found/not-found reply).
 OS_TYPE_GROUPS = {
     'Windows': {
         'required': ['Microsoft Security', 'WinCollect'],
@@ -103,18 +101,18 @@ OS_TYPE_GROUPS = {
 
 # ─── SUBJECT OUTCOME TAGS ──────────────────────────────────────────────────────
 # Written into draft subject lines to record outcome without external storage.
-# The subject guard checks '[processed' (no closing bracket) to catch all variants.
-TAG_ACTIVE     = '[Processed-Active]'
-TAG_PARTIAL    = '[Processed-Partial]'
-TAG_NOT_FOUND  = '[Processed-NotFound]'
+# Guard checks '[processed' (no closing bracket) to catch ALL variants.
+TAG_ACTIVE    = '[Processed-Active]'
+TAG_PARTIAL   = '[Processed-Partial]'
+TAG_NOT_FOUND = '[Processed-NotFound]'
 REVALIDATABLE_TAGS = {TAG_PARTIAL, TAG_NOT_FOUND}
 
 # ─── CONSTANTS ─────────────────────────────────────────────────────────────────
-ACTIVITY_THRESHOLD_DAYS  = 7
-_MIN_TS                  = 0
-_MAX_TS                  = 2147483647
-LOG_SOURCE_TYPES_CACHE   = {}
-STATUS_PRIORITY          = {'not_found': 2, 'partial': 1, 'active': 0}
+ACTIVITY_THRESHOLD_DAYS = 7
+_MIN_TS                 = 0
+_MAX_TS                 = 2147483647
+LOG_SOURCE_TYPES_CACHE  = {}
+STATUS_PRIORITY         = {'not_found': 2, 'partial': 1, 'active': 0}
 
 # ─── END CONFIGURATION ─────────────────────────────────────────────────────────
 
@@ -160,7 +158,7 @@ def release_lock():
 def _com_dt_to_py(com_dt):
     """
     Converts a pywintypes COM datetime to a naive Python datetime (local time).
-    Returns None on failure. Used for all win32com date comparisons.
+    Returns None on failure.
     """
     if com_dt is None:
         return None
@@ -239,14 +237,13 @@ def fetch_log_source_types():
 def _safe_timestamp(timestamp_ms):
     """
     Converts a QRadar epoch-ms (or epoch-s) timestamp to readable string,
-    activity status, and days-since value. Read-only, no side effects.
+    activity status, and days-since value.
     """
     if not timestamp_ms:
         return 'No events recorded', 'No Activity', None
     try:
         if isinstance(timestamp_ms, float):
             timestamp_ms = int(timestamp_ms)
-        # QRadar sometimes returns seconds, sometimes milliseconds
         epoch_s = timestamp_ms / 1000.0 if timestamp_ms > 4102444800 else timestamp_ms
         if epoch_s <= _MIN_TS or epoch_s > _MAX_TS:
             return f'Invalid timestamp: {timestamp_ms}', 'Unknown', None
@@ -263,14 +260,8 @@ def query_all_log_sources_readonly(hostname):
     """
     STRICTLY READ-ONLY — fetches ALL log sources matching hostname.
     Only HTTP GET. Nothing in QRadar is created, modified, or deleted.
-
-    Returns:
-        {
-            'status':  'Found' | 'Not Found' | 'API Error ...',
-            'sources': [ {name, ls_type, enabled, last_seen, activity, days_ago}, ... ]
-        }
     """
-    clean = str(hostname).replace('"', '').replace("'", "").strip()
+    clean    = str(hostname).replace('"', '').replace("'", "").strip()
     endpoint = (
         f"{QRADAR_HOST.rstrip('/')}/api/config/event_sources"
         f"/log_source_management/log_sources"
@@ -311,10 +302,9 @@ def validate_expected_types(all_sources_result, required_types):
     """
     Checks each required type keyword against returned QRadar sources.
     Fuzzy keyword matching — every word in the keyword must appear in the type name.
-    Returns one result dict per required type (shown as one table row each).
     """
-    results  = []
-    sources  = all_sources_result.get('sources', [])
+    results = []
+    sources = all_sources_result.get('sources', [])
     for expected_kw in required_types:
         exp_words = str(expected_kw).lower().split()
         matched   = [
@@ -326,7 +316,6 @@ def validate_expected_types(all_sources_result, required_types):
                             'ls_type': None, 'ls_name': None,
                             'last_seen': None, 'days_ago': None})
             continue
-        # Prefer enabled sources; sort by recency within each group
         enabled  = sorted([s for s in matched if s.get('enabled')],
                           key=lambda x: x.get('days_ago') or 99999)
         disabled = sorted([s for s in matched if not s.get('enabled')],
@@ -343,13 +332,12 @@ def validate_expected_types(all_sources_result, required_types):
 def detect_os_group(sources):
     """
     Detects OS group by fuzzy-matching the first 'required' entry (the OS
-    signature) against all returned source types. First match in dict order wins.
-    Returns (group_name, group_rules) or (None, None).
+    signature) against all returned source types. First match wins.
     """
     if not OS_TYPE_GROUPS:
         return None, None
     for group_name, rules in OS_TYPE_GROUPS.items():
-        required = rules.get('required', [])
+        required  = rules.get('required', [])
         if not required:
             continue
         sig_words = str(required[0]).lower().split()
@@ -386,25 +374,44 @@ def is_sender_allowed(sender_address):
 
 def passes_subject_guards(subject):
     """
-    All guards must pass before an email is processed.
+    Gates that must pass before an email is processed.
 
-    Note: '[processed' (no closing bracket) catches ALL outcome tag variants:
-    [Processed-Active], [Processed-Partial], [Processed-NotFound], [Processed].
-    Using '[processed]' (with bracket) would silently miss the new variants.
+    NOTE — RE/FW/FWD prefix check is intentionally absent.
+    ───────────────────────────────────────────────────────
+    RE:/FW: emails are safe to consider because:
+      1. The '[processed' tag guard below catches any reply to a previously
+         drafted conversation (our drafts carry the tag in their subject).
+      2. check_conversation_status() catches threads we've already handled
+         via Sent Items / Drafts scan — BEFORE QRadar is ever queried.
+    Filtering RE/FW here was creating gaps when, e.g., a requestor replied
+    to their own signoff request before we processed it, or when Outlook
+    thread-folding surfaced the reply rather than the original.
+
+    '[processed' (no closing bracket) catches ALL outcome tag variants:
+      [Processed-Active], [Processed-Partial], [Processed-NotFound]
+    Using '[processed]' would silently miss all three.
     """
     if not subject:
         return False, "empty subject"
-    s   = subject.strip()
-    sl  = s.lower()
-    if any(sl.startswith(p) for p in ('re:', 'fw:', 'fwd:')):
-        return False, f"reply/forward prefix in: '{s[:30]}'"
+    s  = subject.strip()
+    sl = s.lower()
+
     if '[processed' in sl:
         return False, "subject already carries an outcome tag"
     if SUBJECT_SEPARATOR not in s:
         return False, f"separator '{SUBJECT_SEPARATOR}' not found"
-    left = s.split(SUBJECT_SEPARATOR)[0].strip().lower()
-    if SUBJECT_KEYWORD.lower() not in left:
+
+    # Strip any RE:/FW:/FWD: prefixes before checking for the keyword
+    # so "RE: Security Signoff | HOST" still matches correctly.
+    left_raw = s.split(SUBJECT_SEPARATOR)[0].strip()
+    # Remove common reply/forward prefixes for keyword matching only
+    for pfx in ('re:', 'fw:', 'fwd:'):
+        if left_raw.lower().startswith(pfx):
+            left_raw = left_raw[len(pfx):].strip()
+
+    if SUBJECT_KEYWORD.lower() not in left_raw.lower():
         return False, f"keyword '{SUBJECT_KEYWORD}' not found left of separator"
+
     return True, "ok"
 
 
@@ -414,21 +421,20 @@ def extract_hostnames(subject):
 
     Format: "Security Signoff | HOST1 | HOST2 | HOST3"
              ──────────────── ^ first sep  ^ subsequent seps
-    Returns a list of stripped, non-empty hostname strings.
-    Empty list if nothing is found right of the first separator.
+    Works correctly even with RE:/FW: prefixes because we split on the
+    first separator and take everything to the right.
     """
     parts = subject.split(SUBJECT_SEPARATOR, 1)
     if len(parts) < 2:
         return []
     remainder = parts[1]
-    # Everything right of the first separator is a pipe-delimited hostname list
     return [h.strip() for h in remainder.split(SUBJECT_SEPARATOR) if h.strip()]
 
 
 def body_contains_dl(mail_item):
     """
     Returns True if TRIGGER_DL appears in the plain-text or HTML body.
-    Falls back to HTML body if plain text is empty. '' = disabled.
+    '' = disabled (always returns True).
     """
     if not TRIGGER_DL.strip():
         return True
@@ -445,22 +451,24 @@ def body_contains_dl(mail_item):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONVERSATION STATUS (State Machine via Subject Tags)
+# CONVERSATION STATUS  (State Machine via Subject Tags)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_conversation_status(mail_item, sent_folder, drafts_folder):
     """
     Scans Sent Items and Drafts for any prior reply in this conversation thread
-    bearing a recognised outcome tag, without any external state file.
+    bearing a recognised outcome tag — no external state file needed.
+
+    Sent Items are scanned back SENT_SCAN_DAYS (default 90).
+    FIX: previously this was limited to REVALIDATION_WINDOW_DAYS (14d), which
+    caused Active threads older than 14 days to be re-drafted as brand-new.
 
     Returns:
-        (TAG_ACTIVE,    dt) → confirmed active — permanent skip
-        (TAG_PARTIAL,   dt) → partial — revalidate after cooldown
-        (TAG_NOT_FOUND, dt) → not found — revalidate after cooldown
-        ('legacy',      dt) → old [Processed] without suffix — treat as Active
-        (None,         None)→ no prior reply — treat as brand-new signoff
-
-    Sent Items scan is restricted to REVALIDATION_WINDOW_DAYS for performance.
+        (TAG_ACTIVE,    dt) → confirmed active  — permanent skip
+        (TAG_PARTIAL,   dt) → partial           — revalidate
+        (TAG_NOT_FOUND, dt) → not found         — revalidate
+        ('legacy',      dt) → old [Processed]   — treat as Active
+        (None,         None)→ no prior reply    — new signoff
     """
     conv_id  = mail_item.ConversationID
     last_tag = None
@@ -479,11 +487,12 @@ def check_conversation_status(mail_item, sent_folder, drafts_folder):
         if tag and (last_dt is None or (item_dt and item_dt > last_dt)):
             last_tag, last_dt = tag, item_dt
 
-    # Restrict Sent Items scan to the revalidation window for speed
-    reval_cutoff = (datetime.now() - timedelta(days=REVALIDATION_WINDOW_DAYS)
-                    ).strftime('%m/%d/%Y %I:%M %p')
+    sent_cutoff = (
+        datetime.now() - timedelta(days=SENT_SCAN_DAYS)
+    ).strftime('%m/%d/%Y %I:%M %p')
+
     try:
-        for item in sent_folder.Items.Restrict(f"[SentOn] >= '{reval_cutoff}'"):
+        for item in sent_folder.Items.Restrict(f"[SentOn] >= '{sent_cutoff}'"):
             try:
                 if item.ConversationID == conv_id:
                     _update(_tag(item.Subject), _com_dt_to_py(item.SentOn))
@@ -515,9 +524,9 @@ def _build_host_html_section(hostname, qradar_result):
     Builds the HTML block for a single hostname result.
 
     Returns:
-        html_section : str   — <div> block for this host
-        host_status  : str   — 'active' | 'partial' | 'not_found'
-        type_records : list  — serialisable list for JSON dashboard data
+        html_section : str       — <div> block for this host
+        host_status  : str       — 'active' | 'partial' | 'not_found'
+        type_records : list      — serialisable list for JSON dashboard
         os_group     : str|None
     """
     status  = qradar_result.get('status')
@@ -539,19 +548,18 @@ def _build_host_html_section(hostname, qradar_result):
         </div>"""
         return section, 'not_found', [], None
 
-    # ── OS detection for type validation ──────────────────────────────────────
+    # ── OS detection ──────────────────────────────────────────────────────────
     group_name, group_rules = detect_os_group(sources)
     type_records = []
 
     if OS_TYPE_GROUPS and group_name:
-        validation   = validate_expected_types(qradar_result,
-                                               group_rules.get('required', []))
-        any_missing  = any(not r['found'] for r in validation)
-        any_silent   = any(r['found'] and r['days_ago'] is None for r in validation)
-        any_problem  = any_missing or any_silent
-        host_status  = 'partial' if any_problem else 'active'
+        validation  = validate_expected_types(qradar_result,
+                                              group_rules.get('required', []))
+        any_missing = any(not r['found'] for r in validation)
+        any_silent  = any(r['found'] and r['days_ago'] is None for r in validation)
+        any_problem = any_missing or any_silent
+        host_status = 'partial' if any_problem else 'active'
 
-        # Banner
         os_label = f' ({group_name})'
         if not any_problem:
             banner_bg  = '#1a7a4a'
@@ -566,7 +574,6 @@ def _build_host_html_section(hostname, qradar_result):
             banner_txt = (f'⚠&nbsp; {hostname}{os_label} — '
                           f'Log sources present but not yet reporting')
 
-        # Rows
         rows = ''
         for r in validation:
             if not r['found']:
@@ -590,16 +597,12 @@ def _build_host_html_section(hostname, qradar_result):
             <tr style="background:{row_bg};">
               <td style="padding:7px 10px;font-size:12px;color:{'#c0392b' if not r['found'] else '#c87800' if r['days_ago'] is None else '#1a7a4a'};
                          font-weight:700;text-align:center;width:22px;">{icon}</td>
-              <td style="padding:7px 10px;font-size:12px;font-weight:600;color:#333;">
-                {r['expected']}</td>
-              <td style="padding:7px 10px;font-size:12px;color:#555;">
-                {r.get('ls_name') or '—'}</td>
-              <td style="padding:7px 10px;font-size:12px;color:#555;">
-                {r.get('last_seen') or '—'}</td>
+              <td style="padding:7px 10px;font-size:12px;font-weight:600;color:#333;">{r['expected']}</td>
+              <td style="padding:7px 10px;font-size:12px;color:#555;">{r.get('ls_name') or '—'}</td>
+              <td style="padding:7px 10px;font-size:12px;color:#555;">{r.get('last_seen') or '—'}</td>
               <td style="padding:7px 10px;font-size:12px;">{status_cell}</td>
             </tr>"""
 
-            # Record for JSON
             type_records.append({
                 'expected': r['expected'],
                 'found':    r['found'],
@@ -624,7 +627,6 @@ def _build_host_html_section(hostname, qradar_result):
         </table>"""
 
     else:
-        # ── Simple mode: OS_TYPE_GROUPS empty or OS undetected ────────────────
         if OS_TYPE_GROUPS and not group_name:
             _log(f"      ⚠️  OS undetected for {hostname} — showing best source, "
                  f"no type validation.")
@@ -635,10 +637,10 @@ def _build_host_html_section(hostname, qradar_result):
                           key=lambda x: x.get('days_ago') or 99999)
         best = enabled[0] if enabled else (disabled[0] if disabled else None)
 
-        host_status  = 'active'
-        banner_bg    = '#1a7a4a'
-        banner_txt   = f'✔&nbsp; {hostname} — Confirmed Reporting on SIEM'
-        group_name   = None
+        host_status = 'active'
+        banner_bg   = '#1a7a4a'
+        banner_txt  = f'✔&nbsp; {hostname} — Confirmed Reporting on SIEM'
+        group_name  = None
 
         if best:
             days_val = best.get('days_ago')
@@ -683,8 +685,8 @@ def _build_host_html_section(hostname, qradar_result):
 
 def _build_full_reply_html(hostname_list, host_sections, host_statuses, run_time):
     """
-    Wraps all per-host sections into a complete HTML email body.
-    Includes a summary badge bar at the top for quick multi-host overview.
+    Wraps all per-host sections into a complete HTML email body with a
+    summary badge bar at the top.
     """
     badge_cfg = {
         'active':    ('#1a7a4a', '✔'),
@@ -700,7 +702,7 @@ def _build_full_reply_html(hostname_list, host_sections, host_statuses, run_time
             f'margin:0 4px 6px 0;">{icon}&nbsp;{hn}</span>'
         )
 
-    count_label = f"{len(hostname_list)} host{'s' if len(hostname_list) != 1 else ''} checked"
+    count_label   = f"{len(hostname_list)} host{'s' if len(hostname_list) != 1 else ''} checked"
     sections_html = '\n'.join(host_sections)
 
     return f"""
@@ -727,20 +729,13 @@ def _build_full_reply_html(hostname_list, host_sections, host_statuses, run_time
 
 def build_all_hosts_reply(hostname_list):
     """
-    Main reply orchestrator — queries QRadar for every hostname in the list,
-    builds a combined HTML body, and determines the overall signoff outcome.
-
-    Overall status follows worst-case priority: not_found > partial > active.
-
-    Returns:
-        html_body     : str  — complete HTML email
-        overall_status: str  — 'active' | 'partial' | 'not_found'
-        host_records  : list — serialisable per-host data for JSON dashboard
+    Queries QRadar for every hostname, builds the combined HTML body, and
+    determines the overall outcome (worst-case: not_found > partial > active).
     """
-    run_time     = datetime.now().strftime('%d %B %Y, %H:%M')
-    host_sections = []
-    host_statuses = []
-    host_records  = []
+    run_time       = datetime.now().strftime('%d %B %Y, %H:%M')
+    host_sections  = []
+    host_statuses  = []
+    host_records   = []
     overall_status = 'active'
 
     for hostname in hostname_list:
@@ -755,7 +750,6 @@ def build_all_hosts_reply(hostname_list):
         host_sections.append(section)
         host_statuses.append(host_status)
 
-        # Escalate overall status to worst-case
         if STATUS_PRIORITY.get(host_status, 0) > STATUS_PRIORITY.get(overall_status, 0):
             overall_status = host_status
 
@@ -781,8 +775,7 @@ def write_signoff_record(email_subject, sender, host_records,
                          overall_status, is_revalidation, prior_status):
     """
     Appends one signoff run record to SIGNOFF_DATA_PATH for the dashboard.
-    Reads existing data, appends, and writes back atomically.
-    Silently logs failures — data write errors never abort the draft creation.
+    Non-critical — write failures are logged and never abort draft creation.
     """
     record = {
         'run_id':          f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
@@ -823,13 +816,13 @@ def create_draft_reply(mail_item, html_body, hostname_list,
     Saves a reply draft to Outlook Drafts. NEVER calls reply.Send().
 
     Routing:
-      overall_status == 'active'               → ReplyAll (original recipients kept)
-      overall_status in ('partial','not_found') → ESCALATION_TO / ESCALATION_CC only
+      overall_status == 'active'                → ReplyAll
+      overall_status in ('partial','not_found') → ESCALATION_TO / CC only
 
     Subject tagging:
       TAG_ACTIVE / TAG_PARTIAL / TAG_NOT_FOUND written into subject so future
-      runs can read prior outcome from Sent Items without any external state.
-      Revalidation runs additionally prepend '[Revalidated] ' for reviewer clarity.
+      runs detect prior outcome from Sent Items without any external state.
+      Revalidation runs additionally prepend '[Revalidated] ' for clarity.
     """
     tag_map = {'active': TAG_ACTIVE, 'partial': TAG_PARTIAL, 'not_found': TAG_NOT_FOUND}
     tag     = tag_map.get(overall_status, TAG_ACTIVE)
@@ -841,8 +834,6 @@ def create_draft_reply(mail_item, html_body, hostname_list,
         reply.Subject  = f"{prefix}{tag} {mail_item.Subject}"
 
         if overall_status in ('partial', 'not_found'):
-            # Override recipients — escalation list only.
-            # The original requestor's thread receives NO reply for problem cases.
             if ESCALATION_TO:
                 reply.To = '; '.join(ESCALATION_TO)
             if ESCALATION_CC:
@@ -853,8 +844,7 @@ def create_draft_reply(mail_item, html_body, hostname_list,
             _log(f"      📧 ReplyAll (Active result)")
 
         reply.Save()
-        hosts_label = ', '.join(hostname_list)
-        _log(f"      ✅ Draft saved [{tag}] for: {hosts_label}"
+        _log(f"      ✅ Draft saved [{tag}] for: {', '.join(hostname_list)}"
              f"{' — REVALIDATION' if is_revalidation else ''}")
         return True
 
@@ -906,9 +896,10 @@ def main():
 
     _log("=" * 65)
     _log("🚀 QRadar Signoff Auto-Draft starting...")
-    _log(f"   Normal window  : {LOOKBACK_HOURS}h")
-    _log(f"   Reval window   : {REVALIDATION_WINDOW_DAYS}d | "
-         f"Cooldown: {REVALIDATION_COOLDOWN_DAYS}d")
+    _log(f"   Inbox scan     : {LOOKBACK_DAYS}d back")
+    _log(f"   Sent scan      : {SENT_SCAN_DAYS}d back (Active tag detection)")
+    _log(f"   Reval cooldown : {'disabled — re-check every run' if REVALIDATION_COOLDOWN_DAYS == 0 else f'{REVALIDATION_COOLDOWN_DAYS}d'}")
+    _log(f"   RE/FW filter   : disabled (conversation state handles dedup)")
     _log(f"   Folder         : {SIGNOFF_FOLDER_NAME or 'Full Inbox'}")
     _log(f"   Escalation To  : {ESCALATION_TO or 'ReplyAll fallback'}")
     _log(f"   Escalation CC  : {ESCALATION_CC or '(none)'}")
@@ -929,16 +920,19 @@ def main():
 
         fetch_log_source_types()
 
-        # Scan window = broader of normal window vs revalidation window so a
-        # single inbox pass covers both fresh signoffs and aged problem cases.
-        scan_hours      = max(LOOKBACK_HOURS, REVALIDATION_WINDOW_DAYS * 24)
-        normal_cutoff   = datetime.now() - timedelta(hours=LOOKBACK_HOURS)
-        cooldown_cutoff = datetime.now() - timedelta(days=REVALIDATION_COOLDOWN_DAYS)
-        cutoff_str      = (datetime.now() - timedelta(hours=scan_hours)
-                           ).strftime('%m/%d/%Y %I:%M %p')
+        cutoff_str  = (
+            datetime.now() - timedelta(days=LOOKBACK_DAYS)
+        ).strftime('%m/%d/%Y %I:%M %p')
+
+        # Optional cooldown: skip if last check was within cooldown window.
+        # Set REVALIDATION_COOLDOWN_DAYS = 0 to disable (re-check every run).
+        cooldown_cutoff = (
+            datetime.now() - timedelta(days=REVALIDATION_COOLDOWN_DAYS)
+            if REVALIDATION_COOLDOWN_DAYS > 0 else None
+        )
 
         inbox_items = list(inbox.Items.Restrict(f"[ReceivedTime] >= '{cutoff_str}'"))
-        _log(f"\n📬 Scan: {len(inbox_items)} email(s) in last {scan_hours // 24}d")
+        _log(f"\n📬 Scan: {len(inbox_items)} email(s) in last {LOOKBACK_DAYS}d")
 
         processed = skipped = drafted = revalidated = 0
 
@@ -990,34 +984,23 @@ def main():
                 _log(f"   ⏭️  SKIP (no hostnames found after separator): '{subject[:60]}'")
                 continue
 
-            received_dt       = _com_dt_to_py(mail_item.ReceivedTime)
-            in_normal_window  = received_dt is not None and received_dt >= normal_cutoff
-
             _log(f"\n🔹 Candidate: '{subject[:70]}'")
-            _log(f"      Sender   : {sender}")
-            _log(f"      Hosts    : {hostname_list} ({len(hostname_list)} host(s))")
-            _log(f"      Received : {received_dt} "
-                 f"({'normal' if in_normal_window else 'reval'} window)")
+            _log(f"      Sender : {sender}")
+            _log(f"      Hosts  : {hostname_list} ({len(hostname_list)} host(s))")
 
-            # ── Conversation state ───────────────────────────────────────────
+            # ── Conversation state check (BEFORE any QRadar query) ───────────
             last_tag, last_dt = check_conversation_status(mail_item, sent, drafts)
 
-            if last_tag is None:
-                if not in_normal_window:
-                    skipped += 1
-                    _log(f"      ⏭️  SKIP (old email, no prior tag — out of scope)")
-                    continue
-                is_revalidation = False
-                _log(f"      🆕 New signoff")
-
-            elif last_tag in (TAG_ACTIVE, 'legacy'):
+            if last_tag in (TAG_ACTIVE, 'legacy'):
+                # Permanently resolved — never re-draft.
                 skipped += 1
                 last_str = last_dt.strftime('%Y-%m-%d') if last_dt else 'unknown'
-                _log(f"      ⏭️  SKIP (Active confirmed on {last_str} — permanent)")
+                _log(f"      ⏭️  SKIP (Active confirmed {last_str} — permanent)")
                 continue
 
             elif last_tag in REVALIDATABLE_TAGS:
-                if last_dt and last_dt >= cooldown_cutoff:
+                # Cooldown gate — only active when REVALIDATION_COOLDOWN_DAYS > 0.
+                if cooldown_cutoff and last_dt and last_dt >= cooldown_cutoff:
                     skipped += 1
                     days_ago = (datetime.now() - last_dt).days
                     _log(f"      ⏭️  SKIP (cooldown — last checked {days_ago}d ago, "
@@ -1026,6 +1009,11 @@ def main():
                 last_str = last_dt.strftime('%Y-%m-%d') if last_dt else 'unknown'
                 _log(f"      🔄 Revalidating {last_tag} from {last_str}")
                 is_revalidation = True
+
+            elif last_tag is None:
+                # No prior outcome tag anywhere in the conversation — treat as new.
+                _log(f"      🆕 New signoff (no prior tag found)")
+                is_revalidation = False
 
             else:
                 skipped += 1
@@ -1047,14 +1035,13 @@ def main():
                 drafted += 1
                 if is_revalidation:
                     revalidated += 1
-                # Write dashboard data — non-critical, never aborts on failure
                 write_signoff_record(
-                    email_subject  = subject,
-                    sender         = sender,
-                    host_records   = host_records,
-                    overall_status = overall_status,
-                    is_revalidation= is_revalidation,
-                    prior_status   = last_tag,
+                    email_subject   = subject,
+                    sender          = sender,
+                    host_records    = host_records,
+                    overall_status  = overall_status,
+                    is_revalidation = is_revalidation,
+                    prior_status    = last_tag,
                 )
             processed += 1
 
