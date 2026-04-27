@@ -538,142 +538,207 @@ def check_conversation_status(mail_item, sent_folder, drafts_folder) -> tuple:
 #  HTML REPLY BUILDER — EMAIL  (v3.1: transparent background, Outlook dark-mode native)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HTML REPLY BUILDER — EMAIL  (v3.2)
+#
+#  Design principles:
+#   • NO background on <body> or outer container — transparent so the email
+#     sits flush on Outlook's dark-mode canvas (no floating card artefact)
+#   • All text is solid and vivid — no muted rgba washes
+#   • Status banners use deep solid fills (readable on ANY background)
+#   • Host headers have a prominent 4px coloured left-border + solid colour tag
+#   • Table rows: high-contrast coloured icons + text, visible dividers
+#   • Footer text is intentionally softer (purposeful hierarchy, not accidental haze)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _host_section_html(hostname: str, host_status: str,
                         type_validation, os_group, sources: list) -> str:
-    """
-    v3.1: All explicit dark-background colours removed from the email HTML.
-    The body is transparent — Outlook renders it with its own dark-mode
-    background, so the email looks native rather than a floating dark card.
-    Status accents (left-border + coloured badges) remain.
-    """
-    COLORS = {'active': '#22c55e', 'partial': '#f59e0b', 'not_found': '#ef4444'}
-    col    = COLORS.get(host_status, '#888888')
-    osl    = (f'<span style="color:#94a3b8;font-size:10px;margin-left:10px">'
-              f'{os_group}</span>') if os_group else ''
 
-    hdr = (
-        f'<div style="margin:18px 0 6px 0;padding:7px 14px;'
-        f'border-left:3px solid {col};border-radius:0 4px 4px 0;">'
-        f'<span style="font-family:Consolas,\'Courier New\',monospace;'
-        f'font-weight:700;color:{col};font-size:12px">{hostname}</span>'
-        f'{osl}</div>'
+    # ── Palette ────────────────────────────────────────────────────────────────
+    SOLID  = {'active': '#22c55e', 'partial': '#f59e0b', 'not_found': '#ef4444'}
+    DEEP   = {'active': '#14532d', 'partial': '#78350f', 'not_found': '#7f1d1d'}
+    LABEL  = {'active': 'Active',  'partial': 'Partial', 'not_found': 'Not Found'}
+
+    col   = SOLID.get(host_status, '#888888')
+    deep  = DEEP.get(host_status,  '#1a1a1a')
+    lbl   = LABEL.get(host_status, host_status)
+
+    # ── Host header bar ────────────────────────────────────────────────────────
+    os_badge = (
+        f'<span style="font-family:Arial,sans-serif;font-size:10px;color:#94a3b8;'
+        f'margin-left:10px;font-weight:400">{os_group}</span>'
+    ) if os_group else ''
+
+    status_pill = (
+        f'<span style="background:{deep};color:{col};font-size:10px;font-weight:700;'
+        f'letter-spacing:.4px;padding:2px 9px;border-radius:3px;'
+        f'margin-left:10px;text-transform:uppercase;'
+        f'border:1px solid {col}">{lbl}</span>'
     )
 
+    hdr = (
+        f'<div style="margin:22px 0 0;padding:10px 16px;'
+        f'border-left:4px solid {col};">'
+        f'<span style="font-family:Consolas,\'Courier New\',monospace;'
+        f'font-size:13px;font-weight:700;color:{col}">{hostname}</span>'
+        f'{status_pill}{os_badge}'
+        f'</div>'
+    )
+
+    # ── Not found ──────────────────────────────────────────────────────────────
     if host_status == 'not_found':
         return hdr + (
-            '<p style="font-size:12px;color:#ef4444;margin:3px 0 0 14px;">'
-            'Not found in QRadar log source inventory.</p>'
+            f'<div style="padding:8px 16px 4px;border-left:4px solid {col};">'
+            f'<span style="font-family:Arial,sans-serif;font-size:12px;'
+            f'color:#ef4444;font-weight:600">'
+            f'&#10006;&nbsp; Not found in QRadar log source inventory.</span>'
+            f'</div>'
         )
 
+    # ── Shared table helpers ───────────────────────────────────────────────────
+    TH = lambda t: (
+        f'<th style="padding:7px 12px;border-bottom:1px solid #374151;'
+        f'text-align:left;color:#94a3b8;font-size:10px;font-family:Arial,sans-serif;'
+        f'font-weight:700;text-transform:uppercase;letter-spacing:.5px;'
+        f'background:#111827">{t}</th>'
+    )
+
+    TABLE_OPEN = (
+        f'<div style="border-left:4px solid {col};margin-bottom:4px">'
+        f'<table style="width:100%;border-collapse:collapse;'
+        f'border:1px solid #374151;font-family:Arial,sans-serif;font-size:12px">'
+        f'<thead><tr><th style="width:28px;background:#111827;'
+        f'border-bottom:1px solid #374151"></th>'
+        + TH('Log Source Type') + TH('Log Source Name')
+        + TH('Last Event') + TH('Status')
+        + '</tr></thead><tbody>'
+    )
+    TABLE_CLOSE = '</tbody></table></div>'
+
+    # ── Type-validation mode ───────────────────────────────────────────────────
     if type_validation is not None:
         rows = ''
         for r in type_validation:
             da_str = ''
             if r['days_ago'] is not None:
-                label = 'Today' if r['days_ago'] == 0 else f"{r['days_ago']}d ago"
-                da_str = (f' <span style="color:#64748b;font-size:10px">({label})</span>')
+                label  = 'Today' if r['days_ago'] == 0 else f"{r['days_ago']}d ago"
+                da_str = (
+                    f'&nbsp;<span style="color:#6b7280;font-size:10px">({label})</span>'
+                )
 
             if not r['found']:
-                note = (f"{ESCALATION_CONTACT} please onboard this log source."
-                        if ESCALATION_CONTACT.strip() else
-                        "Not found — please onboard this log source.")
+                note = (
+                    f"{ESCALATION_CONTACT}&nbsp;please onboard this log source."
+                    if ESCALATION_CONTACT.strip() else
+                    "Not found — please onboard this log source."
+                )
                 rows += (
-                    f'<tr>'
-                    f'<td style="text-align:center;padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;width:22px;color:#ef4444;font-weight:700">&#10006;</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#ef4444;font-weight:600">{r["expected"]}</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#94a3b8">&#8212;</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#94a3b8">&#8212;</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#ef4444;font-style:italic">{note}</td>'
+                    f'<tr style="background:#1c0a0a">'
+                    f'<td style="text-align:center;padding:8px 4px;'
+                    f'border-bottom:1px solid #374151;color:#ef4444;font-size:14px">&#10006;</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#ef4444;font-weight:700">{r["expected"]}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#6b7280">&#8212;</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#6b7280">&#8212;</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#ef4444;font-style:italic">{note}</td>'
                     f'</tr>'
                 )
             elif r['days_ago'] is None:
-                note = (f"{ESCALATION_CONTACT} no events received — please investigate."
-                        if ESCALATION_CONTACT.strip() else
-                        "No events received — please investigate.")
+                note = (
+                    f"{ESCALATION_CONTACT}&nbsp;no events received — please investigate."
+                    if ESCALATION_CONTACT.strip() else
+                    "No events received — please investigate."
+                )
                 rows += (
-                    f'<tr>'
-                    f'<td style="text-align:center;padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;width:22px;color:#f59e0b;font-weight:700">&#9888;</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#f59e0b;font-weight:600">{r["expected"]}</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#cbd5e1">{r.get("ls_name","N/A")}</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#f59e0b;font-style:italic">No events recorded</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#f59e0b;font-style:italic">{note}</td>'
+                    f'<tr style="background:#1c1205">'
+                    f'<td style="text-align:center;padding:8px 4px;'
+                    f'border-bottom:1px solid #374151;color:#f59e0b;font-size:14px">&#9888;</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#f59e0b;font-weight:700">{r["expected"]}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#d1d5db">{r.get("ls_name","N/A")}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#f59e0b;font-style:italic">No events recorded</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#f59e0b;font-style:italic">{note}</td>'
                     f'</tr>'
                 )
             else:
                 rows += (
-                    f'<tr>'
-                    f'<td style="text-align:center;padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;width:22px;color:#22c55e;font-weight:700">&#10004;</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#e2e8f0;font-weight:600">{r["expected"]}</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#cbd5e1">{r.get("ls_name","N/A")}</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#cbd5e1">{r.get("last_seen","N/A")}{da_str}</td>'
-                    f'<td style="padding:7px 10px;border-bottom:1px solid #2a2a2a;'
-                    f'font-size:12px;color:#22c55e;font-weight:600">Confirmed</td>'
+                    f'<tr style="background:#0a1c10">'
+                    f'<td style="text-align:center;padding:8px 4px;'
+                    f'border-bottom:1px solid #374151;color:#22c55e;font-size:14px">&#10004;</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#ffffff;font-weight:700">{r["expected"]}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#d1d5db">{r.get("ls_name","N/A")}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#d1d5db">{r.get("last_seen","N/A")}{da_str}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
+                    f'color:#22c55e;font-weight:700">&#10004;&nbsp;Confirmed</td>'
                     f'</tr>'
                 )
+        return hdr + TABLE_OPEN + rows + TABLE_CLOSE
 
-        th = lambda t: (
-            f'<th style="padding:6px 10px;border-bottom:1px solid #2a2a2a;'
-            f'text-align:left;color:#64748b;font-size:10px;'
-            f'text-transform:uppercase;letter-spacing:.4px;font-weight:600">{t}</th>'
-        )
-        return hdr + (
-            f'<table style="width:100%;border-collapse:collapse;'
-            f'border:1px solid #2a2a2a;border-radius:4px;overflow:hidden;font-size:12px">'
-            f'<tr><th style="width:22px;padding:6px 10px;border-bottom:1px solid #2a2a2a"></th>'
-            + th('Log Source Type') + th('Log Source Name') + th('Last Event') + th('Status')
-            + f'</tr>{rows}</table>'
-        )
-
-    # Simple mode (no OS_TYPE_GROUPS match)
+    # ── Simple mode (no OS group match) ───────────────────────────────────────
     best = None
     if sources:
-        en = sorted([s for s in sources if s.get('enabled')],
-                    key=lambda x: (x.get('days_ago') is None, x.get('days_ago') or 99999))
-        di = sorted([s for s in sources if not s.get('enabled')],
-                    key=lambda x: (x.get('days_ago') is None, x.get('days_ago') or 99999))
+        en = sorted(
+            [s for s in sources if s.get('enabled')],
+            key=lambda x: (x.get('days_ago') is None, x.get('days_ago') or 99999)
+        )
+        di = sorted(
+            [s for s in sources if not s.get('enabled')],
+            key=lambda x: (x.get('days_ago') is None, x.get('days_ago') or 99999)
+        )
         best = en[0] if en else (di[0] if di else None)
+
     if best:
         da  = best.get('days_ago')
         dsp = 'Today' if da == 0 else (f"{da}d ago" if da is not None else 'N/A')
-        td  = lambda l, v: (
-            f'<tr><td style="padding:6px 12px;color:#64748b;font-size:12px;'
-            f'border-bottom:1px solid #2a2a2a;width:140px">{l}</td>'
-            f'<td style="padding:6px 12px;font-size:12px;border-bottom:1px solid #2a2a2a;'
-            f'color:#cbd5e1">{v}</td></tr>'
-        )
+        dcolor = '#22c55e' if (da is not None and da <= 7) else '#f59e0b'
+
+        def simple_row(label, value, val_style='color:#d1d5db'):
+            return (
+                f'<tr>'
+                f'<td style="padding:7px 14px;color:#94a3b8;font-size:11px;'
+                f'font-family:Arial,sans-serif;border-bottom:1px solid #1f2937;'
+                f'width:130px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">'
+                f'{label}</td>'
+                f'<td style="padding:7px 14px;font-size:12px;font-family:Arial,sans-serif;'
+                f'border-bottom:1px solid #1f2937;{val_style}">{value}</td>'
+                f'</tr>'
+            )
+
         return hdr + (
-            f'<table style="width:100%;max-width:480px;border-collapse:collapse;'
-            f'border:1px solid #2a2a2a;border-radius:4px;overflow:hidden">'
-            + td('Log Source Name',
-                 f'<b style="color:#e2e8f0">{best.get("name","N/A")}</b>')
-            + td('Log Source Type', best.get("ls_type","N/A"))
-            + td('Last Event',
-                 f'{best.get("last_seen","N/A")} '
-                 f'<span style="color:#64748b;font-size:11px">({dsp})</span>')
-            + '</table>'
+            f'<div style="border-left:4px solid {col};margin-bottom:4px">'
+            f'<table style="width:100%;max-width:520px;border-collapse:collapse;'
+            f'border:1px solid #374151;background:#0d1117">'
+            + simple_row('Log Source',
+                         f'<strong style="color:#ffffff;font-size:13px">'
+                         f'{best.get("name","N/A")}</strong>')
+            + simple_row('Source Type', best.get("ls_type","N/A"))
+            + simple_row('Last Event',
+                         f'<span style="color:#d1d5db">{best.get("last_seen","N/A")}</span>'
+                         f'&nbsp;<span style="color:{dcolor};font-weight:700;font-size:11px">'
+                         f'({dsp})</span>')
+            + '</table></div>'
         )
+
     return hdr
 
 
 def build_reply_for_all_hosts(hostname_qr_pairs: list) -> tuple:
     """
-    v3.1: Email HTML uses transparent background throughout — no explicit
-    dark background on body or container. Blends with Outlook's dark-mode
-    natively. Status banners retain intentional accent colours.
+    v3.2 email design:
+     - Transparent body (no background) — blends with Outlook dark mode
+     - Solid vivid status banner with deep coloured fill + bright accent border
+     - White body text — fully solid, not hazy
+     - Per-host sections with prominent 4px left-border + status pill badge
+     - High-contrast table rows (dark tinted rows, vivid status colours)
     """
     run_time = datetime.now().strftime('%d %B %Y, %H:%M')
     host_sections, host_tracking, statuses = [], [], []
@@ -700,6 +765,7 @@ def build_reply_for_all_hosts(hostname_qr_pairs: list) -> tuple:
             'days_ago':  best_da,
         })
 
+    # FIX from v3.0: max() with STATUS_PRIORITY (not_found=2 > partial=1 > active=0)
     overall_status = max(statuses, key=lambda s: STATUS_PRIORITY.get(s, 0)) \
         if statuses else 'not_found'
 
@@ -707,49 +773,105 @@ def build_reply_for_all_hosts(hostname_qr_pairs: list) -> tuple:
     n_ok     = sum(1 for s in statuses if s == 'active')
     n_issues = n_hosts - n_ok
 
+    # ── Banner config: deep solid fill + vivid top-border ─────────────────────
     BANNERS = {
-        'active':    ('#166534', 'rgba(34,197,94,0.12)',
-                      '&#10004;&nbsp; All Hosts Confirmed Reporting on SIEM'),
-        'partial':   ('#92400e', 'rgba(245,158,11,0.12)',
-                      f'&#9888;&nbsp; {n_issues} of {n_hosts} Host{"s" if n_hosts>1 else ""} Require Attention'),
-        'not_found': ('#991b1b', 'rgba(239,68,68,0.12)',
-                      f'&#10006;&nbsp; {"Some hosts not" if n_ok else "No hosts"} found in QRadar'),
+        'active': {
+            'bg':    '#14532d',          # deep solid green
+            'bdr':   '#22c55e',          # vivid green border
+            'icon':  '&#10004;',
+            'text':  '#ffffff',
+            'label': 'All Hosts Confirmed Reporting on SIEM',
+        },
+        'partial': {
+            'bg':    '#78350f',
+            'bdr':   '#f59e0b',
+            'icon':  '&#9888;',
+            'text':  '#ffffff',
+            'label': (f'{n_issues} of {n_hosts} Host{"s" if n_hosts > 1 else ""}'
+                      f' Require Attention'),
+        },
+        'not_found': {
+            'bg':    '#7f1d1d',
+            'bdr':   '#ef4444',
+            'icon':  '&#10006;',
+            'text':  '#ffffff',
+            'label': (f'{"Some hosts not" if n_ok else "No hosts"} found in QRadar'),
+        },
     }
-    bcol, bbg, blbl = BANNERS.get(overall_status, BANNERS['partial'])
+    B = BANNERS.get(overall_status, BANNERS['partial'])
 
+    # ── Summary sentence ───────────────────────────────────────────────────────
     if overall_status == 'active' and n_hosts == 1:
-        summary = f'<b>{hostname_qr_pairs[0][0]}</b> is confirmed reporting on our SIEM.'
+        summary = (f'<b style="color:#ffffff">{hostname_qr_pairs[0][0]}</b>'
+                   f' is confirmed reporting on our SIEM.')
     elif overall_status == 'active':
-        names   = ', '.join(f'<b>{h}</b>' for h, _ in hostname_qr_pairs)
-        summary = f'All {n_hosts} requested hosts ({names}) are confirmed reporting on our SIEM.'
+        names   = ', '.join(
+            f'<b style="color:#ffffff">{h}</b>' for h, _ in hostname_qr_pairs
+        )
+        summary = f'All {n_hosts} hosts ({names}) are confirmed active on our SIEM.'
     else:
-        summary = (f'{n_ok} of {n_hosts} host{"s" if n_hosts>1 else ""} confirmed active. '
-                   f'Issues are highlighted per host below.')
+        summary = (
+            f'<b style="color:#ffffff">{n_ok} of {n_hosts}'
+            f' host{"s" if n_hosts > 1 else ""}</b> confirmed active. '
+            f'Issues are highlighted per host below.'
+        )
 
-    # v3.1: NO background on <body> or outer <div> — transparent = Outlook dark mode native
+    # ── Assemble email ────────────────────────────────────────────────────────
+    #    body background intentionally omitted — renders transparent on
+    #    Outlook's dark-mode canvas
     body = (
-        '<html><head>'
+        '<html>'
+        '<head>'
         '<meta name="color-scheme" content="dark light">'
         '<meta name="supported-color-scheme" content="dark light">'
         '</head>'
-        '<body style="font-family:\'Segoe UI\',Arial,sans-serif;'
-        'color:#e2e8f0;font-size:13px;line-height:1.6;margin:0;padding:16px 0;">'
-        '<div style="max-width:680px;padding:0 4px;">'
-        '<p style="margin:0 0 16px;color:#e2e8f0">Hi,</p>'
-        f'<div style="background:{bbg};border:1px solid {bcol};color:#f0f4ff;'
-        f'padding:10px 16px;border-radius:6px;font-size:13px;font-weight:600;'
-        f'margin-bottom:14px">{blbl}</div>'
-        f'<p style="margin:0 0 14px;color:#cbd5e1">{summary}</p>'
-        + ''.join(host_sections) +
-        f'<p style="margin:22px 0 4px;color:#475569;font-size:11px">'
-        f'Automated response from the SIEM monitoring system.<br>'
-        f'Checked against QRadar on {run_time}.</p>'
-        '<p style="margin:14px 0 0;color:#e2e8f0">Regards,<br>'
-        '<span style="font-weight:600">Cyberdefence</span></p>'
-        '</div></body></html>'
-    )
-    return body, overall_status, host_tracking
+        '<body style="'
+        'font-family:Arial,\'Segoe UI\',sans-serif;'
+        'font-size:13px;'
+        'line-height:1.6;'
+        'color:#ffffff;'          # solid white — no haze
+        'margin:0;padding:16px 0;">'
 
+        '<div style="max-width:700px;">'
+
+        # Greeting
+        '<p style="margin:0 0 18px;font-size:13px;color:#ffffff">Hi,</p>'
+
+        # ── Status banner ──────────────────────────────────────────────────────
+        f'<div style="'
+        f'background:{B["bg"]};'
+        f'border:1px solid {B["bdr"]};'
+        f'border-left:5px solid {B["bdr"]};'
+        f'border-radius:4px;'
+        f'padding:12px 18px;'
+        f'margin-bottom:16px;">'
+        f'<span style="font-size:14px;font-weight:700;color:{B["text"]}">'
+        f'{B["icon"]}&nbsp;&nbsp;{B["label"]}'
+        f'</span>'
+        f'</div>'
+
+        # Summary line
+        f'<p style="margin:0 0 6px;font-size:13px;color:#d1d5db">{summary}</p>'
+
+        # Per-host sections
+        + ''.join(host_sections) +
+
+        # ── Footer ────────────────────────────────────────────────────────────
+        '<div style="margin-top:28px;padding-top:14px;border-top:1px solid #374151">'
+        f'<p style="margin:0;font-size:11px;color:#6b7280">'
+        f'Automated SIEM monitoring response &mdash; QRadar checked {run_time}.</p>'
+        '</div>'
+
+        '<p style="margin:18px 0 0;font-size:13px;color:#ffffff">'
+        'Regards,<br>'
+        '<strong style="color:#ffffff">Cyberdefence</strong>'
+        '</p>'
+
+        '</div>'
+        '</body></html>'
+    )
+
+    return body, overall_status, host_tracking
 
 def _status_for_host(hostname: str, qr_result: dict) -> tuple:
     status  = qr_result.get('status')
