@@ -1,45 +1,42 @@
 """
-QRadar Signoff Auto-Draft  v3.1
-=================================
-CHANGES FROM v3.0
-──────────────────────────────────────────────
-EMAIL BODY
-  • Removed explicit dark backgrounds from body/container — email is now
-    transparent and blends with Outlook's dark-mode theme (no floating card)
-  • meta color-scheme: dark added for Outlook dark-mode signal
-  • Status banners retain their colored backgrounds (intentional accents)
-  • All table row backgrounds removed — subtle borders only
-  • Text colours light enough to read on any dark background
+QRadar Signoff Auto-Draft  v2.2
+────────────────────────────────────────────────────────────────────────────
+Scans Outlook for SIEM signoff emails, queries QRadar, saves draft replies.
 
-DASHBOARD — FILTER / DELETE
-  • Status filter pills removed from table header
-  • OS-group dropdown removed from table header (OS group still visible as badge in rows)
-  • Quick-delete (🗑) button added to every row — no modal, no reason required;
-    10-second undo bar appears immediately after click
-  • Edit (✎) button still opens the full modal for overrides/notes
+v2.2 changes (over v2.1):
+  • Fix 1: Multi-level prefix stripping — RE: FW: RE: chains now fully stripped
+            before keyword matching.
+  • Fix 2: Drafts folder date-restricted — same SENT_SCAN_DAYS window applied
+            via .Restrict() so large mailboxes don't slow the scan to a crawl.
+  • Fix 3: Clean Ctrl+C / crash exit — KeyboardInterrupt caught at __main__
+            level; HTTP server shut down immediately instead of hanging until
+            the DASHBOARD_SERVE_MINUTES timeout expires.
+  • Fix 4: Atomic JSON writes — all data-file writes go through
+            _atomic_write_json() which writes to a .tmp file then os.replace()
+            so a mid-write crash can never corrupt signoff_data.json.
+  • Fix 5: Dashboard save button — persistent "Save Changes" button in the
+            header (greyed + disabled when clean, green + pulsing when dirty);
+            discard fully reverts to last persisted snapshot; gi mapping is
+            stable across filtered / sorted / paginated views.
 
-DASHBOARD — VISUAL REFRESH
-  • Cleaner card design: subtle gradient top-border accent, better spacing
-  • Table: alternating micro-tint rows, sticky header, sharper typography
-  • Header bar simplified and tightened
-  • Charts section unchanged (pure-SVG, air-gapped)
-  • Period selector preserved as-is
-
-AUTO-OPEN
-  • generate_dashboard() calls os.startfile(DASHBOARD_PATH) at the end of
-    every run so the dashboard opens in the default browser automatically
+DRAFT-ONLY: reply.Save() is called, NEVER reply.Send().
 """
 
-import os
-import re
 import json
-import uuid
+import os
+import socket
+import tempfile
+import threading
 import time
 import urllib3
-import requests
+import uuid
+import webbrowser
 import win32com.client
+import requests
 
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 
 # ─── PATH AUTO-CONFIGURATION ─────────────────────────────────────────────────
 _SCRIPT_DIR       = os.path.dirname(os.path.abspath(__file__))
@@ -70,12 +67,11 @@ YOUR_EMAIL_ADDRESS = 'youremail@yourorg.com'
 TRIGGER_DL         = '@SOC-DL@yourorg.com'
 
 # ─── ESCALATION ──────────────────────────────────────────────────────────────
-ESCALATION_TO      = ['onboarding-owner@yourorg.com']
-ESCALATION_CC      = ['@SOC-DL@yourorg.com']
-ESCALATION_CONTACT = '@xyz'
+ESCALATION_TO = ['onboarding-owner@yourorg.com']
+ESCALATION_CC = ['@SOC-DL@yourorg.com']
 
 # ─── OUTLOOK FOLDERS ─────────────────────────────────────────────────────────
-SIGNOFF_FOLDER_NAME = 'SIEM Signoffs'
+SIGNOFF_FOLDER_NAME = 'SIEM Signoffs'   # set None for full Inbox
 
 # ─── OS TYPE VALIDATION ──────────────────────────────────────────────────────
 OS_TYPE_GROUPS = {
@@ -89,6 +85,15 @@ TAG_PARTIAL    = '[Processed-Partial]'
 TAG_NOT_FOUND  = '[Processed-NotFound]'
 REVALIDATABLE_TAGS = {TAG_PARTIAL, TAG_NOT_FOUND}
 
+# ─── HISTORICAL IMPORT ───────────────────────────────────────────────────────
+# ONE-TIME USE: set True to ingest already-tagged legacy emails into the data
+# file for management reporting.  Reset to False immediately after that run.
+HISTORICAL_RUN_MODE = False
+
+# ─── DASHBOARD SERVER ────────────────────────────────────────────────────────
+DASHBOARD_SERVER_PORT   = 8745   # preferred local port; auto-picks if in use
+DASHBOARD_SERVE_MINUTES = 30     # minutes to keep server alive; 0 = file:// only (no save)
+
 # ─── CONSTANTS ───────────────────────────────────────────────────────────────
 ACTIVITY_THRESHOLD_DAYS = 7
 _MIN_TS                 = 0
@@ -97,31 +102,51 @@ LOG_SOURCE_TYPES_CACHE  = {}
 STATUS_PRIORITY         = {'not_found': 2, 'partial': 1, 'active': 0}
 REQUEST_TIMEOUT         = 30
 
-_runtime_drafted_hosts: set = set()
-
-_OVERRIDES_PATH = SIGNOFF_DATA_PATH.replace('.json', '_overrides.json')
-VERSION         = '3.1'
-_API_RETRIES    = 3
-_API_PAGE_SIZE  = 50
+_runtime_drafted_hosts: set  = set()
+_http_server_instance        = None
+_http_server_port: int       = 0
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LOGGING & LOCKFILE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _log(msg: str) -> None:
-    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+def _log(message):
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
     print(line)
     try:
         with open(RUN_LOG_PATH, 'a', encoding='utf-8') as f:
             f.write(line + '\n')
-    except (IOError, PermissionError) as e:
-        print(f"  [log-write-fail: {e}]")
+    except Exception as e:
+        print(f"WARNING: Could not write to log: {e}")
 
 
-def acquire_lock() -> bool:
+def _ensure_paths():
+    for path in (RUN_LOG_PATH, SIGNOFF_DATA_PATH):
+        if not os.path.exists(path):
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    if path.endswith('.json'):
+                        json.dump({'schema_version': 2, 'entries': []}, f, indent=2)
+                _log(f"Created: {path}")
+            except Exception as e:
+                _log(f"WARNING: Could not create {path}: {e}")
+
+
+def _print_paths():
+    _log("")
+    _log("-" * 65)
+    _log("FILE PATHS — paste into script config to hardcode:")
+    _log(f"  RUN_LOG_PATH      = r'{RUN_LOG_PATH}'")
+    _log(f"  LOCKFILE_PATH     = r'{LOCKFILE_PATH}'")
+    _log(f"  SIGNOFF_DATA_PATH = r'{SIGNOFF_DATA_PATH}'")
+    _log(f"  DASHBOARD_PATH    = r'{DASHBOARD_PATH}'")
+    _log("-" * 65)
+
+
+def acquire_lock():
     if os.path.exists(LOCKFILE_PATH):
-        _log("WARN: Lockfile exists — another instance may be running. Exiting.")
+        _log("WARNING: Lockfile exists — another instance may be running. Exiting.")
         return False
     try:
         with open(LOCKFILE_PATH, 'w') as f:
@@ -132,1589 +157,1712 @@ def acquire_lock() -> bool:
         return False
 
 
-def release_lock() -> None:
+def release_lock():
     try:
         if os.path.exists(LOCKFILE_PATH):
             os.remove(LOCKFILE_PATH)
     except Exception as e:
-        _log(f"WARN: Could not remove lockfile: {e}")
+        _log(f"WARNING: Could not remove lockfile: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DATETIME HELPER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _com_dt_to_py(com_dt) -> datetime | None:
+def _com_dt_to_py(com_dt):
     if com_dt is None:
         return None
     try:
-        return datetime(
-            com_dt.year, com_dt.month, com_dt.day,
-            com_dt.hour, com_dt.minute, com_dt.second,
-        )
+        return datetime(com_dt.year, com_dt.month, com_dt.day,
+                        com_dt.hour, com_dt.minute, com_dt.second)
     except Exception:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DATA FILE
-# ═══════════════════════════════════════════════════════════════════════════════
+def _atomic_write_json(path, data):
+    """
+    Write JSON atomically: dump to a sibling .tmp file then os.replace() it
+    into place.  A crash mid-write leaves the original file intact.
+    """
+    dir_ = os.path.dirname(os.path.abspath(path))
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix='.tmp')
+    try:
+        with os.fdopen(tmp_fd, 'w', encoding='utf-8') as tf:
+            json.dump(data, tf, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
-def _load_data() -> dict:
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD HTTP SERVER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_free_port(preferred=8745):
+    """Returns preferred port if free, otherwise picks a random free port."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('127.0.0.1', preferred))
+        s.close()
+        return preferred
+    except OSError:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+
+class _DashboardHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler: serves dashboard HTML + data JSON, accepts saves."""
+
+    def do_GET(self):
+        if self.path in ('/', '/index.html'):
+            self._serve_file(DASHBOARD_PATH, 'text/html; charset=utf-8')
+        elif self.path == '/data.json':
+            self._serve_file(SIGNOFF_DATA_PATH, 'application/json')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == '/save':
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body   = self.rfile.read(length)
+                data   = json.loads(body.decode('utf-8'))
+                # FIX 4: atomic write — original file untouched if this crashes
+                _atomic_write_json(SIGNOFF_DATA_PATH, data)
+                n = len(data.get('entries', []))
+                _log(f"[Dashboard] Saved via HTTP — {n} entries in {SIGNOFF_DATA_PATH}")
+                # Regenerate the HTML so embedded data is fresh on next file:// open
+                _write_dashboard_html(_http_server_port)
+                self._json_ok({'ok': True, 'entries': n})
+            except Exception as e:
+                _log(f"[Dashboard] Save error: {e}")
+                self._json_ok({'error': str(e)}, code=500)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def _serve_file(self, path, content_type):
+        try:
+            with open(path, 'rb') as f:
+                content = f.read()
+            self.send_response(200)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(content)
+        except FileNotFoundError:
+            self.send_response(404)
+            self.end_headers()
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(str(e).encode())
+
+    def _json_ok(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass  # suppress per-request console noise
+
+
+def _start_dashboard_server():
+    """Start the local HTTP server (once only). Returns port number or 0 if disabled."""
+    global _http_server_instance, _http_server_port
+
+    if DASHBOARD_SERVE_MINUTES <= 0:
+        return 0
+    if _http_server_instance:
+        return _http_server_port
+
+    port   = _find_free_port(DASHBOARD_SERVER_PORT)
+    server = HTTPServer(('127.0.0.1', port), _DashboardHandler)
+    _http_server_instance = server
+    _http_server_port     = port
+
+    # Serve thread — daemon=False keeps process alive until server shuts down
+    threading.Thread(
+        target=server.serve_forever,
+        name='DashboardServer',
+        daemon=False,
+    ).start()
+
+    # Timer thread — shuts server down after configured minutes
+    def _auto_shutdown(srv, mins):
+        time.sleep(mins * 60)
+        _log(f"[Dashboard] Server timeout ({mins} min) — shutting down. Process will exit.")
+        srv.shutdown()
+
+    threading.Thread(
+        target=_auto_shutdown,
+        args=(server, DASHBOARD_SERVE_MINUTES),
+        name='DashboardTimer',
+        daemon=True,
+    ).start()
+
+    _log(f"[Dashboard] Server running: http://127.0.0.1:{port} "
+         f"(auto-closes in {DASHBOARD_SERVE_MINUTES} min)")
+    return port
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RUNTIME + CROSS-RUN DEDUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _host_key(hostname_list):
+    return frozenset(h.upper().strip() for h in hostname_list)
+
+
+def is_drafted_this_run(hostname_list):
+    return _host_key(hostname_list) in _runtime_drafted_hosts
+
+
+def mark_drafted_this_run(hostname_list):
+    _runtime_drafted_hosts.add(_host_key(hostname_list))
+
+
+def get_prior_status_from_data(hostname_list):
+    """
+    Cross-run dedup: look up the most recent live (non-historical) entry for
+    this hostname set in signoff_data.json.  Returns (status_str, datetime)
+    or (None, None) if not found.
+    """
     if not os.path.exists(SIGNOFF_DATA_PATH):
-        return {"records": [], "overrides": {}}
+        return None, None
     try:
         with open(SIGNOFF_DATA_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        if isinstance(data, list):
-            _log("  INFO: Legacy data format detected — migrating to v3 schema")
-            return {"records": data, "overrides": {}}
-        if "records" not in data:
-            data["records"] = []
-        if "overrides" not in data:
-            data["overrides"] = {}
-        return data
-    except Exception as e:
-        _log(f"WARN: Could not load data file: {e}")
-        return {"records": [], "overrides": {}}
+    except Exception:
+        return None, None
 
+    key         = _host_key(hostname_list)
+    best_status = None
+    best_dt     = None
 
-def _save_data(data: dict) -> None:
-    try:
-        with open(SIGNOFF_DATA_PATH, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-    except Exception as e:
-        _log(f"WARN: Could not write data file: {e}")
-
-
-def append_record(record: dict) -> None:
-    data = _load_data()
-    data["records"].append(record)
-    _save_data(data)
-
-
-def load_overrides() -> dict:
-    if os.path.exists(_OVERRIDES_PATH):
+    for entry in data.get('entries', []):
+        if entry.get('manually_resolved'):
+            continue
+        if entry.get('historical'):          # skip historical imports
+            continue
+        entry_hosts = [h.get('hostname', '') for h in entry.get('hosts', [])]
+        if _host_key(entry_hosts) != key:
+            continue
         try:
-            with open(_OVERRIDES_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            _log(f"WARN: Could not read overrides file: {e}")
-    return _load_data().get("overrides", {})
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CROSS-RUN DEDUPLICATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _was_active_recently(hostname_frozenset: frozenset) -> tuple[bool, str]:
-    if ACTIVE_SKIP_DAYS <= 0:
-        return False, ''
-    cutoff = datetime.now() - timedelta(days=ACTIVE_SKIP_DAYS)
-    data   = _load_data()
-    for rec in reversed(data["records"]):
-        try:
-            rec_ts  = datetime.fromisoformat(rec.get("timestamp", ""))
-            rec_hn  = frozenset(h["hostname"] for h in rec.get("host_results", []))
-            rec_sta = rec.get("overall_status", "")
+            entry_dt = datetime.fromisoformat(entry['timestamp'])
         except Exception:
             continue
-        if rec_hn == hostname_frozenset and rec_sta == "active" and rec_ts >= cutoff:
-            return True, rec_ts.strftime('%Y-%m-%d')
-    return False, ''
+        if best_dt is None or entry_dt > best_dt:
+            best_status = entry.get('overall_status')
+            best_dt     = entry_dt
+
+    return best_status, best_dt
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  QRADAR API — RETRY + PAGINATION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# HISTORICAL IMPORT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _qradar_get(path: str, params: dict | None = None,
-                paginate: bool = False) -> tuple[int, list | dict]:
-    url  = f"{QRADAR_HOST.rstrip('/')}{path}"
-    hdrs = {'Accept': 'application/json', 'Version': '14.0'}
-    auth = (QRADAR_USERNAME, QRADAR_PASSWORD)
-
-    def _one_get(extra: dict) -> requests.Response | None:
-        merged = {**hdrs, **extra}
-        for attempt in range(1, _API_RETRIES + 1):
-            try:
-                r = requests.get(url, params=params, auth=auth,
-                                 verify=VERIFY_SSL, timeout=REQUEST_TIMEOUT,
-                                 headers=merged)
-                if r.status_code < 500:
-                    return r
-                wait = 2 ** attempt
-                _log(f"   QRadar HTTP {r.status_code} — retry {attempt}/{_API_RETRIES} in {wait}s")
-                time.sleep(wait)
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                wait = 2 ** attempt
-                _log(f"   QRadar error: {e} — retry {attempt}/{_API_RETRIES} in {wait}s")
-                time.sleep(wait)
-        return None
-
-    if not paginate:
-        r = _one_get({})
-        if r is None:
-            return 503, []
-        try:
-            return r.status_code, r.json()
-        except Exception:
-            return r.status_code, []
-
-    all_items: list = []
-    start = 0
-    while True:
-        r = _one_get({'Range': f'items={start}-{start + _API_PAGE_SIZE - 1}'})
-        if r is None or r.status_code not in (200, 206):
-            code = r.status_code if r else 503
-            _log(f"   WARN: Pagination stopped at offset {start} — HTTP {code}")
-            return code, all_items
-        try:
-            page = r.json()
-        except Exception:
-            break
-        if not page:
-            break
-        all_items.extend(page)
-        cr = r.headers.get('Content-Range', '')
-        if cr:
-            try:
-                total = int(cr.split('/')[-1])
-                if start + _API_PAGE_SIZE >= total:
-                    break
-            except Exception:
-                pass
-        if len(page) < _API_PAGE_SIZE:
-            break
-        start += _API_PAGE_SIZE
-    return 200, all_items
-
-
-def test_qradar_connection() -> bool:
-    _log("Testing QRadar connection...")
-    code, _ = _qradar_get('/api/help/versions')
-    if code == 200:
-        _log("QRadar connection OK.")
-        return True
-    if code == 401:
-        _log("ERROR: Authentication failed. Check QRADAR_USERNAME / QRADAR_PASSWORD env vars.")
+def _historical_already_imported(email_subject):
+    """True if an entry with this exact subject was already written as historical."""
+    if not os.path.exists(SIGNOFF_DATA_PATH):
         return False
-    _log(f"WARN: Unexpected response HTTP {code}")
-    return False
+    try:
+        with open(SIGNOFF_DATA_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return any(
+            e.get('historical') and e.get('email_subject') == email_subject
+            for e in data.get('entries', [])
+        )
+    except Exception:
+        return False
 
 
-def fetch_log_source_types() -> None:
-    _log("Fetching Log Source Types (paginated)...")
-    code, data = _qradar_get(
-        '/api/config/event_sources/log_source_management/log_source_types',
-        paginate=True,
-    )
-    if code == 200 and isinstance(data, list):
-        for t in data:
-            ls_id, ls_name = t.get('id'), t.get('name')
-            if ls_id is not None and ls_name is not None:
-                LOG_SOURCE_TYPES_CACHE[ls_id] = ls_name
-        _log(f"Cached {len(LOG_SOURCE_TYPES_CACHE)} Log Source Types.")
-    else:
-        _log(f"WARN: Failed to fetch Log Source Types — HTTP {code}")
+def write_historical_record(email_subject, sender, hostname_list, status, received_dt=None):
+    """Write a minimal record for a previously-processed (already-tagged) email."""
+    host_records = [
+        {'hostname': h, 'status': status, 'os_group': None, 'type_results': []}
+        for h in hostname_list
+    ]
+    # Use original email date so the management timeline is accurate
+    timestamp = received_dt.isoformat() if received_dt else datetime.now().isoformat()
+
+    data = {'schema_version': 2, 'entries': []}
+    if os.path.exists(SIGNOFF_DATA_PATH):
+        try:
+            with open(SIGNOFF_DATA_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            _log(f"WARNING: Data read error (will overwrite): {e}")
+
+    record = {
+        'run_id':            f"hist-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
+        'timestamp':         timestamp,
+        'email_subject':     email_subject,
+        'sender':            sender,
+        'is_revalidation':   False,
+        'prior_status':      None,
+        'overall_status':    status,
+        'hosts':             host_records,
+        'notes':             'Historical import',
+        'manually_resolved': False,
+        'historical':        True,
+    }
+    data['entries'].append(record)
+    try:
+        # FIX 4: atomic write
+        _atomic_write_json(SIGNOFF_DATA_PATH, data)
+        _log(f"      Historical record written ({status})")
+    except Exception as e:
+        _log(f"WARNING: Data write error: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  QRADAR QUERIES — STRICTLY READ-ONLY
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# QRADAR
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _safe_timestamp(timestamp_ms) -> tuple:
-    if not timestamp_ms:
+def test_qradar_connection():
+    _log("Testing QRadar connection...")
+    try:
+        resp = requests.get(
+            f"{QRADAR_HOST.rstrip('/')}/api/help/versions",
+            auth=(QRADAR_USERNAME, QRADAR_PASSWORD),
+            verify=VERIFY_SSL, timeout=REQUEST_TIMEOUT,
+            headers={'Accept': 'application/json', 'Version': '14.0'},
+        )
+        if resp.status_code == 200:
+            _log("QRadar connection OK.")
+            return True
+        if resp.status_code == 401:
+            _log("ERROR: Auth failed — check QRADAR_USERNAME / QRADAR_PASSWORD.")
+            return False
+        _log(f"WARNING: Unexpected HTTP {resp.status_code}")
+        return False
+    except Exception as e:
+        _log(f"ERROR: Connection failed: {e}")
+        return False
+
+
+def fetch_log_source_types():
+    _log("Fetching Log Source Types...")
+    try:
+        resp = requests.get(
+            f"{QRADAR_HOST.rstrip('/')}/api/config/event_sources"
+            f"/log_source_management/log_source_types",
+            auth=(QRADAR_USERNAME, QRADAR_PASSWORD),
+            verify=VERIFY_SSL, timeout=REQUEST_TIMEOUT,
+            headers={'Accept': 'application/json', 'Version': '14.0'},
+        )
+        if resp.status_code == 200:
+            for t in resp.json():
+                if t.get('id') is not None:
+                    LOG_SOURCE_TYPES_CACHE[t['id']] = t.get('name', '')
+            _log(f"Cached {len(LOG_SOURCE_TYPES_CACHE)} Log Source Types.")
+        else:
+            _log(f"WARNING: HTTP {resp.status_code} fetching Log Source Types.")
+    except Exception as e:
+        _log(f"ERROR: {e}")
+
+
+def _safe_timestamp(ts):
+    if not ts:
         return 'No events recorded', 'No Activity', None
     try:
-        ts = int(timestamp_ms)
-        epoch_s = ts / 1000.0 if ts > 4102444800 else ts
-        if not (_MIN_TS < epoch_s <= _MAX_TS):
-            return f'Invalid timestamp: {timestamp_ms}', 'Unknown', None
-        last_event_dt = datetime.fromtimestamp(epoch_s)
-        days_ago      = (datetime.now() - last_event_dt).days
-        activity      = 'Active' if days_ago <= ACTIVITY_THRESHOLD_DAYS else 'Inactive'
-        return last_event_dt.strftime('%Y-%m-%d %H:%M:%S'), activity, days_ago
+        ts = int(ts) if isinstance(ts, float) else ts
+        s  = ts / 1000.0 if ts > 4102444800 else ts
+        if not (_MIN_TS < s <= _MAX_TS):
+            return f'Invalid: {ts}', 'Unknown', None
+        dt   = datetime.fromtimestamp(s)
+        days = (datetime.now() - dt).days
+        act  = 'Active' if dt > datetime.now() - timedelta(days=ACTIVITY_THRESHOLD_DAYS) else 'Inactive'
+        return dt.strftime('%Y-%m-%d %H:%M:%S'), act, days
     except Exception:
-        return f'Invalid timestamp: {timestamp_ms}', 'Unknown', None
+        return f'Invalid: {ts}', 'Unknown', None
 
 
-def query_all_log_sources_readonly(hostname: str) -> dict:
-    clean = re.sub(r"[\"']", '', hostname).strip()
-    code, ls_data = _qradar_get(
-        '/api/config/event_sources/log_source_management/log_sources',
-        params={'filter': f'name ilike "%{clean}%"'},
-        paginate=True,
-    )
-    if code != 200:
-        return {'status': f'API Error {code}', 'sources': []}
-    if not ls_data:
-        return {'status': 'Not Found', 'sources': []}
-    sources = []
-    for src in ls_data:
-        type_id      = src.get('type_id')
-        ls_type_name = LOG_SOURCE_TYPES_CACHE.get(type_id, f'Unknown Type ID: {type_id}')
-        last_seen, activity, days_ago = _safe_timestamp(src.get('last_event_time'))
-        sources.append({
-            'name':      src.get('name', hostname),
-            'ls_type':   ls_type_name,
-            'enabled':   src.get('enabled', False),
-            'last_seen': last_seen,
-            'activity':  activity,
-            'days_ago':  days_ago,
-        })
-    return {'status': 'Found', 'sources': sources}
+def query_all_log_sources_readonly(hostname):
+    clean = str(hostname).replace('"', '').replace("'", "").strip()
+    try:
+        resp = requests.get(
+            f"{QRADAR_HOST.rstrip('/')}/api/config/event_sources"
+            f"/log_source_management/log_sources",
+            params={'filter': f'name ilike "%{clean}%"'},
+            auth=(QRADAR_USERNAME, QRADAR_PASSWORD),
+            verify=VERIFY_SSL, timeout=REQUEST_TIMEOUT,
+            headers={'Accept': 'application/json', 'Version': '14.0'},
+        )
+        if resp.status_code != 200:
+            return {'status': f'API Error {resp.status_code}', 'sources': []}
+        ls_data = resp.json()
+        if not ls_data:
+            return {'status': 'Not Found', 'sources': []}
+        sources = []
+        for src in ls_data:
+            tid = src.get('type_id')
+            last_seen, activity, days_ago = _safe_timestamp(src.get('last_event_time'))
+            sources.append({
+                'name':      src.get('name', hostname),
+                'ls_type':   LOG_SOURCE_TYPES_CACHE.get(tid, f'Unknown TypeID:{tid}'),
+                'enabled':   src.get('enabled', False),
+                'last_seen': last_seen,
+                'activity':  activity,
+                'days_ago':  days_ago,
+            })
+        return {'status': 'Found', 'sources': sources}
+    except Exception as e:
+        return {'status': f'Error: {str(e)[:80]}', 'sources': []}
 
 
-def detect_os_group(sources: list) -> tuple:
+def validate_expected_types(result, required_types):
+    sources = result.get('sources', [])
+    out = []
+    for kw in required_types:
+        words   = kw.lower().split()
+        matched = [s for s in sources
+                   if all(w in s.get('ls_type', '').lower() for w in words)]
+        if not matched:
+            out.append({'expected': kw, 'found': False,
+                        'ls_type': None, 'ls_name': None,
+                        'last_seen': None, 'days_ago': None})
+            continue
+        enabled  = sorted([s for s in matched if s.get('enabled')],
+                          key=lambda x: x.get('days_ago') or 99999)
+        disabled = sorted([s for s in matched if not s.get('enabled')],
+                          key=lambda x: x.get('days_ago') or 99999)
+        best = (enabled or disabled)[0]
+        out.append({'expected': kw, 'found': True,
+                    'ls_type': best.get('ls_type'), 'ls_name': best.get('name'),
+                    'last_seen': best.get('last_seen'), 'days_ago': best.get('days_ago')})
+    return out
+
+
+def detect_os_group(sources):
     if not OS_TYPE_GROUPS:
         return None, None
-    for group_name, rules in OS_TYPE_GROUPS.items():
-        required = rules.get('required', [])
-        if not required:
-            continue
-        sig_words = str(required[0]).lower().split()
-        if any(
-            all(w in str(s.get('ls_type', '')).lower() for w in sig_words)
-            for s in sources
-        ):
-            return group_name, rules
+    for gname, rules in OS_TYPE_GROUPS.items():
+        req = rules.get('required', [])
+        if req:
+            sig = req[0].lower().split()
+            if any(all(w in s.get('ls_type', '').lower() for w in sig) for s in sources):
+                return gname, rules
     return None, None
 
 
-def validate_expected_types(all_sources_result: dict, required_types: list) -> list:
-    results = []
-    sources = all_sources_result.get('sources', [])
-    for expected_kw in required_types:
-        exp_words = str(expected_kw).lower().split()
-        matched   = [
-            s for s in sources
-            if all(w in str(s.get('ls_type', '')).lower() for w in exp_words)
-        ]
-        if not matched:
-            results.append({
-                'expected': expected_kw, 'found': False,
-                'ls_type': None, 'ls_name': None,
-                'last_seen': None, 'days_ago': None,
-            })
-            continue
-        me = sorted([s for s in matched if s.get('enabled')],
-                    key=lambda x: (x.get('days_ago') is None, x.get('days_ago') or 99999))
-        md = sorted([s for s in matched if not s.get('enabled')],
-                    key=lambda x: (x.get('days_ago') is None, x.get('days_ago') or 99999))
-        best = me[0] if me else md[0]
-        results.append({
-            'expected':  expected_kw, 'found': True,
-            'ls_type':   best.get('ls_type'), 'ls_name': best.get('name'),
-            'last_seen': best.get('last_seen'), 'days_ago': best.get('days_ago'),
-        })
-    return results
+# ══════════════════════════════════════════════════════════════════════════════
+# EMAIL GUARDS
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SUBJECT PARSING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def passes_subject_guards(subject: str) -> tuple:
-    if not subject:
-        return False, "empty subject"
-    s, sl = subject.strip(), subject.strip().lower()
-    if any(sl.startswith(p) for p in ('re:', 'fw:', 'fwd:')):
-        return False, f"reply/forward prefix: '{s[:30]}'"
-    if '[processed' in sl:
-        return False, "subject bears an outcome tag"
-    if SUBJECT_SEPARATOR not in s:
-        return False, f"separator '{SUBJECT_SEPARATOR}' not found"
-    left = s.split(SUBJECT_SEPARATOR)[0].strip().lower()
-    if SUBJECT_KEYWORD.lower() not in left:
-        return False, f"keyword '{SUBJECT_KEYWORD}' not found left of separator"
-    return True, "ok"
-
-
-def extract_hostnames(subject: str) -> list:
-    parts  = subject.split(SUBJECT_SEPARATOR)
-    seen, result = set(), []
-    for p in parts[1:]:
-        hn = ' '.join(p.split()).strip()
-        if hn and hn not in seen:
-            seen.add(hn)
-            result.append(hn)
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SENDER VALIDATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def is_sender_allowed(sender_address: str) -> bool:
+def is_sender_allowed(addr):
     if not ALLOWED_SENDERS:
         return True
-    if not sender_address:
+    if not addr:
         return False
-    sc = sender_address.strip().lower()
-    for entry in ALLOWED_SENDERS:
-        ec = entry.strip().lower()
-        if ec.startswith('@') and sc.endswith(ec):
-            return True
-        if ec == sc:
+    a = addr.strip().lower()
+    for e in ALLOWED_SENDERS:
+        e = e.strip().lower()
+        if e.startswith('@'):
+            # exact domain match — '@org.com' must not match 'user@badorg.com'
+            if a.split('@', 1)[-1] == e[1:]:
+                return True
+        elif a == e:
             return True
     return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BODY DL CHECK
-# ═══════════════════════════════════════════════════════════════════════════════
+def passes_subject_guards(subject):
+    """
+    Guards: outcome tag present → skip (unless HISTORICAL_RUN_MODE).
+    No separator → skip.  Keyword absent → skip.
+    RE/FW/FWD prefixes stripped in a loop until none remain (FIX 1).
+    Keyword matching is case-insensitive.
+    """
+    if not subject:
+        return False, "empty subject"
+    s  = subject.strip()
+    sl = s.lower()
+    if '[processed' in sl and not HISTORICAL_RUN_MODE:
+        return False, "already tagged"
+    if SUBJECT_SEPARATOR not in s:
+        return False, f"separator '{SUBJECT_SEPARATOR}' not found"
+    left = s.split(SUBJECT_SEPARATOR)[0].strip()
 
-def body_contains_dl(mail_item) -> bool:
+    # FIX 1: loop until all RE:/FW:/FWD: prefixes are stripped
+    _prefixes = ('re:', 'fw:', 'fwd:')
+    while any(left.lower().startswith(p) for p in _prefixes):
+        for pfx in _prefixes:
+            if left.lower().startswith(pfx):
+                left = left[len(pfx):].strip()
+                break
+
+    if SUBJECT_KEYWORD.lower() not in left.lower():
+        return False, f"keyword '{SUBJECT_KEYWORD}' not found"
+    return True, "ok"
+
+
+def extract_hostnames(subject):
+    parts = subject.split(SUBJECT_SEPARATOR, 1)
+    if len(parts) < 2:
+        return []
+    return [h.strip() for h in parts[1].split(SUBJECT_SEPARATOR) if h.strip()]
+
+
+def body_contains_dl(mail_item):
     if not TRIGGER_DL.strip():
         return True
-    dl_lower = TRIGGER_DL.strip().lower()
+    dl = TRIGGER_DL.strip().lower()
     try:
-        if dl_lower in (mail_item.Body or '').lower():
-            return True
-        if dl_lower in (mail_item.HTMLBody or '').lower():
-            return True
-        return False
-    except Exception as e:
-        _log(f"   WARN: Body DL check failed: {e}")
-        return False
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CONVERSATION STATUS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def check_conversation_status(mail_item, sent_folder, drafts_folder) -> tuple:
-    try:
-        conv_id = mail_item.ConversationID
+        return (dl in (mail_item.Body or '').lower() or
+                dl in (mail_item.HTMLBody or '').lower())
     except Exception:
-        return None, None
+        return False
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONVERSATION STATUS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _tag_from_subject(subject):
+    s = (subject or '').lower()
+    if TAG_NOT_FOUND.lower() in s: return TAG_NOT_FOUND
+    if TAG_PARTIAL.lower()   in s: return TAG_PARTIAL
+    if TAG_ACTIVE.lower()    in s: return TAG_ACTIVE
+    if '[processed]'         in s: return 'legacy'
+    return None
+
+
+def check_conversation_status(mail_item, sent_folder, drafts_folder, hostname_list):
+    """
+    Two-layer dedup:
+      Layer 1 — ConversationID scan of Sent + Drafts.
+      Layer 2 — data file hostname-set lookup (cross-thread fallback).
+    Returns (tag, datetime) of most recent outcome, or (None, None).
+    """
+    conv_id  = mail_item.ConversationID
     last_tag = None
     last_dt  = None
 
-    def _extract_tag(subject: str) -> str | None:
-        s = (subject or '').lower()
-        if TAG_NOT_FOUND.lower() in s: return TAG_NOT_FOUND
-        if TAG_PARTIAL.lower()   in s: return TAG_PARTIAL
-        if TAG_ACTIVE.lower()    in s: return TAG_ACTIVE
-        if '[processed]'         in s: return 'legacy'
-        return None
-
-    def _update(tag, item_dt):
+    def _update(tag, dt):
         nonlocal last_tag, last_dt
-        if tag and (last_dt is None or (item_dt and item_dt > last_dt)):
-            last_tag, last_dt = tag, item_dt
+        if tag and (last_dt is None or (dt and dt > last_dt)):
+            last_tag, last_dt = tag, dt
 
-    def _scan_folder(folder, items_iter, dt_attr: str):
-        for item in items_iter:
+    # Layer 1a — Sent Items
+    cutoff = (datetime.now() - timedelta(days=SENT_SCAN_DAYS)).strftime('%m/%d/%Y %I:%M %p')
+    try:
+        for item in sent_folder.Items.Restrict(f"[SentOn] >= '{cutoff}'"):
             try:
                 if item.ConversationID == conv_id:
-                    _update(_extract_tag(item.Subject),
-                            _com_dt_to_py(getattr(item, dt_attr, None)))
+                    _update(_tag_from_subject(item.Subject), _com_dt_to_py(item.SentOn))
             except Exception:
                 continue
-
-    cutoff_iso = (datetime.now() - timedelta(days=SENT_SCAN_DAYS)
-                  ).strftime('%Y-%m-%d')
-    try:
-        restricted = sent_folder.Items.Restrict(f"[SentOn] >= '{cutoff_iso}'")
-        _scan_folder(sent_folder, restricted, 'SentOn')
-    except Exception:
-        try:
-            _scan_folder(sent_folder, sent_folder.Items, 'SentOn')
-        except Exception as e:
-            _log(f"   WARN: Could not scan Sent Items: {e}")
-
-    try:
-        _scan_folder(drafts_folder, drafts_folder.Items, 'LastModificationTime')
     except Exception as e:
-        _log(f"   WARN: Could not scan Drafts: {e}")
+        _log(f"      WARNING: Sent scan error: {e}")
+
+    # Layer 1b — Drafts (FIX 2: date-restricted, same window as Sent scan)
+    drafts_cutoff = (datetime.now() - timedelta(days=SENT_SCAN_DAYS)).strftime('%m/%d/%Y %I:%M %p')
+    try:
+        for item in drafts_folder.Items.Restrict(f"[LastModificationTime] >= '{drafts_cutoff}'"):
+            try:
+                if item.ConversationID == conv_id:
+                    _update(_tag_from_subject(item.Subject),
+                            _com_dt_to_py(item.LastModificationTime))
+            except Exception:
+                continue
+    except Exception as e:
+        _log(f"      WARNING: Drafts scan error: {e}")
+
+    # Layer 2 — data file fallback
+    if last_tag is None and hostname_list:
+        data_status, data_dt = get_prior_status_from_data(hostname_list)
+        if data_status and data_dt:
+            tag_map = {
+                'active':    TAG_ACTIVE,
+                'partial':   TAG_PARTIAL,
+                'not_found': TAG_NOT_FOUND,
+            }
+            fallback_tag = tag_map.get(data_status)
+            if fallback_tag:
+                _log(f"      INFO: Layer-2 fallback — data file: '{data_status}' on "
+                     f"{data_dt.strftime('%Y-%m-%d')} for {hostname_list}")
+                _update(fallback_tag, data_dt)
 
     return last_tag, last_dt
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HTML REPLY BUILDER — EMAIL  (v3.1: transparent background, Outlook dark-mode native)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML EMAIL BUILDERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HTML REPLY BUILDER — EMAIL  (v3.2)
-#
-#  Design principles:
-#   • NO background on <body> or outer container — transparent so the email
-#     sits flush on Outlook's dark-mode canvas (no floating card artefact)
-#   • All text is solid and vivid — no muted rgba washes
-#   • Status banners use deep solid fills (readable on ANY background)
-#   • Host headers have a prominent 4px coloured left-border + solid colour tag
-#   • Table rows: high-contrast coloured icons + text, visible dividers
-#   • Footer text is intentionally softer (purposeful hierarchy, not accidental haze)
-# ═══════════════════════════════════════════════════════════════════════════════
+def _build_host_html_section(hostname, qradar_result):
+    status  = qradar_result.get('status')
+    sources = qradar_result.get('sources', [])
 
-def _host_section_html(hostname: str, host_status: str,
-                        type_validation, os_group, sources: list) -> str:
-
-    # ── Palette ────────────────────────────────────────────────────────────────
-    SOLID  = {'active': '#22c55e', 'partial': '#f59e0b', 'not_found': '#ef4444'}
-    DEEP   = {'active': '#14532d', 'partial': '#78350f', 'not_found': '#7f1d1d'}
-    LABEL  = {'active': 'Active',  'partial': 'Partial', 'not_found': 'Not Found'}
-
-    col   = SOLID.get(host_status, '#888888')
-    deep  = DEEP.get(host_status,  '#1a1a1a')
-    lbl   = LABEL.get(host_status, host_status)
-
-    # ── Host header bar ────────────────────────────────────────────────────────
-    os_badge = (
-        f'<span style="font-family:Arial,sans-serif;font-size:10px;color:#94a3b8;'
-        f'margin-left:10px;font-weight:400">{os_group}</span>'
-    ) if os_group else ''
-
-    status_pill = (
-        f'<span style="background:{deep};color:{col};font-size:10px;font-weight:700;'
-        f'letter-spacing:.4px;padding:2px 9px;border-radius:3px;'
-        f'margin-left:10px;text-transform:uppercase;'
-        f'border:1px solid {col}">{lbl}</span>'
-    )
-
-    hdr = (
-        f'<div style="margin:22px 0 0;padding:10px 16px;'
-        f'border-left:4px solid {col};">'
-        f'<span style="font-family:Consolas,\'Courier New\',monospace;'
-        f'font-size:13px;font-weight:700;color:{col}">{hostname}</span>'
-        f'{status_pill}{os_badge}'
-        f'</div>'
-    )
-
-    # ── Not found ──────────────────────────────────────────────────────────────
-    if host_status == 'not_found':
-        return hdr + (
-            f'<div style="padding:8px 16px 4px;border-left:4px solid {col};">'
-            f'<span style="font-family:Arial,sans-serif;font-size:12px;'
-            f'color:#ef4444;font-weight:600">'
-            f'&#10006;&nbsp; Not found in QRadar log source inventory.</span>'
-            f'</div>'
-        )
-
-    # ── Shared table helpers ───────────────────────────────────────────────────
-    TH = lambda t: (
-        f'<th style="padding:7px 12px;border-bottom:1px solid #374151;'
-        f'text-align:left;color:#94a3b8;font-size:10px;font-family:Arial,sans-serif;'
-        f'font-weight:700;text-transform:uppercase;letter-spacing:.5px;'
-        f'background:#111827">{t}</th>'
-    )
-
-    TABLE_OPEN = (
-        f'<div style="border-left:4px solid {col};margin-bottom:4px">'
-        f'<table style="width:100%;border-collapse:collapse;'
-        f'border:1px solid #374151;font-family:Arial,sans-serif;font-size:12px">'
-        f'<thead><tr><th style="width:28px;background:#111827;'
-        f'border-bottom:1px solid #374151"></th>'
-        + TH('Log Source Type') + TH('Log Source Name')
-        + TH('Last Event') + TH('Status')
-        + '</tr></thead><tbody>'
-    )
-    TABLE_CLOSE = '</tbody></table></div>'
-
-    # ── Type-validation mode ───────────────────────────────────────────────────
-    if type_validation is not None:
-        rows = ''
-        for r in type_validation:
-            da_str = ''
-            if r['days_ago'] is not None:
-                label  = 'Today' if r['days_ago'] == 0 else f"{r['days_ago']}d ago"
-                da_str = (
-                    f'&nbsp;<span style="color:#6b7280;font-size:10px">({label})</span>'
-                )
-
-            if not r['found']:
-                note = (
-                    f"{ESCALATION_CONTACT}&nbsp;please onboard this log source."
-                    if ESCALATION_CONTACT.strip() else
-                    "Not found — please onboard this log source."
-                )
-                rows += (
-                    f'<tr style="background:#1c0a0a">'
-                    f'<td style="text-align:center;padding:8px 4px;'
-                    f'border-bottom:1px solid #374151;color:#ef4444;font-size:14px">&#10006;</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#ef4444;font-weight:700">{r["expected"]}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#6b7280">&#8212;</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#6b7280">&#8212;</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#ef4444;font-style:italic">{note}</td>'
-                    f'</tr>'
-                )
-            elif r['days_ago'] is None:
-                note = (
-                    f"{ESCALATION_CONTACT}&nbsp;no events received — please investigate."
-                    if ESCALATION_CONTACT.strip() else
-                    "No events received — please investigate."
-                )
-                rows += (
-                    f'<tr style="background:#1c1205">'
-                    f'<td style="text-align:center;padding:8px 4px;'
-                    f'border-bottom:1px solid #374151;color:#f59e0b;font-size:14px">&#9888;</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#f59e0b;font-weight:700">{r["expected"]}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#d1d5db">{r.get("ls_name","N/A")}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#f59e0b;font-style:italic">No events recorded</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#f59e0b;font-style:italic">{note}</td>'
-                    f'</tr>'
-                )
-            else:
-                rows += (
-                    f'<tr style="background:#0a1c10">'
-                    f'<td style="text-align:center;padding:8px 4px;'
-                    f'border-bottom:1px solid #374151;color:#22c55e;font-size:14px">&#10004;</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#ffffff;font-weight:700">{r["expected"]}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#d1d5db">{r.get("ls_name","N/A")}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#d1d5db">{r.get("last_seen","N/A")}{da_str}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #374151;'
-                    f'color:#22c55e;font-weight:700">&#10004;&nbsp;Confirmed</td>'
-                    f'</tr>'
-                )
-        return hdr + TABLE_OPEN + rows + TABLE_CLOSE
-
-    # ── Simple mode (no OS group match) ───────────────────────────────────────
-    best = None
-    if sources:
-        en = sorted(
-            [s for s in sources if s.get('enabled')],
-            key=lambda x: (x.get('days_ago') is None, x.get('days_ago') or 99999)
-        )
-        di = sorted(
-            [s for s in sources if not s.get('enabled')],
-            key=lambda x: (x.get('days_ago') is None, x.get('days_ago') or 99999)
-        )
-        best = en[0] if en else (di[0] if di else None)
-
-    if best:
-        da  = best.get('days_ago')
-        dsp = 'Today' if da == 0 else (f"{da}d ago" if da is not None else 'N/A')
-        dcolor = '#22c55e' if (da is not None and da <= 7) else '#f59e0b'
-
-        def simple_row(label, value, val_style='color:#d1d5db'):
-            return (
-                f'<tr>'
-                f'<td style="padding:7px 14px;color:#94a3b8;font-size:11px;'
-                f'font-family:Arial,sans-serif;border-bottom:1px solid #1f2937;'
-                f'width:130px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">'
-                f'{label}</td>'
-                f'<td style="padding:7px 14px;font-size:12px;font-family:Arial,sans-serif;'
-                f'border-bottom:1px solid #1f2937;{val_style}">{value}</td>'
-                f'</tr>'
-            )
-
-        return hdr + (
-            f'<div style="border-left:4px solid {col};margin-bottom:4px">'
-            f'<table style="width:100%;max-width:520px;border-collapse:collapse;'
-            f'border:1px solid #374151;background:#0d1117">'
-            + simple_row('Log Source',
-                         f'<strong style="color:#ffffff;font-size:13px">'
-                         f'{best.get("name","N/A")}</strong>')
-            + simple_row('Source Type', best.get("ls_type","N/A"))
-            + simple_row('Last Event',
-                         f'<span style="color:#d1d5db">{best.get("last_seen","N/A")}</span>'
-                         f'&nbsp;<span style="color:{dcolor};font-weight:700;font-size:11px">'
-                         f'({dsp})</span>')
-            + '</table></div>'
-        )
-
-    return hdr
-
-
-def build_reply_for_all_hosts(hostname_qr_pairs: list) -> tuple:
-    """
-    v3.2 email design:
-     - Transparent body (no background) — blends with Outlook dark mode
-     - Solid vivid status banner with deep coloured fill + bright accent border
-     - White body text — fully solid, not hazy
-     - Per-host sections with prominent 4px left-border + status pill badge
-     - High-contrast table rows (dark tinted rows, vivid status colours)
-    """
-    run_time = datetime.now().strftime('%d %B %Y, %H:%M')
-    host_sections, host_tracking, statuses = [], [], []
-
-    for hostname, qr_result in hostname_qr_pairs:
-        host_status, type_validation, os_group = _status_for_host(hostname, qr_result)
-        sources = qr_result.get('sources', [])
-        statuses.append(host_status)
-        host_sections.append(
-            _host_section_html(hostname, host_status, type_validation, os_group, sources)
-        )
-        best_da = best_seen = None
-        if sources:
-            ev = [s for s in sources if s.get('enabled') and s.get('days_ago') is not None]
-            if ev:
-                best      = min(ev, key=lambda x: x['days_ago'])
-                best_da   = best['days_ago']
-                best_seen = best['last_seen']
-        host_tracking.append({
-            'hostname':  hostname,
-            'status':    host_status,
-            'os_group':  os_group,
-            'last_seen': best_seen,
-            'days_ago':  best_da,
-        })
-
-    # FIX from v3.0: max() with STATUS_PRIORITY (not_found=2 > partial=1 > active=0)
-    overall_status = max(statuses, key=lambda s: STATUS_PRIORITY.get(s, 0)) \
-        if statuses else 'not_found'
-
-    n_hosts  = len(hostname_qr_pairs)
-    n_ok     = sum(1 for s in statuses if s == 'active')
-    n_issues = n_hosts - n_ok
-
-    # ── Banner config: deep solid fill + vivid top-border ─────────────────────
-    BANNERS = {
-        'active': {
-            'bg':    '#14532d',          # deep solid green
-            'bdr':   '#22c55e',          # vivid green border
-            'icon':  '&#10004;',
-            'text':  '#ffffff',
-            'label': 'All Hosts Confirmed Reporting on SIEM',
-        },
-        'partial': {
-            'bg':    '#78350f',
-            'bdr':   '#f59e0b',
-            'icon':  '&#9888;',
-            'text':  '#ffffff',
-            'label': (f'{n_issues} of {n_hosts} Host{"s" if n_hosts > 1 else ""}'
-                      f' Require Attention'),
-        },
-        'not_found': {
-            'bg':    '#7f1d1d',
-            'bdr':   '#ef4444',
-            'icon':  '&#10006;',
-            'text':  '#ffffff',
-            'label': (f'{"Some hosts not" if n_ok else "No hosts"} found in QRadar'),
-        },
-    }
-    B = BANNERS.get(overall_status, BANNERS['partial'])
-
-    # ── Summary sentence ───────────────────────────────────────────────────────
-    if overall_status == 'active' and n_hosts == 1:
-        summary = (f'<b style="color:#ffffff">{hostname_qr_pairs[0][0]}</b>'
-                   f' is confirmed reporting on our SIEM.')
-    elif overall_status == 'active':
-        names   = ', '.join(
-            f'<b style="color:#ffffff">{h}</b>' for h, _ in hostname_qr_pairs
-        )
-        summary = f'All {n_hosts} hosts ({names}) are confirmed active on our SIEM.'
-    else:
-        summary = (
-            f'<b style="color:#ffffff">{n_ok} of {n_hosts}'
-            f' host{"s" if n_hosts > 1 else ""}</b> confirmed active. '
-            f'Issues are highlighted per host below.'
-        )
-
-    # ── Assemble email ────────────────────────────────────────────────────────
-    #    body background intentionally omitted — renders transparent on
-    #    Outlook's dark-mode canvas
-    body = (
-        '<html>'
-        '<head>'
-        '<meta name="color-scheme" content="dark light">'
-        '<meta name="supported-color-scheme" content="dark light">'
-        '</head>'
-        '<body style="'
-        'font-family:Arial,\'Segoe UI\',sans-serif;'
-        'font-size:13px;'
-        'line-height:1.6;'
-        'color:#ffffff;'          # solid white — no haze
-        'margin:0;padding:16px 0;">'
-
-        '<div style="max-width:700px;">'
-
-        # Greeting
-        '<p style="margin:0 0 18px;font-size:13px;color:#ffffff">Hi,</p>'
-
-        # ── Status banner ──────────────────────────────────────────────────────
-        f'<div style="'
-        f'background:{B["bg"]};'
-        f'border:1px solid {B["bdr"]};'
-        f'border-left:5px solid {B["bdr"]};'
-        f'border-radius:4px;'
-        f'padding:12px 18px;'
-        f'margin-bottom:16px;">'
-        f'<span style="font-size:14px;font-weight:700;color:{B["text"]}">'
-        f'{B["icon"]}&nbsp;&nbsp;{B["label"]}'
-        f'</span>'
-        f'</div>'
-
-        # Summary line
-        f'<p style="margin:0 0 6px;font-size:13px;color:#d1d5db">{summary}</p>'
-
-        # Per-host sections
-        + ''.join(host_sections) +
-
-        # ── Footer ────────────────────────────────────────────────────────────
-        '<div style="margin-top:28px;padding-top:14px;border-top:1px solid #374151">'
-        f'<p style="margin:0;font-size:11px;color:#6b7280">'
-        f'Automated SIEM monitoring response &mdash; QRadar checked {run_time}.</p>'
-        '</div>'
-
-        '<p style="margin:18px 0 0;font-size:13px;color:#ffffff">'
-        'Regards,<br>'
-        '<strong style="color:#ffffff">Cyberdefence</strong>'
-        '</p>'
-
-        '</div>'
-        '</body></html>'
-    )
-
-    return body, overall_status, host_tracking
-
-def _status_for_host(hostname: str, qr_result: dict) -> tuple:
-    status  = qr_result.get('status')
-    sources = qr_result.get('sources', [])
     if status != 'Found' or not sources:
-        return 'not_found', None, None
-    if not OS_TYPE_GROUPS:
-        return 'active', None, None
+        section = f"""
+        <div style="margin-bottom:20px;border:1px solid #f5c6c6;border-radius:8px;overflow:hidden;">
+          <div style="background:#c0392b;color:#fff;padding:9px 14px;font-size:13px;font-weight:700;">
+            &#x2716;&nbsp; {hostname} &mdash; Not Found in QRadar
+          </div>
+          <div style="padding:12px 14px;font-size:12px;color:#555;">
+            <b>{hostname}</b> was not found in QRadar. Please ensure the asset is onboarded.
+          </div>
+        </div>"""
+        return section, 'not_found', [], None
+
     group_name, group_rules = detect_os_group(sources)
-    if group_name is None:
-        _log(f"      OS group undetected for {hostname} — raw found, no type validation")
-        return 'active', None, None
-    validation  = validate_expected_types(qr_result, group_rules.get('required', []))
-    any_problem = any(
-        not r['found'] or (r['found'] and r['days_ago'] is None)
-        for r in validation
+    type_records = []
+
+    if OS_TYPE_GROUPS and group_name:
+        validation  = validate_expected_types(qradar_result, group_rules.get('required', []))
+        any_missing = any(not r['found'] for r in validation)
+        any_silent  = any(r['found'] and r['days_ago'] is None for r in validation)
+        any_problem = any_missing or any_silent
+        host_status = 'partial' if any_problem else 'active'
+        os_label    = f' ({group_name})'
+
+        if not any_problem:
+            banner_bg, banner_txt = '#1a7a4a', f'&#x2714;&nbsp; {hostname}{os_label} &mdash; Confirmed Reporting on SIEM'
+        elif any_missing:
+            n = sum(1 for r in validation if r['found'])
+            banner_bg  = '#c87800'
+            banner_txt = f'&#x26A0;&nbsp; {hostname}{os_label} &mdash; {n}/{len(validation)} required log sources found'
+        else:
+            banner_bg  = '#c87800'
+            banner_txt = f'&#x26A0;&nbsp; {hostname}{os_label} &mdash; Log sources present but not yet reporting'
+
+        rows = ''
+        for r in validation:
+            if not r['found']:
+                icon, row_bg, status_cell, icon_color = '&#x2716;', '#fff5f5', '<span style="color:#c0392b;font-weight:600;">Missing &mdash; requires onboarding</span>', '#c0392b'
+            elif r['days_ago'] is None:
+                icon, row_bg, status_cell, icon_color = '&#x26A0;', '#fffbf0', '<span style="color:#c87800;font-weight:600;">No events recorded yet</span>', '#c87800'
+            else:
+                d_str = 'Today' if r['days_ago'] == 0 else f"{r['days_ago']}d ago"
+                icon, row_bg, icon_color = '&#x2714;', '#f0faf4', '#1a7a4a'
+                status_cell = (f'<span style="color:#1a7a4a;font-weight:600;">Active</span>'
+                               f'&nbsp;<span style="color:#888;font-size:11px;">({d_str})</span>')
+            rows += f"""
+            <tr style="background:{row_bg};">
+              <td style="padding:7px 10px;font-size:12px;color:{icon_color};font-weight:700;text-align:center;width:22px;">{icon}</td>
+              <td style="padding:7px 10px;font-size:12px;font-weight:600;color:#333;">{r['expected']}</td>
+              <td style="padding:7px 10px;font-size:12px;color:#555;">{r.get('ls_name') or '&mdash;'}</td>
+              <td style="padding:7px 10px;font-size:12px;color:#555;">{r.get('last_seen') or '&mdash;'}</td>
+              <td style="padding:7px 10px;font-size:12px;">{status_cell}</td>
+            </tr>"""
+            type_records.append({'expected': r['expected'], 'found': r['found'], 'days_ago': r['days_ago']})
+
+        detail = f"""
+        <table style="width:100%;border-collapse:collapse;">
+          <tr style="background:#f5f5f5;">
+            <th style="padding:6px 10px;font-size:11px;color:#888;text-align:left;border-bottom:1px solid #ddd;width:22px;"></th>
+            <th style="padding:6px 10px;font-size:11px;color:#888;text-align:left;border-bottom:1px solid #ddd;">Log Source Type</th>
+            <th style="padding:6px 10px;font-size:11px;color:#888;text-align:left;border-bottom:1px solid #ddd;">Log Source Name</th>
+            <th style="padding:6px 10px;font-size:11px;color:#888;text-align:left;border-bottom:1px solid #ddd;">Last Event</th>
+            <th style="padding:6px 10px;font-size:11px;color:#888;text-align:left;border-bottom:1px solid #ddd;">Status</th>
+          </tr>{rows}
+        </table>"""
+    else:
+        if OS_TYPE_GROUPS and not group_name:
+            _log(f"      WARNING: OS undetected for {hostname} — simple mode.")
+        enabled  = sorted([s for s in sources if s.get('enabled')],     key=lambda x: x.get('days_ago') or 99999)
+        disabled = sorted([s for s in sources if not s.get('enabled')], key=lambda x: x.get('days_ago') or 99999)
+        best        = (enabled or disabled or [None])[0]
+        host_status = 'active'
+        banner_bg   = '#1a7a4a'
+        banner_txt  = f'&#x2714;&nbsp; {hostname} &mdash; Confirmed Reporting on SIEM'
+        group_name  = None
+        if best:
+            dv     = best.get('days_ago')
+            ds     = 'Today' if dv == 0 else (f"{dv} days ago" if dv is not None else 'N/A')
+            detail = f"""
+            <table style="width:100%;border-collapse:collapse;">
+              <tr><td style="padding:7px 10px;font-size:12px;color:#555;width:160px;border-bottom:1px solid #eee;">Log Source Name</td>
+                  <td style="padding:7px 10px;font-size:12px;font-weight:600;color:#222;border-bottom:1px solid #eee;">{best.get('name','N/A')}</td></tr>
+              <tr><td style="padding:7px 10px;font-size:12px;color:#555;border-bottom:1px solid #eee;">Log Source Type</td>
+                  <td style="padding:7px 10px;font-size:12px;color:#333;border-bottom:1px solid #eee;">{best.get('ls_type','N/A')}</td></tr>
+              <tr><td style="padding:7px 10px;font-size:12px;color:#555;">Last Event</td>
+                  <td style="padding:7px 10px;font-size:12px;color:#333;">{best.get('last_seen','N/A')}
+                  &nbsp;<span style="color:#888;font-size:11px;">({ds})</span></td></tr>
+            </table>"""
+        else:
+            detail = ''
+
+    section = f"""
+    <div style="margin-bottom:20px;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;">
+      <div style="background:{banner_bg};color:#fff;padding:9px 14px;font-size:13px;font-weight:700;">{banner_txt}</div>
+      <div style="padding:0;">{detail}</div>
+    </div>"""
+    return section, host_status, type_records, group_name
+
+
+def _build_full_reply_html(hostname_list, host_sections, host_statuses, run_time):
+    badge_cfg = {'active': ('#1a7a4a', '&#x2714;'), 'partial': ('#c87800', '&#x26A0;'), 'not_found': ('#c0392b', '&#x2716;')}
+    badges = ''.join(
+        f'<span style="display:inline-block;background:{badge_cfg.get(hs,("#555","?"))[0]};color:#fff;'
+        f'padding:4px 12px;border-radius:12px;font-size:11px;font-weight:600;margin:0 4px 6px 0;">'
+        f'{badge_cfg.get(hs,("#555","?"))[1]}&nbsp;{hn}</span>'
+        for hn, hs in zip(hostname_list, host_statuses)
     )
-    return ('partial' if any_problem else 'active'), validation, group_name
+    count_label = f"{len(hostname_list)} host{'s' if len(hostname_list)!=1 else ''} checked"
+    return f"""<html>
+<body style="font-family:'Segoe UI',Arial,sans-serif;color:#222;font-size:13px;line-height:1.6;margin:0;padding:0;">
+  <div style="max-width:680px;padding:20px 0;">
+    <p style="margin:0 0 14px 0;">Hi,</p>
+    <p style="margin:0 0 10px 0;color:#555;font-size:12px;">Results for your SIEM Security Signoff request &mdash; {count_label}.</p>
+    <div style="margin-bottom:18px;">{badges}</div>
+    {''.join(host_sections)}
+    <p style="margin:20px 0 4px 0;color:#888;font-size:11px;">
+      Automated response from the SIEM monitoring system.<br>Checked against QRadar on {run_time}.
+    </p>
+    <p style="margin:14px 0 0 0;">Regards,<br><span style="font-weight:700;">Cyberdefence</span></p>
+  </div>
+</body></html>"""
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DRAFT CREATOR
-# ═══════════════════════════════════════════════════════════════════════════════
+def build_all_hosts_reply(hostname_list):
+    run_time       = datetime.now().strftime('%d %B %Y, %H:%M')
+    host_sections  = []
+    host_statuses  = []
+    host_records   = []
+    overall_status = 'active'
 
-def create_draft_reply(mail_item, html_body: str, overall_status: str,
-                       hostnames_str: str, is_revalidation: bool = False) -> bool:
+    for hostname in hostname_list:
+        _log(f"      Querying QRadar for [{hostname}]...")
+        qr = query_all_log_sources_readonly(hostname)
+        _log(f"      [{hostname}] {qr['status']} | {len(qr.get('sources',[]))} sources")
+        section, host_status, type_records, os_group = _build_host_html_section(hostname, qr)
+        host_sections.append(section)
+        host_statuses.append(host_status)
+        if STATUS_PRIORITY.get(host_status, 0) > STATUS_PRIORITY.get(overall_status, 0):
+            overall_status = host_status
+        host_records.append({'hostname': hostname, 'status': host_status,
+                             'os_group': os_group, 'type_results': type_records})
+        _log(f"      [{hostname}] -> {host_status.upper()}")
+
+    return _build_full_reply_html(hostname_list, host_sections, host_statuses, run_time), overall_status, host_records
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA STORE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_signoff_record(email_subject, sender, host_records,
+                         overall_status, is_revalidation, prior_status):
+    record = {
+        'run_id':            f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
+        'timestamp':         datetime.now().isoformat(),
+        'email_subject':     email_subject,
+        'sender':            sender,
+        'is_revalidation':   is_revalidation,
+        'prior_status':      prior_status,
+        'overall_status':    overall_status,
+        'hosts':             host_records,
+        'notes':             '',
+        'manually_resolved': False,
+        'historical':        False,
+    }
+    data = {'schema_version': 2, 'entries': []}
+    if os.path.exists(SIGNOFF_DATA_PATH):
+        try:
+            with open(SIGNOFF_DATA_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            _log(f"WARNING: Data read error (will overwrite): {e}")
+    data['entries'].append(record)
+    try:
+        # FIX 4: atomic write
+        _atomic_write_json(SIGNOFF_DATA_PATH, data)
+        _log(f"      Record written ({overall_status})")
+    except Exception as e:
+        _log(f"WARNING: Data write error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DRAFT CREATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_draft_reply(mail_item, html_body, hostname_list, overall_status, is_revalidation=False):
     tag_map = {'active': TAG_ACTIVE, 'partial': TAG_PARTIAL, 'not_found': TAG_NOT_FOUND}
-    tag    = tag_map.get(overall_status, TAG_ACTIVE)
-    prefix = '[Revalidated] ' if is_revalidation else ''
-
+    tag     = tag_map.get(overall_status, TAG_ACTIVE)
+    prefix  = '[Revalidated] ' if is_revalidation else ''
     try:
         reply          = mail_item.ReplyAll()
         reply.HTMLBody = html_body
         reply.Subject  = f"{prefix}{tag} {mail_item.Subject}"
-
-        use_escalation = (
-            overall_status in ('partial', 'not_found')
-            and (ESCALATION_TO or ESCALATION_CC)
-        )
-        if use_escalation:
-            reply.To = '; '.join(ESCALATION_TO) if ESCALATION_TO else ''
-            reply.CC = '; '.join(ESCALATION_CC) if ESCALATION_CC else ''
-            _log(f"      Escalation routing  To: {reply.To or '(none)'}  CC: {reply.CC or '(none)'}")
+        if overall_status in ('partial', 'not_found'):
+            if ESCALATION_TO: reply.To = '; '.join(ESCALATION_TO)
+            if ESCALATION_CC: reply.CC = '; '.join(ESCALATION_CC)
+            _log(f"      Escalation routing -> To:{reply.To} | CC:{reply.CC or '(none)'}")
         else:
-            _log(f"      ReplyAll (Active or escalation lists empty)")
-
+            _log(f"      ReplyAll (Active)")
         reply.Save()
-        _log(f"      Draft saved [{tag}] — {hostnames_str}"
-             f"{' [revalidation]' if is_revalidation else ''}")
+        _log(f"      Draft saved [{tag}]{' — REVAL' if is_revalidation else ''}")
         return True
-
     except Exception as e:
-        _log(f"      ERROR: Draft creation failed for {hostnames_str}: {e}")
+        _log(f"      ERROR: Draft failed: {e}")
         return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  OUTLOOK SETUP
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD — HTML WRITER  (paste your _write_dashboard_html body here)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def get_outlook_folders() -> tuple:
+def _write_dashboard_html(port: int):
+    try:
+        with open(SIGNOFF_DATA_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        _log(f"WARNING: Dashboard HTML generation skipped — could not read data: {e}")
+        return
+
+    json_blob        = json.dumps(data, ensure_ascii=False)
+    save_origin      = f'http://127.0.0.1:{port}' if port else ''
+    server_active_js = 'true' if port else 'false'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIEM Signoff Dashboard</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@300;400;500;600&display=swap');
+  *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0;}}
+  :root{{
+    --bg:#080b10;--surface:#0e1219;--surface2:#141820;--surface3:#1a2030;
+    --border:#1e2535;--border2:#252d40;
+    --green:#00d68f;--green-dim:#00d68f33;
+    --amber:#f0a500;--amber-dim:#f0a50033;
+    --red:#ff4d6d;--red-dim:#ff4d6d33;
+    --blue:#4d9fff;--blue-dim:#4d9fff33;
+    --purple:#b57bee;--purple-dim:#b57bee33;
+    --text:#dde3f0;--muted:#5a6480;--muted2:#3d4560;
+    --mono:'JetBrains Mono',monospace;--sans:'DM Sans',sans-serif;
+    --radius:10px;--transition:all .18s ease;
+  }}
+  html{{scroll-behavior:smooth;}}
+  body{{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;
+        min-height:100vh;overflow-x:hidden;}}
+
+  /* ── Scrollbar ─────────────────────────────────────────────── */
+  ::-webkit-scrollbar{{width:6px;height:6px;}}
+  ::-webkit-scrollbar-track{{background:var(--bg);}}
+  ::-webkit-scrollbar-thumb{{background:var(--border2);border-radius:3px;}}
+
+  /* ── Header ─────────────────────────────────────────────────── */
+  header{{
+    background:linear-gradient(180deg,var(--surface) 0%,rgba(14,18,25,.95) 100%);
+    border-bottom:1px solid var(--border);padding:0 32px;
+    display:flex;align-items:center;gap:20px;height:62px;
+    position:sticky;top:0;z-index:200;backdrop-filter:blur(12px);
+  }}
+  .logo{{display:flex;align-items:center;gap:10px;}}
+  .logo-dot{{width:8px;height:8px;border-radius:50%;background:var(--green);
+              box-shadow:0 0 8px var(--green);animation:pulse-dot 2.4s ease-in-out infinite;}}
+  @keyframes pulse-dot{{0%,100%{{opacity:1;}}50%{{opacity:.4;}}}}
+  .logo h1{{font-family:var(--mono);font-size:12px;font-weight:700;
+             letter-spacing:2px;color:var(--text);text-transform:uppercase;}}
+  .logo-sub{{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1px;margin-top:2px;}}
+  .spacer{{flex:1;}}
+  .hdr-controls{{display:flex;gap:8px;align-items:center;}}
+
+  /* ── Buttons ─────────────────────────────────────────────────── */
+  .btn{{
+    background:transparent;border:1px solid var(--border2);color:var(--muted);
+    border-radius:7px;font-size:11px;padding:6px 14px;cursor:pointer;
+    font-family:var(--mono);font-weight:600;letter-spacing:.3px;
+    transition:var(--transition);white-space:nowrap;
+  }}
+  .btn:hover:not(:disabled){{border-color:var(--blue);color:var(--blue);background:var(--blue-dim);}}
+  .btn:disabled{{opacity:.35;cursor:not-allowed;}}
+
+  .btn-save{{border-color:var(--green);color:var(--green);}}
+  .btn-save:hover:not(:disabled){{background:var(--green);color:#000;box-shadow:0 0 14px var(--green-dim);}}
+  .btn-save.dirty{{
+    background:var(--green-dim);border-color:var(--green);color:var(--green);
+    animation:save-pulse 1.8s ease-in-out infinite;
+  }}
+  @keyframes save-pulse{{0%,100%{{box-shadow:0 0 0 0 var(--green-dim);}}
+    50%{{box-shadow:0 0 0 5px transparent;}}}}
+
+  .btn-discard{{border-color:var(--red);color:var(--red);}}
+  .btn-discard:hover:not(:disabled){{background:var(--red-dim);}}
+  .btn-del{{border-color:var(--red-dim);color:var(--red);}}
+  .btn-del:hover{{background:var(--red);color:#fff;border-color:var(--red);}}
+  .btn-exp{{border-color:var(--amber-dim);color:var(--amber);}}
+  .btn-exp:hover{{background:var(--amber-dim);border-color:var(--amber);}}
+
+  /* ── Pill period selector ───────────────────────────────────── */
+  .pill-group{{display:flex;border:1px solid var(--border2);border-radius:7px;overflow:hidden;}}
+  .pill-group button{{
+    background:transparent;border:none;color:var(--muted);
+    font-family:var(--mono);font-size:11px;font-weight:600;
+    padding:6px 13px;cursor:pointer;transition:var(--transition);letter-spacing:.3px;
+  }}
+  .pill-group button.active{{background:var(--blue);color:#fff;}}
+  .pill-group button:not(.active):hover{{background:var(--surface3);color:var(--text);}}
+
+  /* ── Search ──────────────────────────────────────────────────── */
+  .search-wrap{{position:relative;}}
+  .search-wrap svg{{position:absolute;left:10px;top:50%;transform:translateY(-50%);
+                    color:var(--muted);pointer-events:none;}}
+  input[type=text]{{
+    background:var(--surface2);border:1px solid var(--border2);border-radius:7px;
+    color:var(--text);font-family:var(--mono);font-size:11px;
+    padding:6px 12px 6px 32px;width:210px;outline:none;transition:var(--transition);
+  }}
+  input[type=text]:focus{{border-color:var(--blue);background:var(--surface3);width:240px;}}
+
+  /* ── Dirty banner ────────────────────────────────────────────── */
+  #dirtyBanner{{
+    display:none;background:linear-gradient(90deg,#1a1200,#100800);
+    border-bottom:1px solid var(--amber);padding:8px 32px;
+    align-items:center;gap:10px;font-family:var(--mono);font-size:11px;color:var(--amber);
+  }}
+  #dirtyBanner.show{{display:flex;}}
+  #dirtyBanner .dbmsg{{flex:1;}}
+
+  /* ── Main ────────────────────────────────────────────────────── */
+  main{{padding:28px 32px;max-width:1440px;margin:0 auto;}}
+
+  /* ── Stat cards ──────────────────────────────────────────────── */
+  .stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:26px;}}
+  @media(max-width:900px){{.stats{{grid-template-columns:repeat(2,1fr);}}}}
+  .card{{
+    background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    padding:20px 22px;position:relative;overflow:hidden;cursor:default;
+    transition:var(--transition);
+  }}
+  .card:hover{{border-color:var(--border2);transform:translateY(-1px);}}
+  .card-accent{{position:absolute;top:0;left:0;right:0;height:2px;}}
+  .card.g .card-accent{{background:linear-gradient(90deg,var(--green),transparent);}}
+  .card.a .card-accent{{background:linear-gradient(90deg,var(--amber),transparent);}}
+  .card.r .card-accent{{background:linear-gradient(90deg,var(--red),transparent);}}
+  .card.b .card-accent{{background:linear-gradient(90deg,var(--blue),transparent);}}
+  .card.p .card-accent{{background:linear-gradient(90deg,var(--purple),transparent);}}
+  .card .num{{
+    font-family:var(--mono);font-size:38px;font-weight:700;
+    line-height:1;margin-bottom:8px;letter-spacing:-1px;
+  }}
+  .card.g .num{{color:var(--green);}} .card.a .num{{color:var(--amber);}}
+  .card.r .num{{color:var(--red);}}   .card.b .num{{color:var(--blue);}}
+  .card.p .num{{color:var(--purple);}}
+  .card .clabel{{color:var(--muted);font-size:10px;letter-spacing:1px;
+                 text-transform:uppercase;font-weight:600;}}
+  .card .sub{{color:var(--muted2);font-size:11px;margin-top:5px;}}
+
+  /* ── Charts ──────────────────────────────────────────────────── */
+  .charts-grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:26px;}}
+  @media(max-width:700px){{.charts-grid{{grid-template-columns:1fr;}}}}
+  .chart-card{{
+    background:var(--surface);border:1px solid var(--border);
+    border-radius:var(--radius);padding:20px 22px;
+  }}
+  .chart-card h3{{
+    font-family:var(--mono);font-size:10px;color:var(--muted);
+    margin-bottom:16px;letter-spacing:1.5px;text-transform:uppercase;
+  }}
+  .chart-row{{display:flex;align-items:center;gap:10px;margin-bottom:8px;}}
+  .chart-row .ck{{
+    width:96px;color:var(--text);font-family:var(--mono);font-size:10px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }}
+  .bar-track{{flex:1;background:var(--surface3);border-radius:4px;height:6px;overflow:hidden;}}
+  .bar-fill{{height:100%;border-radius:4px;transition:width .5s cubic-bezier(.4,0,.2,1);}}
+  .chart-row .cv{{
+    width:26px;text-align:right;color:var(--muted);
+    font-family:var(--mono);font-size:10px;
+  }}
+
+  /* ── Table wrapper ───────────────────────────────────────────── */
+  .table-wrap{{
+    background:var(--surface);border:1px solid var(--border);
+    border-radius:var(--radius);overflow:hidden;
+  }}
+  .table-header{{
+    padding:14px 20px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:12px;
+  }}
+  .table-header h2{{font-family:var(--mono);font-size:11px;font-weight:700;
+                    letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);}}
+  .rec-count{{
+    background:var(--surface3);border:1px solid var(--border2);
+    border-radius:20px;padding:2px 9px;font-family:var(--mono);font-size:10px;color:var(--muted);
+  }}
+  table{{width:100%;border-collapse:collapse;}}
+  th{{
+    background:var(--surface2);color:var(--muted);font-family:var(--mono);
+    font-size:10px;font-weight:600;letter-spacing:1px;text-align:left;
+    padding:10px 16px;border-bottom:1px solid var(--border);
+    cursor:pointer;user-select:none;white-space:nowrap;transition:var(--transition);
+    text-transform:uppercase;
+  }}
+  th:hover{{color:var(--text);}}
+  th .sort-arrow{{opacity:.3;margin-left:4px;font-size:9px;}}
+  th.sorted .sort-arrow{{opacity:1;color:var(--blue);}}
+  td{{
+    padding:11px 16px;border-bottom:1px solid var(--border);
+    vertical-align:middle;font-size:12px;transition:background .1s;
+  }}
+  tr:last-child td{{border-bottom:none;}}
+  tr:hover td{{background:var(--surface2);}}
+
+  /* ── Badges ──────────────────────────────────────────────────── */
+  .badge{{
+    display:inline-flex;align-items:center;gap:4px;
+    padding:3px 9px;border-radius:20px;font-size:10px;
+    font-family:var(--mono);font-weight:700;white-space:nowrap;
+    letter-spacing:.3px;
+  }}
+  .ba{{background:var(--green-dim);color:var(--green);border:1px solid #00d68f44;}}
+  .bp{{background:var(--amber-dim);color:var(--amber);border:1px solid #f0a50044;}}
+  .bn{{background:var(--red-dim);color:var(--red);border:1px solid #ff4d6d44;}}
+  .br{{background:var(--blue-dim);color:var(--blue);border:1px solid #4d9fff44;}}
+  .bh{{background:var(--purple-dim);color:var(--purple);border:1px solid #b57bee44;}}
+  .bx{{background:var(--muted2);color:var(--muted);border:1px solid var(--border2);}}
+
+  .hp{{
+    display:inline-block;background:var(--surface3);border:1px solid var(--border2);
+    border-radius:5px;padding:2px 8px;font-family:var(--mono);font-size:10px;
+    margin:2px 2px 2px 0;color:var(--text);
+  }}
+
+  /* ── Pagination ──────────────────────────────────────────────── */
+  .pag{{
+    display:flex;gap:5px;align-items:center;
+    padding:12px 16px;flex-wrap:wrap;border-top:1px solid var(--border);
+  }}
+  .pag button{{
+    background:var(--surface2);border:1px solid var(--border);color:var(--muted);
+    border-radius:5px;padding:4px 10px;font-size:11px;cursor:pointer;
+    font-family:var(--mono);transition:var(--transition);
+  }}
+  .pag button.active{{background:var(--blue);border-color:var(--blue);color:#fff;}}
+  .pag button:disabled{{opacity:.3;cursor:not-allowed;}}
+  .pag button:not(.active):not(:disabled):hover{{border-color:var(--blue);color:var(--blue);}}
+  .pag-info{{color:var(--muted);font-size:10px;margin-left:auto;font-family:var(--mono);}}
+  .empty{{
+    padding:56px;text-align:center;color:var(--muted);
+    font-family:var(--mono);font-size:12px;letter-spacing:.5px;
+  }}
+  .empty-icon{{font-size:32px;margin-bottom:12px;opacity:.4;}}
+
+  /* ── Notes cell ──────────────────────────────────────────────── */
+  .note-chip{{
+    display:inline-block;background:var(--blue-dim);border:1px solid var(--blue-dim);
+    border-radius:4px;padding:2px 8px;font-size:10px;color:var(--blue);
+    font-family:var(--mono);cursor:help;max-width:160px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }}
+
+  /* ── Modal ───────────────────────────────────────────────────── */
+  .modal-bg{{
+    display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
+    z-index:300;align-items:center;justify-content:center;backdrop-filter:blur(4px);
+  }}
+  .modal-bg.open{{display:flex;}}
+  .modal{{
+    background:var(--surface);border:1px solid var(--border2);
+    border-radius:14px;padding:30px 32px;width:500px;
+    max-width:95vw;max-height:88vh;overflow-y:auto;
+    animation:modal-in .2s cubic-bezier(.4,0,.2,1);
+  }}
+  @keyframes modal-in{{from{{opacity:0;transform:translateY(-10px) scale(.97);}}to{{opacity:1;transform:none;}}}}
+  .modal-title{{
+    font-family:var(--mono);font-size:12px;font-weight:700;color:var(--blue);
+    letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;
+  }}
+  .modal-subtitle{{font-size:11px;color:var(--muted);margin-bottom:22px;}}
+  .fr{{margin-bottom:16px;}}
+  .fr label{{
+    display:block;color:var(--muted);font-size:10px;font-weight:600;
+    margin-bottom:6px;text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);
+  }}
+  .fr select,.fr textarea{{
+    width:100%;background:var(--surface2);border:1px solid var(--border2);
+    border-radius:7px;color:var(--text);font-family:var(--mono);font-size:12px;
+    padding:9px 12px;outline:none;resize:vertical;transition:var(--transition);
+  }}
+  .fr select:focus,.fr textarea:focus{{border-color:var(--blue);background:var(--surface3);}}
+  .fr select option{{background:var(--surface2);}}
+  .modal-actions{{display:flex;gap:8px;margin-top:22px;justify-content:flex-end;}}
+
+  /* ── Toast ───────────────────────────────────────────────────── */
+  .toast-stack{{position:fixed;bottom:24px;right:24px;display:flex;flex-direction:column;gap:8px;z-index:999;}}
+  .toast{{
+    background:var(--surface);border:1px solid var(--border2);border-radius:8px;
+    padding:11px 18px;font-family:var(--mono);font-size:11px;
+    opacity:0;transform:translateX(12px);transition:all .25s;color:var(--text);
+    pointer-events:none;max-width:320px;
+  }}
+  .toast.show{{opacity:1;transform:translateX(0);}}
+  .toast.t-ok{{border-left:3px solid var(--green);color:var(--green);}}
+  .toast.t-err{{border-left:3px solid var(--red);color:var(--red);}}
+  .toast.t-warn{{border-left:3px solid var(--amber);color:var(--amber);}}
+  .toast.t-info{{border-left:3px solid var(--blue);color:var(--blue);}}
+</style>
+</head>
+<body>
+
+<!-- ── Unsaved-changes banner ──────────────────────────────── -->
+<div id="dirtyBanner">
+  <span class="dbmsg">&#x26A0;&nbsp; You have unsaved changes — they exist only in this browser tab.</span>
+  <button class="btn btn-discard" onclick="discardChanges()">Discard</button>
+</div>
+
+<header>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    <div>
+      <h1>SIEM Signoff Dashboard</h1>
+      <div class="logo-sub" id="lastUpdated"></div>
+    </div>
+  </div>
+  <div class="spacer"></div>
+  <div class="hdr-controls">
+    <div class="pill-group" id="pg">
+      <button onclick="setPeriod('week',this)" class="active">7D</button>
+      <button onclick="setPeriod('month',this)">30D</button>
+      <button onclick="setPeriod('quarter',this)">90D</button>
+      <button onclick="setPeriod('all',this)">ALL</button>
+    </div>
+    <div class="search-wrap">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+      </svg>
+      <input type="text" id="search" placeholder="Host / sender / notes..." oninput="render()">
+    </div>
+    <button class="btn btn-exp" onclick="exportJSON()">&#x2B07; Export</button>
+    <button class="btn btn-save" id="saveBtn" onclick="saveChanges()" disabled>
+      &#x2713; Save Changes
+    </button>
+  </div>
+</header>
+
+<main>
+  <div class="stats" id="statsCards"></div>
+  <div class="charts-grid">
+    <div class="chart-card"><h3>Status Breakdown</h3><div id="statusChart"></div></div>
+    <div class="chart-card"><h3>Top Hostnames by Requests</h3><div id="hostChart"></div></div>
+  </div>
+  <div class="table-wrap">
+    <div class="table-header">
+      <h2>Signoff Log</h2>
+      <span class="rec-count" id="recCount">0 records</span>
+      <div class="spacer"></div>
+    </div>
+    <table>
+      <thead><tr>
+        <th onclick="sortBy('timestamp')" id="th-timestamp">
+          Timestamp<span class="sort-arrow">&#x25BC;</span>
+        </th>
+        <th>Hostnames</th>
+        <th onclick="sortBy('overall_status')" id="th-overall_status">
+          Status<span class="sort-arrow">&#x25BC;</span>
+        </th>
+        <th onclick="sortBy('sender')" id="th-sender">
+          Sender<span class="sort-arrow">&#x25BC;</span>
+        </th>
+        <th>Flags</th>
+        <th>Notes</th>
+        <th style="min-width:110px;text-align:right;">Actions</th>
+      </tr></thead>
+      <tbody id="logBody"></tbody>
+    </table>
+    <div class="pag" id="pag"></div>
+  </div>
+</main>
+
+<!-- ── Edit modal ─────────────────────────────────────────────── -->
+<div class="modal-bg" id="mb" onclick="if(event.target===this)closeMod()">
+  <div class="modal">
+    <div class="modal-title">Edit Record</div>
+    <div class="modal-subtitle" id="modal-host-label"></div>
+    <div class="fr">
+      <label>Override Status</label>
+      <select id="eStatus">
+        <option value="">— keep current —</option>
+        <option value="active">Active</option>
+        <option value="partial">Partial</option>
+        <option value="not_found">Not Found</option>
+      </select>
+    </div>
+    <div class="fr">
+      <label>Manually Resolved</label>
+      <select id="eResolved">
+        <option value="false">No — still open</option>
+        <option value="true">Yes — resolved, exclude from dedup</option>
+      </select>
+    </div>
+    <div class="fr">
+      <label>Notes (ticket ID, actions taken...)</label>
+      <textarea id="eNotes" rows="4" placeholder="e.g. TICKET-1234 — onboarding initiated..."></textarea>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeMod()">Cancel</button>
+      <button class="btn btn-save" onclick="saveEdit()">&#x2713; Apply Changes</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-stack" id="toastStack"></div>
+
+<script>
+// ═══════════════════════════════════════════════
+// Bootstrap
+// ═══════════════════════════════════════════════
+const EMBEDDED      = {json_blob};
+const SERVER_ACTIVE = {server_active_js};
+const SAVE_URL      = '{save_origin}/save';
+const DATA_URL      = '{save_origin}/data.json';
+
+let RAW;          // last persisted snapshot
+let D;            // working copy — only differs from RAW when dirty
+let _dirty = false;
+
+let sf = 'timestamp', sasc = false, page = 1, eidx = null;
+const PS = 15;
+let _period = 'week';
+
+async function init() {{
+  if (SERVER_ACTIVE) {{
+    try {{
+      const r = await fetch(DATA_URL, {{cache:'no-cache'}});
+      if (r.ok) {{
+        RAW = await r.json();
+        D   = deepClone(RAW);
+        render();
+        return;
+      }}
+    }} catch(e) {{
+      console.warn('Live fetch failed, using embedded snapshot:', e);
+    }}
+  }}
+  RAW = EMBEDDED;
+  D   = deepClone(RAW);
+  render();
+}}
+
+function deepClone(o) {{ return JSON.parse(JSON.stringify(o)); }}
+
+// ═══════════════════════════════════════════════
+// Dirty-state management
+// ═══════════════════════════════════════════════
+function markDirty() {{
+  _dirty = true;
+  document.getElementById('saveBanner')?.classList?.add('show');
+  document.getElementById('dirtyBanner').classList.add('show');
+  const btn = document.getElementById('saveBtn');
+  btn.disabled = false;
+  btn.classList.add('dirty');
+}}
+
+function markClean() {{
+  _dirty = false;
+  document.getElementById('dirtyBanner').classList.remove('show');
+  const btn = document.getElementById('saveBtn');
+  btn.disabled = true;
+  btn.classList.remove('dirty');
+}}
+
+// ═══════════════════════════════════════════════
+// Save / discard
+// ═══════════════════════════════════════════════
+async function saveChanges() {{
+  if (!_dirty) return;
+  const btn = document.getElementById('saveBtn');
+  btn.textContent = 'Saving…';
+  btn.disabled = true;
+
+  if (SERVER_ACTIVE) {{
+    try {{
+      const r = await fetch(SAVE_URL, {{
+        method: 'POST',
+        headers: {{'Content-Type':'application/json'}},
+        body: JSON.stringify(D),
+      }});
+      if (r.ok) {{
+        RAW = deepClone(D);
+        markClean();
+        btn.textContent = '✓ Save Changes';
+        showToast('Saved to signoff_data.json', 'ok');
+        return;
+      }}
+      throw new Error('HTTP ' + r.status);
+    }} catch(e) {{
+      btn.disabled = false;
+      btn.classList.add('dirty');
+      btn.textContent = '✓ Save Changes';
+      showToast('Server save failed — downloaded JSON instead. Replace signoff_data.json manually.', 'warn');
+      _downloadJSON();
+      return;
+    }}
+  }}
+
+  // file:// mode — download
+  _downloadJSON();
+  RAW = deepClone(D);
+  markClean();
+  btn.textContent = '✓ Save Changes';
+  showToast('Downloaded JSON — replace your signoff_data.json with this file', 'warn');
+}}
+
+function discardChanges() {{
+  if (!confirm('Discard all unsaved changes and revert to the last saved state?')) return;
+  D = deepClone(RAW);
+  markClean();
+  page = 1;
+  render();
+  showToast('Changes discarded', 'warn');
+}}
+
+// ═══════════════════════════════════════════════
+// Delete
+// ═══════════════════════════════════════════════
+function deleteRow(gi) {{
+  const entry = D.entries[gi];
+  const label = (entry.hosts||[]).map(h=>h.hostname||'?').join(', ') || 'this record';
+  if (!confirm(`Permanently delete the record for "${{label}}"?\\n\\nClick Save Changes to write this to disk.`)) return;
+  D.entries.splice(gi, 1);
+  markDirty();
+  // Stay on same page if possible
+  const pages = Math.max(1, Math.ceil(filtered().length / PS));
+  if (page > pages) page = pages;
+  render();
+  showToast('Row deleted — click Save Changes to persist', 'warn');
+}}
+
+// ═══════════════════════════════════════════════
+// Edit modal
+// ═══════════════════════════════════════════════
+function openMod(gi) {{
+  eidx = gi;
+  const e = D.entries[gi];
+  const hosts = (e.hosts||[]).map(h=>h.hostname||'?').join(', ');
+  document.getElementById('modal-host-label').textContent = hosts || e.email_subject || '';
+  document.getElementById('eStatus').value   = e.overall_status || '';
+  document.getElementById('eResolved').value = e.manually_resolved ? 'true' : 'false';
+  document.getElementById('eNotes').value    = e.notes || '';
+  document.getElementById('mb').classList.add('open');
+}}
+
+function closeMod() {{
+  document.getElementById('mb').classList.remove('open');
+  eidx = null;
+}}
+
+function saveEdit() {{
+  if (eidx === null) return;
+  const e  = D.entries[eidx];
+  const ns = document.getElementById('eStatus').value;
+  if (ns) e.overall_status = ns;
+  e.manually_resolved = document.getElementById('eResolved').value === 'true';
+  e.notes = document.getElementById('eNotes').value.trim();
+  closeMod();
+  markDirty();
+  render();
+  showToast('Edit applied — click Save Changes to persist', 'info');
+}}
+
+// ═══════════════════════════════════════════════
+// Filtering / sorting / pagination
+// ═══════════════════════════════════════════════
+function periodCutoff() {{
+  const days = {{week:7, month:30, quarter:90, all:36500}};
+  return new Date(Date.now() - (days[_period]||7) * 86400000);
+}}
+
+function filtered() {{
+  const q = (document.getElementById('search').value||'').toLowerCase().trim();
+  const c = periodCutoff();
+  return D.entries.filter(e => {{
+    if (new Date(e.timestamp) < c) return false;
+    if (!q) return true;
+    const hosts  = (e.hosts||[]).map(x=>x.hostname||'').join(' ').toLowerCase();
+    const sender = (e.sender||'').toLowerCase();
+    const notes  = (e.notes||'').toLowerCase();
+    const subj   = (e.email_subject||'').toLowerCase();
+    return hosts.includes(q) || sender.includes(q) || notes.includes(q) || subj.includes(q);
+  }});
+}}
+
+function srt(arr) {{
+  return [...arr].sort((a, b) => {{
+    let av, bv;
+    if      (sf==='timestamp')      {{ av=a.timestamp||'';      bv=b.timestamp||''; }}
+    else if (sf==='overall_status') {{ av=a.overall_status||''; bv=b.overall_status||''; }}
+    else if (sf==='sender')         {{ av=a.sender||'';         bv=b.sender||''; }}
+    else                            {{ av=''; bv=''; }}
+    if (av < bv) return sasc ? -1 :  1;
+    if (av > bv) return sasc ?  1 : -1;
+    return 0;
+  }});
+}}
+
+// ═══════════════════════════════════════════════
+// Badges & formatting
+// ═══════════════════════════════════════════════
+function statusBadge(status, resolved, reval, hist) {{
+  if (resolved) return '<span class="badge bx">&#x2714; Resolved</span>';
+  if (hist)     return '<span class="badge bh">&#x2605; Historical</span>';
+  const icons = {{active:'&#x2714;', partial:'&#x26A0;', not_found:'&#x2716;'}};
+  const cls   = {{active:'ba',       partial:'bp',       not_found:'bn'}};
+  const label = {{active:'Active',   partial:'Partial',  not_found:'Not Found'}};
+  const base  = `<span class="badge ${{cls[status]||'bx'}}">${{icons[status]||'?'}}&nbsp;${{label[status]||status}}</span>`;
+  return base + (reval ? ' <span class="badge br">&#x21BB; Reval</span>' : '');
+}}
+
+function fmtDate(iso) {{
+  if (!iso) return '&mdash;';
+  const d = new Date(iso);
+  const date = d.toLocaleDateString('en-GB',{{day:'2-digit',month:'short',year:'numeric'}});
+  const time = d.toLocaleTimeString('en-GB',{{hour:'2-digit',minute:'2-digit'}});
+  return `<span style="color:var(--text)">${{date}}</span> <span style="color:var(--muted);font-size:10px">${{time}}</span>`;
+}}
+
+function fmtSender(sender) {{
+  if (!sender) return '<span style="color:var(--muted2)">—</span>';
+  const parts = sender.split('@');
+  if (parts.length < 2) return `<span style="font-family:var(--mono);font-size:11px">${{sender}}</span>`;
+  return `<span style="font-family:var(--mono);font-size:11px;color:var(--text)">${{parts[0]}}</span>` +
+         `<span style="font-family:var(--mono);font-size:10px;color:var(--muted)">@${{parts[1]}}</span>`;
+}}
+
+// ═══════════════════════════════════════════════
+// Render
+// ═══════════════════════════════════════════════
+function render() {{
+  const e     = srt(filtered());
+  const tot   = e.length;
+  const pages = Math.max(1, Math.ceil(tot / PS));
+  if (page > pages) page = 1;
+  const sl = e.slice((page-1)*PS, page*PS);
+
+  document.getElementById('recCount').textContent =
+    `${{tot}} record${{tot!==1?'s':''}}`;
+
+  // Update sort header highlights
+  ['timestamp','overall_status','sender'].forEach(f => {{
+    const th = document.getElementById('th-'+f);
+    if (!th) return;
+    th.classList.toggle('sorted', sf===f);
+    const arrow = th.querySelector('.sort-arrow');
+    if (arrow) arrow.textContent = (sf===f && sasc) ? '▲' : '▼';
+  }});
+
+  const body = document.getElementById('logBody');
+  if (!sl.length) {{
+    body.innerHTML = `<tr><td colspan="7">
+      <div class="empty"><div class="empty-icon">&#x1F50D;</div>No records match this filter.</div>
+    </td></tr>`;
+  }} else {{
+    body.innerHTML = sl.map((x, i) => {{
+      // gi = true index in D.entries, stable even after filtering/sorting
+      const gi    = D.entries.indexOf(e[(page-1)*PS + i]);
+      const hosts = (x.hosts||[]).map(h =>
+        `<span class="hp" title="${{h.hostname||''}}">${{h.hostname||'?'}}</span>`
+      ).join('');
+
+      const flagParts = [];
+      if (x.historical)      flagParts.push('<span style="color:var(--purple);font-size:10px;font-family:var(--mono)">imported</span>');
+      else if (x.prior_status) flagParts.push(`<span style="color:var(--muted);font-size:10px;font-family:var(--mono)">prior:&nbsp;${{x.prior_status.replace(/\[Processed-?/i,'').replace(']','').toLowerCase()}}</span>`);
+      else                   flagParts.push('<span style="color:var(--muted2);font-size:10px;font-family:var(--mono)">new</span>');
+
+      const noteCell = x.notes
+        ? `<span class="note-chip" title="${{x.notes.replace(/"/g,'&quot;')}}">${{x.notes}}</span>`
+        : '<span style="color:var(--muted2);font-size:10px">—</span>';
+
+      return `<tr>
+        <td style="white-space:nowrap;font-family:var(--mono);font-size:11px;">${{fmtDate(x.timestamp)}}</td>
+        <td>${{hosts}}</td>
+        <td>${{statusBadge(x.overall_status, x.manually_resolved, x.is_revalidation, x.historical)}}</td>
+        <td style="white-space:nowrap;">${{fmtSender(x.sender)}}</td>
+        <td>${{flagParts.join('')}}</td>
+        <td>${{noteCell}}</td>
+        <td style="text-align:right;white-space:nowrap;">
+          <button class="btn" onclick="openMod(${{gi}})">Edit</button>
+          <button class="btn btn-del" onclick="deleteRow(${{gi}})" title="Delete this record">&#x2715;</button>
+        </td>
+      </tr>`;
+    }}).join('');
+  }}
+
+  // Pagination
+  let ph = `<button onclick="goP(${{page-1}})" ${{page===1?'disabled':''}}>&#x2039; Prev</button>`;
+  const s = Math.max(1,page-2), en = Math.min(pages,page+2);
+  if (s>1) ph += `<button onclick="goP(1)">1</button>${{s>2?'<span style="color:var(--muted);padding:0 4px">…</span>':''}}`;
+  for (let p=s;p<=en;p++) ph += `<button onclick="goP(${{p}})" class="${{p===page?'active':''}}">${{p}}</button>`;
+  if (en<pages) ph += `${{en<pages-1?'<span style="color:var(--muted);padding:0 4px">…</span>':''}}<button onclick="goP(${{pages}})">${{pages}}</button>`;
+  ph += `<button onclick="goP(${{page+1}})" ${{page===pages?'disabled':''}}>Next &#x203A;</button>
+         <span class="pag-info">${{tot}} record${{tot!==1?'s':''}}&nbsp;·&nbsp;page ${{page}}/${{pages}}</span>`;
+  document.getElementById('pag').innerHTML = ph;
+
+  renderStats(filtered());
+  renderCharts(filtered());
+}}
+
+function goP(p) {{ page=p; render(); window.scrollTo({{top:0,behavior:'smooth'}}); }}
+function sortBy(f) {{ sf===f ? sasc=!sasc : (sf=f, sasc=false); render(); }}
+function setPeriod(p,btn) {{
+  _period=p; page=1;
+  document.querySelectorAll('#pg button').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  render();
+}}
+
+// ═══════════════════════════════════════════════
+// Stats cards
+// ═══════════════════════════════════════════════
+function renderStats(e) {{
+  const total  = e.length;
+  const active = e.filter(x=>x.overall_status==='active'    && !x.manually_resolved && !x.historical).length;
+  const partial= e.filter(x=>x.overall_status==='partial'   && !x.manually_resolved && !x.historical).length;
+  const notfnd = e.filter(x=>x.overall_status==='not_found' && !x.manually_resolved && !x.historical).length;
+  const hist   = e.filter(x=>x.historical).length;
+  const revals = e.filter(x=>x.is_revalidation).length;
+  const pct    = total ? Math.round(active/total*100) : 0;
+
+  document.getElementById('statsCards').innerHTML = `
+    <div class="card b"><div class="card-accent"></div>
+      <div class="num">${{total}}</div>
+      <div class="clabel">Total Signoffs</div>
+      <div class="sub">${{revals}} revalidation${{revals!==1?'s':''}}</div></div>
+    <div class="card g"><div class="card-accent"></div>
+      <div class="num">${{active}}</div>
+      <div class="clabel">Active</div>
+      <div class="sub">${{pct}}% of period</div></div>
+    <div class="card a"><div class="card-accent"></div>
+      <div class="num">${{partial}}</div>
+      <div class="clabel">Partial</div>
+      <div class="sub">Missing log sources</div></div>
+    <div class="card r"><div class="card-accent"></div>
+      <div class="num">${{notfnd}}</div>
+      <div class="clabel">Not Found</div>
+      <div class="sub">${{e.filter(x=>x.manually_resolved).length}} resolved</div></div>
+    <div class="card p"><div class="card-accent"></div>
+      <div class="num">${{hist}}</div>
+      <div class="clabel">Historical</div>
+      <div class="sub">Legacy imported</div></div>`;
+}}
+
+// ═══════════════════════════════════════════════
+// Charts
+// ═══════════════════════════════════════════════
+function renderCharts(e) {{
+  // Status chart
+  const sm = {{}};
+  e.forEach(x => {{
+    const k = x.manually_resolved ? 'resolved' : (x.historical ? 'historical' : (x.overall_status||'unknown'));
+    sm[k] = (sm[k]||0) + 1;
+  }});
+  const colorMap = {{
+    active:'var(--green)', partial:'var(--amber)', not_found:'var(--red)',
+    resolved:'var(--muted)', historical:'var(--purple)', unknown:'var(--border2)',
+  }};
+  barChart(
+    document.getElementById('statusChart'),
+    Object.entries(sm).map(([k,v])=>{{return{{k,v}}}}).sort((a,b)=>b.v-a.v),
+    k => colorMap[k] || 'var(--blue)'
+  );
+
+  // Host chart — count by hostname across all entries in period
+  const hm = {{}};
+  e.forEach(x => (x.hosts||[]).forEach(h => {{
+    if (h.hostname) hm[h.hostname] = (hm[h.hostname]||0) + 1;
+  }}));
+  barChart(
+    document.getElementById('hostChart'),
+    Object.entries(hm).map(([k,v])=>{{return{{k,v}}}}).sort((a,b)=>b.v-a.v).slice(0,10),
+    () => 'var(--blue)'
+  );
+}}
+
+function barChart(el, items, colorFn) {{
+  if (!items.length) {{ el.innerHTML = '<div style="color:var(--muted);font-family:var(--mono);font-size:11px;text-align:center;padding:20px 0;">No data</div>'; return; }}
+  const mx = Math.max(...items.map(i=>i.v), 1);
+  el.innerHTML = items.map(i => `
+    <div class="chart-row">
+      <span class="ck" title="${{i.k}}">${{i.k}}</span>
+      <div class="bar-track">
+        <div class="bar-fill" style="width:${{Math.round(i.v/mx*100)}}%;background:${{colorFn(i.k)}}"></div>
+      </div>
+      <span class="cv">${{i.v}}</span>
+    </div>`).join('');
+}}
+
+// ═══════════════════════════════════════════════
+// Export
+// ═══════════════════════════════════════════════
+function _downloadJSON() {{
+  const b = new Blob([JSON.stringify(D,null,2)],{{type:'application/json'}});
+  Object.assign(document.createElement('a'),{{
+    href:URL.createObjectURL(b), download:'signoff_data.json'
+  }}).click();
+}}
+function exportJSON() {{
+  _downloadJSON();
+  showToast('Exported current view as JSON', 'info');
+}}
+
+// ═══════════════════════════════════════════════
+// Toast
+// ═══════════════════════════════════════════════
+function showToast(msg, type='ok') {{
+  const stack = document.getElementById('toastStack');
+  const el    = document.createElement('div');
+  el.className = `toast t-${{type}}`;
+  el.textContent = msg;
+  stack.appendChild(el);
+  requestAnimationFrame(() => {{ el.classList.add('show'); }});
+  setTimeout(() => {{
+    el.classList.remove('show');
+    setTimeout(() => el.remove(), 300);
+  }}, 4000);
+}}
+
+// ═══════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════
+const _last = EMBEDDED.entries?.length
+  ? EMBEDDED.entries[EMBEDDED.entries.length-1]?.timestamp
+  : null;
+document.getElementById('lastUpdated').textContent =
+  _last
+    ? 'Last run: ' + new Date(_last).toLocaleDateString('en-GB',{{day:'2-digit',month:'short',year:'numeric'}})
+    : 'No data yet';
+
+init();
+</script>
+</body>
+</html>"""
+
+    try:
+        with open(DASHBOARD_PATH, 'w', encoding='utf-8') as f:
+            f.write(html)
+    except Exception as e:
+        _log(f"WARNING: Dashboard HTML write error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD — ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_dashboard():
+    """Start HTTP server (if enabled), write HTML, open browser."""
+    _log("Generating dashboard...")
+    port = _start_dashboard_server()    # starts server + timer; returns 0 if disabled
+    _write_dashboard_html(port)
+
+    if port:
+        url = f'http://127.0.0.1:{port}/'
+        _log(f"Dashboard URL : {url}")
+        _log(f"  Edits will auto-save to signoff_data.json (server up for {DASHBOARD_SERVE_MINUTES} min).")
+    else:
+        url = "file:///" + DASHBOARD_PATH.replace(os.sep, '/')
+        _log(f"Dashboard URL : {url}")
+        _log("  Note: server disabled (DASHBOARD_SERVE_MINUTES=0). "
+             "Saves will download JSON — replace signoff_data.json manually.")
+
+    try:
+        webbrowser.open(url)
+    except Exception as e:
+        _log(f"WARNING: Could not open browser: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OUTLOOK SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_outlook_folders():
     try:
         outlook    = win32com.client.Dispatch('Outlook.Application')
         ns         = outlook.GetNamespace('MAPI')
         main_inbox = ns.GetDefaultFolder(6)
         drafts     = ns.GetDefaultFolder(16)
         sent       = ns.GetDefaultFolder(5)
-
         if SIGNOFF_FOLDER_NAME:
             try:
                 inbox = main_inbox.Folders[SIGNOFF_FOLDER_NAME]
-                _log(f"Monitoring: Inbox\\{SIGNOFF_FOLDER_NAME}")
+                _log(f"Folder: Inbox\\{SIGNOFF_FOLDER_NAME}")
             except Exception:
-                _log(f"WARN: Subfolder '{SIGNOFF_FOLDER_NAME}' not found — falling back to Inbox.")
+                _log(f"WARNING: '{SIGNOFF_FOLDER_NAME}' not found — using full Inbox.")
                 inbox = main_inbox
         else:
             inbox = main_inbox
-            _log("Monitoring: Full Inbox")
-
         return inbox, drafts, sent
     except Exception as e:
-        _log(f"ERROR: Could not connect to Outlook: {e}")
+        _log(f"ERROR: Outlook connect failed: {e}")
         return None, None, None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DASHBOARD GENERATOR  (v3.1: auto-opens on run completion)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
-def generate_dashboard() -> None:
-    data = _load_data()
-    try:
-        html = _build_dashboard_html(data["records"])
-        with open(DASHBOARD_PATH, 'w', encoding='utf-8') as f:
-            f.write(html)
-        _log(f"Dashboard written → {DASHBOARD_PATH}  ({len(data['records'])} records)")
-    except Exception as e:
-        _log(f"WARN: Dashboard generation failed: {e}")
-        return
-
-    # v3.1: auto-open dashboard in the default browser
-    try:
-        os.startfile(DASHBOARD_PATH)
-        _log("Dashboard opened in browser.")
-    except Exception as e:
-        _log(f"INFO: Could not auto-open dashboard: {e}")
-
-
-def _build_dashboard_html(records: list) -> str:
-    data_json  = json.dumps(records, ensure_ascii=False, default=str)
-    generated  = datetime.now().strftime('%d %B %Y at %H:%M')
-    rcd        = str(REVALIDATION_COOLDOWN_DAYS)
-    rwd        = str(LOOKBACK_DAYS)
-    return (
-        _DASHBOARD_TMPL
-        .replace('%%DATA_JSON%%',  data_json)
-        .replace('%%GENERATED%%',  generated)
-        .replace('%%REVAL_COOL%%', rcd)
-        .replace('%%LOOKBACK%%',   rwd)
-        .replace('%%VERSION%%',    VERSION)
-        .replace('%%OVPATH%%',     _OVERRIDES_PATH)
-    )
-
-
-# ─── Dashboard HTML template ──────────────────────────────────────────────────
-# v3.1 changes:
-#   • Status filter pills REMOVED from table header
-#   • OS-group dropdown REMOVED from table header
-#   • Quick-delete (🗑) button added to every row — no modal, 10-second undo
-#   • Cleaner card design: gradient accent top-border, tighter spacing
-#   • Table: sticky header, subtle alternating rows, sharper type
-#   • Modal kept for full edit/override/note workflow
-# ─────────────────────────────────────────────────────────────────────────────
-_DASHBOARD_TMPL = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>SIEM Signoff Dashboard v%%VERSION%%</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg0:#07111e;--bg1:#0d1929;--bg2:#112236;--bg3:#162b42;
-  --bdr:#1e3352;--bdr2:#162544;
-  --t0:#f0f6ff;--t1:#c5d4ee;--t2:#7e9cbf;--t3:#435e7a;
-  --green:#22c55e;--gd:#15803d;--gbg:#071812;
-  --amber:#f59e0b;--ad:#b45309;--abg:#1a1106;
-  --red:#f87171;--rd:#b91c1c;--rbg:#1a0808;
-  --blue:#60a5fa;--bd:#1d4ed8;--bbg:#06122a;
-  --purple:#a78bfa;--pbg:#130f28;
-  --mono:'Consolas','Cascadia Code','Courier New',monospace;
-  --r:10px;--r2:6px;
-  --shadow:0 1px 3px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.3);
-}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg0);color:var(--t1);font-size:13px;line-height:1.5;min-height:100vh}
-
-/* ── Header ── */
-.hdr{
-  background:var(--bg1);
-  border-bottom:1px solid var(--bdr);
-  padding:11px 24px;
-  display:flex;align-items:center;justify-content:space-between;
-  position:sticky;top:0;z-index:100;gap:12px;flex-wrap:wrap;
-}
-.hdr-l{display:flex;align-items:center;gap:10px}
-.hdr h1{font-size:14px;font-weight:600;color:var(--t0);letter-spacing:-.01em}
-.badge{font-size:10px;padding:2px 8px;border-radius:20px;font-weight:600;letter-spacing:.3px}
-.bqr{background:var(--pbg);color:var(--purple);border:1px solid #4c2d8a}
-.bv {background:var(--bbg);color:var(--blue);border:1px solid #1e3a7a}
-.hdr-r{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.hdr-ts{font-size:11px;color:var(--t3)}
-.btn{
-  background:var(--bg2);border:1px solid var(--bdr);color:var(--t2);
-  padding:5px 13px;border-radius:var(--r2);cursor:pointer;
-  font-size:12px;font-family:inherit;transition:all .14s;white-space:nowrap;
-}
-.btn:hover{border-color:var(--blue);color:var(--t0);background:var(--bg3)}
-.btn-sm{padding:4px 10px;font-size:11px}
-.btn-pri{background:var(--bbg);border-color:#1e4080;color:var(--blue)}
-.btn-pri:hover{background:var(--blue);color:#fff;border-color:var(--blue)}
-.btn-del{
-  background:transparent;border:1px solid transparent;
-  color:var(--t3);padding:3px 7px;border-radius:var(--r2);
-  cursor:pointer;font-size:13px;font-family:inherit;
-  transition:all .14s;line-height:1;
-}
-.btn-del:hover{background:var(--rbg);border-color:var(--rd);color:var(--red)}
-.btn-edit{
-  background:transparent;border:1px solid transparent;
-  color:var(--t3);padding:3px 7px;border-radius:var(--r2);
-  cursor:pointer;font-size:13px;font-family:inherit;
-  transition:all .14s;line-height:1;
-}
-.btn-edit:hover{background:var(--bbg);border-color:#1e4080;color:var(--blue)}
-
-/* ── Layout ── */
-.main{padding:18px 24px;max-width:1440px}
-
-/* ── Period bar ── */
-.pbar{display:flex;gap:4px;margin-bottom:16px;align-items:center;flex-wrap:wrap}
-.pbar .sep{width:1px;height:16px;background:var(--bdr);margin:0 6px}
-.pbtn{
-  background:transparent;border:1px solid var(--bdr);color:var(--t3);
-  padding:4px 13px;border-radius:20px;cursor:pointer;font-size:12px;
-  font-family:inherit;transition:all .14s;
-}
-.pbtn:hover{border-color:var(--blue);color:var(--t1)}
-.pbtn.active{background:var(--bbg);border-color:#1e4080;color:var(--blue);font-weight:500}
-
-/* ── KPI Cards ── */
-.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
-.card{
-  background:var(--bg1);border:1px solid var(--bdr);border-radius:var(--r);
-  padding:14px 16px;position:relative;overflow:hidden;
-}
-.card::before{
-  content:'';position:absolute;top:0;left:0;right:0;height:2px;
-  border-radius:var(--r) var(--r) 0 0;
-}
-.card.cb::before{background:linear-gradient(90deg,var(--blue),#3b82f620)}
-.card.cg::before{background:linear-gradient(90deg,var(--green),#22c55e20)}
-.card.ca::before{background:linear-gradient(90deg,var(--amber),#f59e0b20)}
-.card.cr::before{background:linear-gradient(90deg,var(--red),#f8717120)}
-.card.cp::before{background:linear-gradient(90deg,var(--purple),#a78bfa20)}
-.card-lbl{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:var(--t3);margin-bottom:8px}
-.card-val{font-size:28px;font-weight:700;line-height:1;color:var(--t0);letter-spacing:-.02em}
-.card-sub{font-size:11px;color:var(--t3);margin-top:4px}
-.card.cg .card-val{color:var(--green)}
-.card.ca .card-val{color:var(--amber)}
-.card.cr .card-val{color:var(--red)}
-.card.cb .card-val{color:var(--blue)}
-.card.cp .card-val{color:var(--purple)}
-
-/* ── Charts ── */
-.charts{display:grid;grid-template-columns:220px 1fr;gap:10px;margin-bottom:16px}
-.cbox{background:var(--bg1);border:1px solid var(--bdr);border-radius:var(--r);padding:16px}
-.clbl{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:var(--t3);margin-bottom:12px}
-.leg{display:flex;flex-direction:column;gap:7px;margin-top:12px}
-.leg-r{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--t2)}
-.leg-d{width:8px;height:8px;border-radius:2px;flex-shrink:0}
-
-/* ── Table wrapper ── */
-.twrap{background:var(--bg1);border:1px solid var(--bdr);border-radius:var(--r);overflow:hidden}
-.ttbar{
-  display:flex;align-items:center;gap:10px;
-  padding:12px 16px;border-bottom:1px solid var(--bdr);flex-wrap:wrap;
-}
-.ttitle{font-size:11px;font-weight:600;color:var(--t0);letter-spacing:-.01em}
-.trcount{font-size:11px;color:var(--t3)}
-.sp1{flex:1}
-.srch{
-  background:var(--bg0);border:1px solid var(--bdr);border-radius:var(--r2);
-  color:var(--t0);padding:5px 11px;font-size:12px;width:200px;font-family:inherit;
-  transition:border-color .14s;
-}
-.srch:focus{outline:none;border-color:var(--blue)}
-.srch::placeholder{color:var(--t3)}
-
-/* ── Table ── */
-table{width:100%;border-collapse:collapse}
-thead{position:sticky;top:49px;z-index:10}
-th{
-  background:var(--bg0);color:var(--t3);font-size:10px;font-weight:600;
-  text-align:left;padding:9px 13px;border-bottom:1px solid var(--bdr);
-  text-transform:uppercase;letter-spacing:.5px;cursor:pointer;
-  white-space:nowrap;user-select:none;transition:color .12s;
-}
-th:hover{color:var(--t1)}
-th.sa::after{content:' ▲';color:var(--blue);font-size:9px}
-th.sd::after{content:' ▼';color:var(--blue);font-size:9px}
-td{padding:10px 13px;border-bottom:1px solid var(--bdr2);vertical-align:middle;font-size:12px}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:var(--bg2)}
-tr.drow td{opacity:.35;text-decoration:line-through}
-.hn{font-family:var(--mono);font-size:12px;font-weight:500;color:var(--t0)}
-.hndel{color:var(--t3)}
-.sb{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.3px;white-space:nowrap}
-.sa1{background:rgba(34,197,94,.1);color:var(--green);border:1px solid var(--gd)}
-.sp3{background:rgba(245,158,11,.1);color:var(--amber);border:1px solid var(--ad)}
-.sn {background:rgba(248,113,113,.1);color:var(--red);border:1px solid var(--rd)}
-.bovr{background:rgba(96,165,250,.1);color:var(--blue);font-size:9px;padding:1px 5px;border-radius:3px;margin-left:5px;font-weight:600;border:1px solid #1e4080}
-.bdel{background:var(--rbg);color:var(--red);font-size:9px;padding:1px 5px;border-radius:3px;margin-left:5px;font-weight:600;border:1px solid var(--rd)}
-.obadge{background:rgba(167,139,250,.08);color:var(--purple);font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid #4c2d8a;white-space:nowrap}
-.tup{color:var(--green);font-size:11px}
-.tdn{color:var(--red);font-size:11px}
-.teq{color:var(--t3);font-size:11px}
-.rvsoon{color:var(--amber);font-weight:600;font-size:11px}
-.rvok{color:var(--t3);font-size:11px}
-.ract{display:flex;gap:3px;align-items:center}
-.note-i{cursor:help;color:var(--amber);font-size:11px;margin-left:4px;vertical-align:middle}
-.nodata{text-align:center;padding:44px;color:var(--t3);font-size:13px}
-
-/* ── Pager ── */
-.pager{
-  display:flex;align-items:center;justify-content:flex-end;gap:6px;
-  padding:10px 16px;border-top:1px solid var(--bdr);font-size:12px;color:var(--t2);
-}
-.pginfo{font-size:11px;color:var(--t3);margin-right:4px}
-
-/* ── Modal ── */
-.mbg{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(3px);z-index:500;display:none;align-items:center;justify-content:center}
-.mbg.open{display:flex}
-.modal{background:var(--bg1);border:1px solid var(--bdr);border-radius:var(--r);padding:24px;width:440px;max-width:94vw;max-height:88vh;overflow-y:auto;box-shadow:var(--shadow)}
-.modal h2{font-size:14px;font-weight:600;color:var(--t0);margin-bottom:16px;letter-spacing:-.01em}
-.frow{margin-bottom:14px}
-label{display:block;font-size:10px;font-weight:600;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
-select,textarea,input[type=text]{
-  background:var(--bg0);border:1px solid var(--bdr);border-radius:var(--r2);
-  color:var(--t0);padding:7px 10px;font-size:13px;font-family:inherit;width:100%;
-  transition:border-color .14s;
-}
-select:focus,textarea:focus,input[type=text]:focus{outline:none;border-color:var(--blue)}
-textarea{resize:vertical;min-height:68px}
-.mact{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
-.btn-mex{background:var(--rbg);border:1px solid var(--rd);color:var(--red);padding:5px 13px;border-radius:var(--r2);cursor:pointer;font-size:12px;font-family:inherit;transition:all .14s}
-.btn-mex:hover{background:var(--red);color:#fff}
-.err{border-color:var(--red)!important}
-
-/* ── Toast & Undo ── */
-.toast{
-  position:fixed;bottom:20px;right:20px;
-  background:var(--bg2);border:1px solid var(--bdr);border-radius:var(--r);
-  padding:9px 15px;font-size:12px;z-index:600;
-  box-shadow:var(--shadow);display:none;color:var(--t1);
-}
-.toast.show{display:block}
-.ubar{
-  position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
-  background:var(--bg2);border:1px solid var(--rd);border-radius:var(--r);
-  padding:10px 18px;font-size:12px;z-index:600;
-  display:none;align-items:center;gap:12px;
-  box-shadow:var(--shadow);white-space:nowrap;color:var(--t1);
-}
-.ubar.show{display:flex}
-.ubtn{color:var(--amber);cursor:pointer;font-weight:600;text-decoration:underline}
-.utmr{font-size:11px;color:var(--t3);font-family:var(--mono)}
-
-@media(max-width:900px){.cards{grid-template-columns:repeat(3,1fr)}.charts{grid-template-columns:1fr}}
-@media(max-width:600px){.cards{grid-template-columns:repeat(2,1fr)}}
-</style>
-</head>
-<body>
-
-<div class="hdr">
-  <div class="hdr-l">
-    <h1>SIEM Signoff Dashboard</h1>
-    <span class="badge bqr">QRadar</span>
-    <span class="badge bv">v%%VERSION%%</span>
-  </div>
-  <div class="hdr-r">
-    <span class="hdr-ts">Generated %%GENERATED%%</span>
-    <button class="btn btn-sm" onclick="exportCSV()">&#8595; Export CSV</button>
-    <button class="btn btn-sm" onclick="exportOvr()">&#8595; Overrides JSON</button>
-  </div>
-</div>
-
-<div class="main">
-
-  <!-- Period selector -->
-  <div class="pbar">
-    <button class="pbtn" onclick="setPeriod(7)"  data-p="7">7 days</button>
-    <button class="pbtn" onclick="setPeriod(15)" data-p="15">15 days</button>
-    <button class="pbtn active" onclick="setPeriod(30)" data-p="30">30 days</button>
-    <button class="pbtn" onclick="setPeriod(0)"  data-p="0">All time</button>
-    <div class="sep"></div>
-    <span style="font-size:11px;color:var(--t3)">Lookback %%LOOKBACK%%d &nbsp;&bull;&nbsp; Reval cooldown %%REVAL_COOL%%d</span>
-  </div>
-
-  <!-- KPI cards -->
-  <div class="cards">
-    <div class="card cb"><div class="card-lbl">Signoff Emails</div><div class="card-val" id="ct0">—</div><div class="card-sub" id="ct0s">—</div></div>
-    <div class="card cg"><div class="card-lbl">Active</div><div class="card-val" id="ct1">—</div><div class="card-sub" id="ct1s">—</div></div>
-    <div class="card ca"><div class="card-lbl">Partial</div><div class="card-val" id="ct2">—</div><div class="card-sub" id="ct2s">—</div></div>
-    <div class="card cr"><div class="card-lbl">Not Found</div><div class="card-val" id="ct3">—</div><div class="card-sub" id="ct3s">—</div></div>
-    <div class="card cp"><div class="card-lbl">Exceptions</div><div class="card-val" id="ct4">—</div><div class="card-sub">deleted / overridden</div></div>
-  </div>
-
-  <!-- Charts -->
-  <div class="charts">
-    <div class="cbox">
-      <div class="clbl">Status distribution</div>
-      <svg id="dsvg" viewBox="0 0 200 170" width="100%" role="img" aria-label="Donut chart"></svg>
-      <div class="leg" id="dleg"></div>
-    </div>
-    <div class="cbox">
-      <div class="clbl">Signoffs over time &mdash; <span style="color:var(--red)">not-found</span> &rarr; <span style="color:var(--amber)">partial</span> &rarr; <span style="color:var(--green)">active</span></div>
-      <svg id="bsvg" viewBox="0 0 530 185" width="100%" role="img" aria-label="Bar chart" style="overflow:visible"></svg>
-    </div>
-  </div>
-
-  <!-- Host table -->
-  <div class="twrap">
-    <div class="ttbar">
-      <span class="ttitle">Host Registry</span>
-      <span class="trcount" id="trcount"></span>
-      <div class="sp1"></div>
-      <input class="srch" type="text" placeholder="&#128269; Search hostname…" oninput="setSrch(this.value)" id="srchbox">
-    </div>
-    <div style="overflow-x:auto">
-      <table>
-        <thead><tr>
-          <th onclick="srt('hostname')">Hostname</th>
-          <th onclick="srt('os_group')">OS Group</th>
-          <th onclick="srt('eff_status')">Status</th>
-          <th onclick="srt('last_checked')">Last Checked</th>
-          <th onclick="srt('days_ago')">Last QRadar Event</th>
-          <th onclick="srt('checks')" style="text-align:center">Checks</th>
-          <th onclick="srt('next_rv')">Next Revalidation</th>
-          <th>Trend</th>
-          <th style="width:70px"></th>
-        </tr></thead>
-        <tbody id="tbody"></tbody>
-      </table>
-    </div>
-    <div class="pager" id="pager"></div>
-  </div>
-</div>
-
-<!-- Edit modal -->
-<div class="mbg" id="mbg">
-  <div class="modal">
-    <h2 id="mtitle">Edit host</h2>
-    <div class="frow">
-      <label>Status override</label>
-      <select id="mst">
-        <option value="">— use script result —</option>
-        <option value="active">Active</option>
-        <option value="partial">Partial</option>
-        <option value="not_found">Not Found</option>
-      </select>
-    </div>
-    <div class="frow">
-      <label>Note <span style="font-weight:400;color:var(--t3)">(shown as tooltip)</span></label>
-      <textarea id="mnote" placeholder="Freeform note…"></textarea>
-    </div>
-    <div class="frow">
-      <label>Exception reason <span style="color:var(--red)">*</span> <span style="font-weight:400;color:var(--t3)">required for exception</span></label>
-      <textarea id="mreason" placeholder="e.g. Decommissioned — approved by SOC-Lead 2026-01-15"></textarea>
-    </div>
-    <div class="mact">
-      <button class="btn" onclick="closeM()">Cancel</button>
-      <button class="btn-mex" onclick="delFromM()" id="mdelbtn">Mark as Exception</button>
-      <button class="btn btn-pri" onclick="saveM()">Save</button>
-    </div>
-  </div>
-</div>
-
-<!-- Undo bar -->
-<div class="ubar" id="ubar">
-  <span id="umsg">Host removed.</span>
-  <span class="ubtn" onclick="undoDel()">Undo</span>
-  <span class="utmr" id="utmr">10s</span>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<script>
-// ── Injected data ────────────────────────────────────────────────────────────
-const ALL = %%DATA_JSON%%;
-const RVCOOL = %%REVAL_COOL%%;
-const OVR_PATH = '%%OVPATH%%';
-
-// ── localStorage ─────────────────────────────────────────────────────────────
-const LS = 'siem_ovr_v3';
-const PS = 25;
-
-function loadOvr()      { try { return JSON.parse(localStorage.getItem(LS)||'{}'); } catch { return {}; } }
-function saveOvr(o)     { localStorage.setItem(LS, JSON.stringify(o)); }
-function getO(hn)       { return loadOvr()[hn] || {}; }
-function setO(hn,patch) { const a=loadOvr(); a[hn]=Object.assign(a[hn]||{},patch,{ts:new Date().toISOString()}); saveOvr(a); }
-
-// ── Status helpers ────────────────────────────────────────────────────────────
-const SLBL  = {active:'Active',partial:'Partial',not_found:'Not Found'};
-const SCLS  = {active:'sa1',partial:'sp3',not_found:'sn'};
-const SRANK = {active:0,partial:1,not_found:2};
-
-// ── State ─────────────────────────────────────────────────────────────────────
-let period=30, srch='';
-let scol='last_checked', sasc=false;
-let cp=1, allH=[], editHN=null;
-let undoTmr=null, undoPend=null, undoSecs=10;
-
-// ── Host map ──────────────────────────────────────────────────────────────────
-function buildMap(recs) {
-  const m = {};
-  recs.forEach(r => r.host_results.forEach(h => {
-    const k = h.hostname;
-    if (!m[k]) m[k] = {hostname:k,os_group:h.os_group||'—',status:h.status,
-                       last_checked:r.timestamp,days_ago:h.days_ago,
-                       checks:0,prev_status:null};
-    const e = m[k];
-    if (r.timestamp > e.last_checked) {
-      e.prev_status=e.status; e.status=h.status;
-      e.last_checked=r.timestamp; e.days_ago=h.days_ago;
-      e.os_group=h.os_group||e.os_group||'—';
-    }
-    e.checks++;
-  }));
-  return Object.values(m);
-}
-
-function applyOvr(hosts) {
-  const o = loadOvr();
-  return hosts.map(h => {
-    const x = o[h.hostname] || {};
-    return {...h,deleted:!!x.deleted,status_override:x.status_override||null,
-            note:x.note||'',exception_reason:x.exception_reason||'',
-            eff_status:x.status_override||h.status};
-  });
-}
-
-function filtRecs(d) {
-  if (!d) return ALL;
-  const c = new Date(); c.setDate(c.getDate()-d);
-  return ALL.filter(r => new Date(r.timestamp)>=c);
-}
-
-// ── Controls ──────────────────────────────────────────────────────────────────
-function setPeriod(d) {
-  period=d;
-  document.querySelectorAll('.pbtn').forEach(b=>b.classList.toggle('active',+b.dataset.p===d));
-  cp=1; render();
-}
-function setSrch(v) { srch=v.toLowerCase(); cp=1; drawTable(); }
-function srt(col) {
-  if (scol===col) sasc=!sasc; else { scol=col; sasc=(col==='hostname'); }
-  document.querySelectorAll('th').forEach(t=>t.classList.remove('sa','sd'));
-  const cols=['hostname','os_group','eff_status','last_checked','days_ago','checks','next_rv','_t','_a'];
-  const idx=cols.indexOf(col), ths=document.querySelectorAll('th');
-  if(idx>=0&&ths[idx]) ths[idx].classList.add(sasc?'sa':'sd');
-  drawTable();
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function rel(iso) {
-  const d=(Date.now()-new Date(iso))/1000;
-  if(d<60) return 'Just now';
-  if(d<3600) return Math.floor(d/60)+'m ago';
-  if(d<86400) return Math.floor(d/3600)+'h ago';
-  const n=Math.floor(d/86400); return n===1?'Yesterday':n+'d ago';
-}
-function nextRV(h) {
-  if (h.deleted) return '<span class="rvok">N/A</span>';
-  if (h.eff_status==='active') return '<span class="rvok">—</span>';
-  if (RVCOOL===0) return '<span class="rvsoon">Every run</span>';
-  const el=(Date.now()-new Date(h.last_checked))/86400000;
-  const rem=Math.max(0,RVCOOL-el);
-  if (rem<=0) return '<span class="rvsoon">Due now</span>';
-  return `<span class="${Math.ceil(rem)<=1?'rvsoon':'rvok'}">in ${Math.ceil(rem)}d</span>`;
-}
-function trend(h) {
-  if (!h.prev_status||h.prev_status===h.status) return '<span class="teq">—</span>';
-  return SRANK[h.status]<SRANK[h.prev_status]
-    ?'<span class="tup">▲ Improved</span>':'<span class="tdn">▼ Degraded</span>';
-}
-
-// ── Main render ───────────────────────────────────────────────────────────────
-function render() {
-  const recs=filtRecs(period), hosts=applyOvr(buildMap(recs));
-  const nd=hosts.filter(h=>!h.deleted);
-  const a=nd.filter(h=>h.eff_status==='active').length;
-  const p=nd.filter(h=>h.eff_status==='partial').length;
-  const n=nd.filter(h=>h.eff_status==='not_found').length;
-  const ex=hosts.filter(h=>h.deleted).length;
-  const u=nd.length;
-  const pct=v=>u?Math.round(v/u*100)+'%':'—';
-  document.getElementById('ct0').textContent=recs.length;
-  document.getElementById('ct0s').textContent=u+' unique host'+(u!==1?'s':'');
-  document.getElementById('ct1').textContent=a; document.getElementById('ct1s').textContent=pct(a)+' of hosts';
-  document.getElementById('ct2').textContent=p; document.getElementById('ct2s').textContent=pct(p)+' of hosts';
-  document.getElementById('ct3').textContent=n; document.getElementById('ct3s').textContent=pct(n)+' of hosts';
-  document.getElementById('ct4').textContent=ex;
-  renderDonut(a,p,n); renderBar(recs);
-  allH=hosts; drawTable();
-}
-
-// ── Donut ─────────────────────────────────────────────────────────────────────
-function renderDonut(a,p,n) {
-  const tot=a+p+n, sv=document.getElementById('dsvg');
-  if (!tot) { sv.innerHTML='<text x="100" y="90" text-anchor="middle" fill="#435e7a" font-size="12" font-family="Segoe UI,sans-serif">No data</text>'; document.getElementById('dleg').innerHTML=''; return; }
-  const cx=100,cy=82,R=62,ri=44;
-  const vs=[{v:a,c:'#22c55e'},{v:p,c:'#f59e0b'},{v:n,c:'#f87171'}];
-  let ang=-Math.PI/2, arcs='';
-  vs.forEach(({v,c})=>{
-    if(!v) return;
-    const sw=2*Math.PI*(v/tot);
-    const x1=cx+R*Math.cos(ang),y1=cy+R*Math.sin(ang); ang+=sw;
-    const x2=cx+R*Math.cos(ang),y2=cy+R*Math.sin(ang);
-    const xi1=cx+ri*Math.cos(ang-sw),yi1=cy+ri*Math.sin(ang-sw);
-    const xi2=cx+ri*Math.cos(ang),yi2=cy+ri*Math.sin(ang);
-    const lg=sw>Math.PI?1:0;
-    arcs+=`<path d="M${x1},${y1} A${R},${R} 0 ${lg},1 ${x2},${y2} L${xi2},${yi2} A${ri},${ri} 0 ${lg},0 ${xi1},${yi1} Z" fill="${c}" opacity="0.9"/>`;
-  });
-  const pct=Math.round(a/tot*100);
-  sv.innerHTML=arcs+`<text x="${cx}" y="${cy-4}" text-anchor="middle" font-size="22" font-weight="700" fill="#f0f6ff" font-family="Segoe UI,sans-serif">${a}</text><text x="${cx}" y="${cy+14}" text-anchor="middle" font-size="10" fill="#7e9cbf" font-family="Segoe UI,sans-serif">active (${pct}%)</text>`;
-  document.getElementById('dleg').innerHTML=[['#22c55e','Active',a],['#f59e0b','Partial',p],['#f87171','Not Found',n]].map(([c,l,v])=>`<div class="leg-r"><div class="leg-d" style="background:${c}"></div><span style="flex:1">${l}</span><span style="color:var(--t0);font-weight:600">${v}</span></div>`).join('');
-}
-
-// ── Bar chart ─────────────────────────────────────────────────────────────────
-function renderBar(recs) {
-  const days=period||30, bkts={};
-  for(let i=days-1;i>=0;i--){ const d=new Date(); d.setDate(d.getDate()-i); bkts[d.toISOString().slice(0,10)]={a:0,p:0,n:0}; }
-  recs.forEach(r=>{ const d=r.timestamp.slice(0,10); if(!bkts[d]) return; if(r.overall_status==='active')bkts[d].a++; else if(r.overall_status==='partial')bkts[d].p++; else bkts[d].n++; });
-  const keys=Object.keys(bkts), mv=Math.max(1,...Object.values(bkts).map(b=>b.a+b.p+b.n));
-  const W=530,H=185,PL=24,PR=8,PT=10,PB=32;
-  const aW=W-PL-PR, bw=Math.max(3,Math.floor(aW/keys.length)-1), gap=aW/keys.length;
-  const yS=v=>(H-PT-PB)*(v/mv);
-  let bars='',labs='',grid='';
-  for(let g=0;g<=4;g++){
-    const y=PT+(H-PT-PB)*(1-g/4);
-    grid+=`<line x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}" stroke="#1e3352" stroke-width="0.6"/>`;
-    grid+=`<text x="${PL-3}" y="${y+3}" text-anchor="end" font-size="8" fill="#435e7a" font-family="Segoe UI,sans-serif">${Math.round(mv*g/4)}</text>`;
-  }
-  keys.forEach((k,i)=>{
-    const {a,p,n}=bkts[k], x=PL+i*gap;
-    let y=H-PB;
-    if(n){const h=Math.max(1,Math.round(yS(n)));bars+=`<rect x="${x}" y="${y-h}" width="${bw}" height="${h}" fill="rgba(248,113,113,.3)" stroke="#f87171" stroke-width="0.6" rx="1"/>`;y-=h;}
-    if(p){const h=Math.max(1,Math.round(yS(p)));bars+=`<rect x="${x}" y="${y-h}" width="${bw}" height="${h}" fill="rgba(245,158,11,.3)" stroke="#f59e0b" stroke-width="0.6" rx="1"/>`;y-=h;}
-    if(a){const h=Math.max(1,Math.round(yS(a)));bars+=`<rect x="${x}" y="${y-h}" width="${bw}" height="${h}" fill="rgba(34,197,94,.3)" stroke="#22c55e" stroke-width="0.6" rx="1"/>`;}
-    const sk=keys.length>20?Math.ceil(keys.length/12):1;
-    if(i%sk===0) labs+=`<text x="${x+bw/2}" y="${H-PB+11}" text-anchor="middle" font-size="8" fill="#435e7a" font-family="Segoe UI,sans-serif">${k.slice(5)}</text>`;
-  });
-  const ly=H-3;
-  const leg=`<rect x="${PL}" y="${ly-5}" width="7" height="5" fill="rgba(34,197,94,.3)" stroke="#22c55e" stroke-width=".6"/><text x="${PL+9}" y="${ly}" font-size="8" fill="#7e9cbf" font-family="Segoe UI,sans-serif">Active</text><rect x="${PL+52}" y="${ly-5}" width="7" height="5" fill="rgba(245,158,11,.3)" stroke="#f59e0b" stroke-width=".6"/><text x="${PL+61}" y="${ly}" font-size="8" fill="#7e9cbf" font-family="Segoe UI,sans-serif">Partial</text><rect x="${PL+110}" y="${ly-5}" width="7" height="5" fill="rgba(248,113,113,.3)" stroke="#f87171" stroke-width=".6"/><text x="${PL+119}" y="${ly}" font-size="8" fill="#7e9cbf" font-family="Segoe UI,sans-serif">Not Found</text>`;
-  document.getElementById('bsvg').innerHTML=grid+bars+labs+leg;
-}
-
-// ── Table ─────────────────────────────────────────────────────────────────────
-function drawTable() {
-  let rows=allH.filter(h=>{
-    if(srch && !h.hostname.toLowerCase().includes(srch)) return false;
-    return true;
-  });
-  rows.sort((a,b)=>{
-    let av=a[scol]??'zzz',bv=b[scol]??'zzz';
-    if(scol==='eff_status'){av=SRANK[av]??1;bv=SRANK[bv]??1;}
-    if(scol==='next_rv'){
-      av=a.eff_status==='active'?9999:(Date.now()-new Date(a.last_checked))/86400000;
-      bv=b.eff_status==='active'?9999:(Date.now()-new Date(b.last_checked))/86400000;
-    }
-    if(typeof av==='string')av=av.toLowerCase();
-    if(typeof bv==='string')bv=bv.toLowerCase();
-    return (av<bv?-1:av>bv?1:0)*(sasc?1:-1);
-  });
-  const tot=rows.length, pgs=Math.max(1,Math.ceil(tot/PS));
-  if(cp>pgs)cp=pgs;
-  const sl=rows.slice((cp-1)*PS,cp*PS);
-  const tb=document.getElementById('tbody');
-  document.getElementById('trcount').textContent=tot+' host'+(tot!==1?'s':'');
-  if(!sl.length){
-    tb.innerHTML='<tr><td colspan="9" class="nodata">No hosts found.</td></tr>';
-    document.getElementById('pager').innerHTML=''; return;
-  }
-  tb.innerHTML=sl.map(h=>{
-    const da=h.days_ago!=null?(h.days_ago===0?'Today':`${h.days_ago}d ago`):'—';
-    const dac=h.days_ago!=null&&h.days_ago>7?'color:var(--red)':'color:var(--t2)';
-    const og=h.os_group&&h.os_group!=='—'?`<span class="obadge">${h.os_group}</span>`:'<span style="color:var(--t3)">—</span>';
-    const ob=h.status_override?'<span class="bovr">override</span>':'';
-    const db=h.deleted?'<span class="bdel">exception</span>':'';
-    const ni=h.note?`<span class="note-i" title="${h.note.replace(/"/g,'&quot;')}">&#9432;</span>`:'';
-    const hn=`<span class="hn${h.deleted?' hndel':''}">${h.hostname}</span>${ni}${ob}${db}`;
-    const esc=h.hostname.replace(/'/g,"\\'");
-    return `<tr${h.deleted?' class="drow"':''}>
-      <td>${hn}</td>
-      <td>${og}</td>
-      <td><span class="sb ${SCLS[h.eff_status]||'sp3'}">${SLBL[h.eff_status]||h.eff_status}</span></td>
-      <td style="color:var(--t2)">${rel(h.last_checked)}</td>
-      <td style="${dac}">${da}</td>
-      <td style="color:var(--t3);text-align:center">${h.checks}</td>
-      <td>${nextRV(h)}</td>
-      <td>${trend(h)}</td>
-      <td>
-        <div class="ract">
-          ${h.deleted?'':`<button class="btn-del" title="Delete bad read" onclick="quickDel('${esc}')">&#128465;</button>`}
-          <button class="btn-edit" title="Edit / override" onclick="openM('${esc}')">&#9998;</button>
-        </div>
-      </td>
-    </tr>`;
-  }).join('');
-  // Pager
-  const pg=document.getElementById('pager');
-  if(pgs<=1){pg.innerHTML=`<span class="pginfo">Showing all ${tot} host${tot!==1?'s':''}</span>`;return;}
-  let bs='';
-  for(let i=1;i<=pgs;i++) bs+=`<button class="btn btn-sm${i===cp?' btn-pri':''}" onclick="goP(${i})">${i}</button>`;
-  pg.innerHTML=`<span class="pginfo">${(cp-1)*PS+1}–${Math.min(cp*PS,tot)} of ${tot}</span>${bs}`;
-}
-function goP(n){cp=n;drawTable();}
-
-// ── Quick delete (no modal, no reason required) ───────────────────────────────
-function quickDel(hn) {
-  setO(hn,{deleted:true,exception_reason:'Removed via dashboard quick-delete'});
-  undoPend=hn; showUndo(hn); render();
-}
-
-// ── Modal ─────────────────────────────────────────────────────────────────────
-function openM(hn) {
-  editHN=hn; const o=getO(hn);
-  document.getElementById('mtitle').textContent='Edit: '+hn;
-  document.getElementById('mst').value=o.status_override||'';
-  document.getElementById('mnote').value=o.note||'';
-  document.getElementById('mreason').value=o.exception_reason||'';
-  document.getElementById('mreason').classList.remove('err');
-  document.getElementById('mdelbtn').style.display=o.deleted?'none':'';
-  document.getElementById('mbg').classList.add('open');
-}
-function closeM(){document.getElementById('mbg').classList.remove('open');editHN=null;}
-function saveM() {
-  if(!editHN) return;
-  setO(editHN,{status_override:document.getElementById('mst').value||null,
-               note:document.getElementById('mnote').value.trim(),
-               exception_reason:document.getElementById('mreason').value.trim(),
-               deleted:getO(editHN).deleted||false});
-  closeM(); render(); toast('Saved: '+editHN);
-}
-function delFromM() {
-  if(!editHN) return;
-  const r=document.getElementById('mreason').value.trim();
-  if(!r){document.getElementById('mreason').classList.add('err');return;}
-  const hn=editHN;
-  setO(hn,{deleted:true,exception_reason:r,
-           note:document.getElementById('mnote').value.trim(),
-           status_override:document.getElementById('mst').value||null});
-  closeM(); undoPend=hn; showUndo(hn); render();
-}
-
-// ── Undo ──────────────────────────────────────────────────────────────────────
-function showUndo(hn) {
-  clearInterval(undoTmr); undoSecs=10;
-  document.getElementById('umsg').textContent=`"${hn}" removed.`;
-  document.getElementById('utmr').textContent=undoSecs+'s';
-  document.getElementById('ubar').classList.add('show');
-  undoTmr=setInterval(()=>{
-    undoSecs--;
-    document.getElementById('utmr').textContent=undoSecs+'s';
-    if(undoSecs<=0){clearInterval(undoTmr);document.getElementById('ubar').classList.remove('show');undoPend=null;}
-  },1000);
-}
-function undoDel() {
-  if(!undoPend) return;
-  setO(undoPend,{deleted:false});
-  clearInterval(undoTmr);
-  document.getElementById('ubar').classList.remove('show');
-  render(); toast('"'+undoPend+'" restored.');
-  undoPend=null;
-}
-
-// ── Toast ─────────────────────────────────────────────────────────────────────
-let ttmr=null;
-function toast(msg) {
-  clearTimeout(ttmr); const el=document.getElementById('toast');
-  el.textContent=msg; el.classList.add('show');
-  ttmr=setTimeout(()=>el.classList.remove('show'),2800);
-}
-
-// ── Export ────────────────────────────────────────────────────────────────────
-function exportCSV() {
-  const hosts=applyOvr(buildMap(filtRecs(period)));
-  const rows=[['Hostname','OS Group','Status','Status Override','Last Checked','Days Since Event','Checks','Exception','Note','Exception Reason']];
-  hosts.forEach(h=>rows.push([h.hostname,h.os_group||'',SLBL[h.eff_status]||h.eff_status,
-    h.status_override?SLBL[h.status_override]:'',h.last_checked,h.days_ago??'',
-    h.checks,h.deleted?'YES':'',h.note||'',h.exception_reason||'']));
-  const csv=rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')).join('\r\n');
-  dl(new Blob([csv],{type:'text/csv'}),'signoff_export.csv');
-}
-function exportOvr() {
-  dl(new Blob([JSON.stringify(loadOvr(),null,2)],{type:'application/json'}),'signoff_overrides.json');
-  toast('Place file at: '+OVR_PATH);
-}
-function dl(blob,name){const u=URL.createObjectURL(blob);Object.assign(document.createElement('a'),{href:u,download:name}).click();URL.revokeObjectURL(u);}
-
-// ── Keyboard ──────────────────────────────────────────────────────────────────
-document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'){closeM();document.getElementById('ubar').classList.remove('show');}
-  if(e.key==='ArrowRight') goP(Math.min(cp+1,Math.ceil(allH.length/PS)));
-  if(e.key==='ArrowLeft')  goP(Math.max(cp-1,1));
-});
-document.getElementById('mbg').addEventListener('click',e=>{if(e.target===document.getElementById('mbg'))closeM();});
-
-render();
-</script>
-</body>
-</html>"""
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def main() -> None:
+def main():
     if not VERIFY_SSL:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    _log("=" * 64)
-    _log(f"QRadar Signoff Auto-Draft v{VERSION}")
-    _log(f"   Script dir      : {_SCRIPT_DIR}")
-    _log(f"   Data file       : {SIGNOFF_DATA_PATH}")
-    _log(f"   Dashboard       : {DASHBOARD_PATH}")
-    _log(f"   Overrides       : {_OVERRIDES_PATH}")
-    _log(f"   Lookback        : {LOOKBACK_DAYS}d  |  Sent scan: {SENT_SCAN_DAYS}d")
-    _log(f"   Reval cooldown  : {REVALIDATION_COOLDOWN_DAYS}d  "
-         f"|  Active skip: {ACTIVE_SKIP_DAYS}d")
-    _log(f"   Trigger DL      : '{TRIGGER_DL}'")
-    _log(f"   Escalation To   : {ESCALATION_TO}")
-    _log(f"   Escalation CC   : {ESCALATION_CC}")
-    _log(f"   MODE            : DRAFT ONLY — nothing is ever sent automatically")
-    _log("=" * 64)
+    _ensure_paths()
+
+    _log("=" * 65)
+    _log("QRadar Signoff Auto-Draft v2.2 starting...")
+    _log(f"  Inbox: {LOOKBACK_DAYS}d | Sent: {SENT_SCAN_DAYS}d | "
+         f"Cooldown: {'off' if not REVALIDATION_COOLDOWN_DAYS else f'{REVALIDATION_COOLDOWN_DAYS}d'} | "
+         f"Active-skip: {ACTIVE_SKIP_DAYS}d")
+    _log("  Runtime dedup: ON | Cross-thread dedup: ON | Mode: DRAFT ONLY")
+
+    if HISTORICAL_RUN_MODE:
+        _log("")
+        _log("  *** HISTORICAL RUN MODE ENABLED ***")
+        _log("  *** Already-tagged emails will be imported (no QRadar query, no draft). ***")
+        _log("  *** Remember to set HISTORICAL_RUN_MODE = False after this run! ***")
+        _log("")
 
     if not acquire_lock():
         return
 
     try:
-        overrides      = load_overrides()
-        deleted_hosts  = {hn for hn, o in overrides.items() if o.get('deleted')}
-        if deleted_hosts:
-            _log(f"Exception hosts (skipped on this run): {sorted(deleted_hosts)}")
-
         inbox, drafts, sent = get_outlook_folders()
         if inbox is None:
             return
 
-        if not test_qradar_connection():
-            _log("ERROR: QRadar unreachable — exiting. All emails left untouched.")
-            return
-        fetch_log_source_types()
+        # In historical-only mode we skip QRadar entirely; for mixed runs we still connect.
+        if not HISTORICAL_RUN_MODE:
+            if not test_qradar_connection():
+                _log("ERROR: QRadar unreachable — aborting. Emails untouched.")
+                return
+            fetch_log_source_types()
+        else:
+            _log("Historical mode — skipping QRadar connectivity check.")
 
-        cutoff_str = (datetime.now() - timedelta(days=LOOKBACK_DAYS)
-                      ).strftime('%Y-%m-%d')
-        try:
-            inbox_items = list(inbox.Items.Restrict(
-                f"[ReceivedTime] >= '{cutoff_str}'"
-            ))
-        except Exception:
-            _log("WARN: Restrict failed — iterating full folder (locale fallback)")
-            cutoff_dt   = datetime.now() - timedelta(days=LOOKBACK_DAYS)
-            inbox_items = [
-                item for item in inbox.Items
-                if _com_dt_to_py(getattr(item, 'ReceivedTime', None)) or datetime.min
-                >= cutoff_dt
-            ]
+        cutoff_str      = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime('%m/%d/%Y %I:%M %p')
+        cooldown_cutoff = (
+            datetime.now() - timedelta(days=REVALIDATION_COOLDOWN_DAYS)
+            if REVALIDATION_COOLDOWN_DAYS > 0 else None
+        )
+        active_skip_cutoff = datetime.now() - timedelta(days=ACTIVE_SKIP_DAYS)
 
-        _log(f"\nInbox scan: {len(inbox_items)} email(s) in last {LOOKBACK_DAYS}d window.")
+        inbox_items = list(inbox.Items.Restrict(f"[ReceivedTime] >= '{cutoff_str}'"))
+        _log(f"\n{len(inbox_items)} email(s) in last {LOOKBACK_DAYS}d")
 
-        processed = skipped = drafted = revalidated = 0
+        processed = skipped = drafted = revalidated = historical_count = 0
 
         for mail_item in inbox_items:
             try:
@@ -1723,18 +1871,19 @@ def main() -> None:
             except Exception:
                 continue
 
-            subject = ''
             try:
                 subject = mail_item.Subject or ''
             except Exception:
                 continue
 
+            # Subject guards (allows tagged in HISTORICAL_RUN_MODE)
             passed, reason = passes_subject_guards(subject)
             if not passed:
                 skipped += 1
-                _log(f"   SKIP (subject — {reason}): '{subject[:60]}'")
+                _log(f"  SKIP ({reason}): '{subject[:60]}'")
                 continue
 
+            # Sender guards
             try:
                 sender = mail_item.SenderEmailAddress or ''
             except Exception:
@@ -1743,96 +1892,107 @@ def main() -> None:
             if sender.strip().lower() == YOUR_EMAIL_ADDRESS.strip().lower():
                 skipped += 1
                 continue
-
             if not is_sender_allowed(sender):
                 skipped += 1
-                _log(f"   SKIP (sender not allowed — {sender}): '{subject[:60]}'")
+                _log(f"  SKIP (sender not allowed): '{subject[:60]}'")
                 continue
-
             if not body_contains_dl(mail_item):
                 skipped += 1
-                _log(f"   SKIP ('{TRIGGER_DL}' not in body): '{subject[:60]}'")
+                _log(f"  SKIP (DL not in body): '{subject[:60]}'")
                 continue
 
-            hostnames = extract_hostnames(subject)
-            if not hostnames:
+            hostname_list = extract_hostnames(subject)
+            if not hostname_list:
                 skipped += 1
-                _log(f"   SKIP (no hostnames): '{subject[:60]}'")
+                _log(f"  SKIP (no hostnames): '{subject[:60]}'")
                 continue
 
-            active_hn = [h for h in hostnames if h not in deleted_hosts]
-            if not active_hn:
+            # ── Historical import path ────────────────────────────────────
+            # Triggered when the email already carries a [Processed*] tag,
+            # which means a previous version of this script handled it.
+            has_processed_tag = '[processed' in subject.lower()
+            if HISTORICAL_RUN_MODE and has_processed_tag:
+                if _historical_already_imported(subject):
+                    skipped += 1
+                    _log(f"  HIST-SKIP (already imported): '{subject[:60]}'")
+                    continue
+
+                existing_tag = _tag_from_subject(subject)
+                tag_to_status = {
+                    TAG_ACTIVE:    'active',
+                    TAG_PARTIAL:   'partial',
+                    TAG_NOT_FOUND: 'not_found',
+                    'legacy':      'active',
+                }
+                hist_status = tag_to_status.get(existing_tag, 'active')
+
+                try:
+                    received_dt = _com_dt_to_py(mail_item.ReceivedTime)
+                except Exception:
+                    received_dt = None
+
+                _log(f"  HISTORICAL [{hist_status.upper()}]: '{subject[:70]}'")
+                _log(f"    Sender: {sender} | Hosts: {hostname_list} | "
+                     f"Date: {received_dt.strftime('%Y-%m-%d') if received_dt else 'unknown'}")
+
+                write_historical_record(
+                    email_subject=subject,
+                    sender=sender,
+                    hostname_list=hostname_list,
+                    status=hist_status,
+                    received_dt=received_dt,
+                )
+                historical_count += 1
+                processed        += 1
+                continue
+
+            # ── Runtime dedup ─────────────────────────────────────────────
+            if is_drafted_this_run(hostname_list):
                 skipped += 1
-                _log(f"   SKIP (all hosts are exceptions): {hostnames}")
-                continue
-            if len(active_hn) < len(hostnames):
-                skipped_hn = [h for h in hostnames if h in deleted_hosts]
-                _log(f"   NOTE: Skipping exception host(s) {skipped_hn}")
-            hostnames = active_hn
-
-            hn_fset = frozenset(hostnames)
-
-            if hn_fset in _runtime_drafted_hosts:
-                skipped += 1
-                _log(f"   SKIP (already drafted in this run): {hostnames}")
+                _log(f"  SKIP (runtime dedup — already handled {hostname_list} this run)")
                 continue
 
-            was_active, active_date = _was_active_recently(hn_fset)
-            if was_active:
-                skipped += 1
-                _log(f"   SKIP (Active in data file on {active_date} "
-                     f"within {ACTIVE_SKIP_DAYS}d window)")
-                continue
+            _log(f"\n  Candidate: '{subject[:70]}'")
+            _log(f"    Sender: {sender} | Hosts: {hostname_list}")
 
-            _log(f"\nCandidate: '{subject[:70]}'")
-            _log(f"   Sender : {sender}")
-            _log(f"   Hosts  : {hostnames}")
+            # ── Conversation + cross-thread state ─────────────────────────
+            last_tag, last_dt = check_conversation_status(
+                mail_item, sent, drafts, hostname_list
+            )
 
-            last_tag, last_dt = check_conversation_status(mail_item, sent, drafts)
-            cooldown_cutoff   = datetime.now() - timedelta(days=REVALIDATION_COOLDOWN_DAYS)
-
-            if last_tag is None:
-                is_revalidation = False
-                _log(f"   -> New signoff (no prior tag in Sent/Drafts)")
-
-            elif last_tag in (TAG_ACTIVE, 'legacy'):
-                skipped += 1
-                dt_s = last_dt.strftime('%Y-%m-%d') if last_dt else 'unknown'
-                _log(f"   SKIP (Sent/Drafts: Active tag from {dt_s})")
-                continue
+            if last_tag in (TAG_ACTIVE, 'legacy'):
+                if last_dt and last_dt >= active_skip_cutoff:
+                    skipped += 1
+                    _log(f"    SKIP (Active on {last_dt.strftime('%Y-%m-%d')} — within {ACTIVE_SKIP_DAYS}d)")
+                    continue
+                _log(f"    Active result > {ACTIVE_SKIP_DAYS}d old — allowing recheck")
+                is_revalidation = True
 
             elif last_tag in REVALIDATABLE_TAGS:
-                if REVALIDATION_COOLDOWN_DAYS > 0 and last_dt and last_dt >= cooldown_cutoff:
-                    days_ago = (datetime.now() - last_dt).days
+                if cooldown_cutoff and last_dt and last_dt >= cooldown_cutoff:
                     skipped += 1
-                    _log(f"   SKIP (cooldown — last checked {days_ago}d ago, "
-                         f"cooldown is {REVALIDATION_COOLDOWN_DAYS}d)")
+                    _log(f"    SKIP (cooldown: {(datetime.now()-last_dt).days}d ago)")
                     continue
-                dt_s = last_dt.strftime('%Y-%m-%d') if last_dt else 'unknown'
-                _log(f"   -> Revalidating {last_tag} from {dt_s}")
+                _log(f"    Revalidating {last_tag} from "
+                     f"{last_dt.strftime('%Y-%m-%d') if last_dt else 'unknown'}")
                 is_revalidation = True
+
+            elif last_tag is None:
+                _log(f"    New signoff")
+                is_revalidation = False
 
             else:
                 skipped += 1
-                _log(f"   SKIP (unrecognised tag state: '{last_tag}')")
+                _log(f"    SKIP (unknown tag: {last_tag})")
                 continue
 
-            _log(f"   Querying QRadar for {len(hostnames)} host(s)...")
-            hostname_qr_pairs = []
-            for hn in hostnames:
-                qr = query_all_log_sources_readonly(hn)
-                _log(f"      {hn}: {qr['status']} ({len(qr.get('sources',[]))} sources)")
-                hostname_qr_pairs.append((hn, qr))
+            # ── QRadar query + draft ──────────────────────────────────────
+            html_body, overall_status, host_records = build_all_hosts_reply(hostname_list)
+            _log(f"    Overall: {overall_status.upper()}")
 
-            body, overall_status, host_tracking = build_reply_for_all_hosts(
-                hostname_qr_pairs
-            )
-            _log(f"   Overall: {overall_status.upper()}")
-
-            hostnames_str = ' | '.join(hostnames)
             success = create_draft_reply(
-                mail_item, body, overall_status,
-                hostnames_str=hostnames_str,
+                mail_item, html_body, hostname_list,
+                overall_status=overall_status,
                 is_revalidation=is_revalidation,
             )
 
@@ -1840,38 +2000,44 @@ def main() -> None:
                 drafted += 1
                 if is_revalidation:
                     revalidated += 1
-                _runtime_drafted_hosts.add(hn_fset)
-                append_record({
-                    'id':              str(uuid.uuid4()),
-                    'version':         VERSION,
-                    'timestamp':       datetime.now().isoformat(timespec='seconds'),
-                    'subject':         subject,
-                    'sender':          sender,
-                    'is_revalidation': is_revalidation,
-                    'overall_status':  overall_status,
-                    'host_results':    host_tracking,
-                })
-
+                mark_drafted_this_run(hostname_list)
+                write_signoff_record(
+                    email_subject   = subject,
+                    sender          = sender,
+                    host_records    = host_records,
+                    overall_status  = overall_status,
+                    is_revalidation = is_revalidation,
+                    prior_status    = last_tag,
+                )
             processed += 1
 
-        # Dashboard written + auto-opened here
-        generate_dashboard()
+        _log(f"\n{'='*65}")
+        _log(f"Done — {processed} processed | {drafted} drafted "
+             f"({revalidated} reval) | {skipped} skipped"
+             + (f" | {historical_count} historical imported" if historical_count else ""))
 
-        _log(f"\n{'=' * 64}")
-        _log(f"Run complete — v{VERSION}")
-        _log(f"   Processed   : {processed}  Drafted: {drafted} "
-             f"({revalidated} revalidation{'s' if revalidated != 1 else ''})")
-        _log(f"   Skipped     : {skipped}")
-        _log(f"\n   File paths (paste into config to hardcode):")
-        _log(f"   RUN_LOG_PATH      = r'{RUN_LOG_PATH}'")
-        _log(f"   LOCKFILE_PATH     = r'{LOCKFILE_PATH}'")
-        _log(f"   SIGNOFF_DATA_PATH = r'{SIGNOFF_DATA_PATH}'")
-        _log(f"   DASHBOARD_PATH    = r'{DASHBOARD_PATH}'")
-        _log(f"{'=' * 64}\n")
+        if HISTORICAL_RUN_MODE and historical_count > 0:
+            _log("")
+            _log(f"  *** Historical import complete: {historical_count} record(s) added. ***")
+            _log(f"  *** ACTION REQUIRED: Set HISTORICAL_RUN_MODE = False before next run! ***")
 
     finally:
         release_lock()
+        _print_paths()
+        generate_dashboard()
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT  (FIX 3: clean Ctrl+C / crash exit)
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        _log("\nInterrupted by user — shutting down server if running.")
+        if _http_server_instance:
+            try:
+                _http_server_instance.shutdown()
+            except Exception:
+                pass
