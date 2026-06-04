@@ -1,9 +1,9 @@
 """
-QRadar Manual Signoff  v1.0
+QRadar Manual Signoff  v1.1
 ────────────────────────────────────────────────────────────────────────────
-Terminal-driven signoff checker — no Outlook scanning required.
-Drop this file alongside signoff_runner.py; it shares the same
-signoff_data.json so signoff_dashboard.py shows manual runs too.
+Terminal-driven signoff checker — no Outlook inbox scanning required.
+You enter hostnames manually; everything else (QRadar query, HTML draft,
+data file, logging) works exactly like signoff_runner.py.
 
 Usage
   python manual_signoff.py
@@ -12,9 +12,10 @@ Usage
       server01 | server02 | server03
 
 Outputs
-  • HTML report  →  manual_signoff_YYYYMMDD-HHMMSS.html  (auto-opened)
-  • JSON record  →  signoff_data.json  (shared with dashboard)
-  • Appended log →  signoff_runner.log
+  • Outlook draft reply  (saved to Drafts, never sent)
+  • HTML report          →  manual_signoff_YYYYMMDD-HHMMSS.html  (auto-opened)
+  • JSON record          →  signoff_data.json  (shared with dashboard)
+  • Appended log         →  signoff_runner.log
 ────────────────────────────────────────────────────────────────────────────
 """
 
@@ -25,6 +26,7 @@ import tempfile
 import uuid
 import urllib3
 import webbrowser
+import win32com.client
 import requests
 
 from datetime import datetime
@@ -45,6 +47,10 @@ QRADAR_HOST     = os.environ.get('QRADAR_HOST',     'https://your-qradar-host')
 QRADAR_USERNAME = os.environ.get('QRADAR_USERNAME', 'your-username')
 QRADAR_PASSWORD = os.environ.get('QRADAR_PASSWORD', 'your-password')
 VERIFY_SSL      = False          # set True + supply a CA bundle in production
+
+# ─── Escalation routing (Partial / Not-Found drafts) ─────────────────────────
+ESCALATION_TO = ['onboarding-owner@yourorg.com']
+ESCALATION_CC = ['@SOC-DL@yourorg.com']
 
 # ─── OS type validation ───────────────────────────────────────────────────────
 OS_TYPE_GROUPS = {
@@ -428,7 +434,7 @@ def _host_section(hostname: str, qr: dict) -> tuple:
 
 def build_reply_html(hostname_list: list, analyst: str = '') -> tuple:
     """
-    Query QRadar for every host and build the full HTML report.
+    Query QRadar for every host and build the full HTML body.
     Returns (html_str, overall_status, host_records_list).
     overall_status ∈ {'active', 'partial', 'not_found'}
     """
@@ -468,99 +474,108 @@ def build_reply_html(hostname_list: list, analyst: str = '') -> tuple:
     count = f"{len(hostname_list)} host{'s' if len(hostname_list) != 1 else ''} checked"
     by    = f' &nbsp;&middot;&nbsp; Submitted by: <strong>{analyst}</strong>' if analyst else ''
 
-    # Overall status banner for the report header
-    overall_colors = {'active': '#1a7a4a', 'partial': '#c87800', 'not_found': '#c0392b'}
-    overall_labels = {
-        'active':    '&#x2714; ALL ACTIVE',
-        'partial':   '&#x26A0; PARTIAL',
-        'not_found': '&#x2716; NOT FOUND',
-    }
-    ov_bg  = overall_colors.get(overall, '#555')
-    ov_lbl = overall_labels.get(overall, overall.upper())
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SIEM Manual Signoff — {run_time}</title>
-  <style>
-    body {{
-      font-family: 'Segoe UI', Arial, sans-serif;
-      color: #222;
-      font-size: 13px;
-      line-height: 1.6;
-      background: #f4f6f9;
-      margin: 0;
-      padding: 24px;
-    }}
-    .card {{
-      background: #fff;
-      border-radius: 8px;
-      box-shadow: 0 1px 4px rgba(0,0,0,.12);
-      max-width: 760px;
-      margin: 0 auto;
-      padding: 28px 32px;
-    }}
-    .report-header {{
-      border-bottom: 2px solid #eee;
-      margin-bottom: 20px;
-      padding-bottom: 14px;
-    }}
-    .report-title {{
-      font-size: 18px;
-      font-weight: 700;
-      color: #1a1a2e;
-      margin: 0 0 4px 0;
-    }}
-    .report-meta {{
-      font-size: 12px;
-      color: #888;
-    }}
-    .overall-badge {{
-      display: inline-block;
-      background: {ov_bg};
-      color: #fff;
-      padding: 5px 18px;
-      border-radius: 20px;
-      font-size: 13px;
-      font-weight: 700;
-      margin-bottom: 16px;
-    }}
-    .footer {{
-      margin-top: 24px;
-      padding-top: 12px;
-      border-top: 1px solid #eee;
-      font-size: 11px;
-      color: #aaa;
-    }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="report-header">
-      <p class="report-title">&#x1F6E1; SIEM Manual Signoff Report</p>
-      <p class="report-meta">
-        {run_time}{by}
-        &nbsp;&middot;&nbsp; {count}
-      </p>
-    </div>
-
-    <div class="overall-badge">{ov_lbl}</div>
-
+    html = f"""<html>
+<body style="font-family:'Segoe UI',Arial,sans-serif;color:#222;
+             font-size:13px;line-height:1.6;margin:0;padding:0;">
+  <div style="max-width:700px;padding:20px 0;">
+    <p style="margin:0 0 14px 0;">Hi,</p>
+    <p style="margin:0 0 10px 0;color:#555;font-size:12px;">
+      Results for your SIEM Security Signoff request &mdash; {count}.{by}
+    </p>
     <div style="margin-bottom:18px;">{badges}</div>
-
     {''.join(sections)}
-
-    <div class="footer">
-      Manual signoff — QRadar checked on {run_time}.<br>
-      View all results in <strong>signoff_dashboard.py</strong>.
-    </div>
+    <p style="margin:20px 0 4px 0;color:#888;font-size:11px;">
+      Automated response from the SIEM monitoring system.<br>
+      Checked against QRadar on {run_time}.
+    </p>
+    <p style="margin:14px 0 0 0;">Regards,<br><strong>Cyberdefence</strong></p>
   </div>
-</body>
-</html>"""
+</body></html>"""
 
     return html, overall, host_records
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OUTLOOK DRAFT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_outlook_app():
+    """Connect to the running Outlook instance and return the Application object."""
+    try:
+        app = win32com.client.Dispatch('Outlook.Application')
+        _log("Outlook connection OK.")
+        return app
+    except Exception as exc:
+        _log(f"ERROR: Could not connect to Outlook — {exc}")
+        return None
+
+
+def create_draft(outlook_app, html_body: str, overall_status: str,
+                 subject_label: str, recipient_to: str) -> bool:
+    """
+    Create a new mail item and Save it as a draft.
+    Never calls .Send().
+
+    • Active    → To: recipient_to (the requestor you entered at the prompt)
+    • Partial / Not-Found → escalation routing (ESCALATION_TO / ESCALATION_CC),
+                            recipient_to moved to CC if supplied
+    """
+    tag_map = {'active': TAG_ACTIVE, 'partial': TAG_PARTIAL, 'not_found': TAG_NOT_FOUND}
+    tag     = tag_map.get(overall_status, TAG_ACTIVE)
+
+    try:
+        mail           = outlook_app.CreateItem(0)   # 0 = olMailItem
+        mail.Subject   = f"{tag} {subject_label}"
+        mail.HTMLBody  = html_body
+
+        if overall_status in ('partial', 'not_found'):
+            # Escalation path — same logic as signoff_runner.py
+            if ESCALATION_TO:
+                mail.To = '; '.join(ESCALATION_TO)
+            cc_parts = list(ESCALATION_CC)
+            if recipient_to:
+                cc_parts.append(recipient_to)          # keep requestor in the loop
+            if cc_parts:
+                mail.CC = '; '.join(cc_parts)
+            _log(f"      Escalation → To: {mail.To}  |  CC: {mail.CC or '(none)'}")
+        else:
+            # Active path — address to the requestor
+            if recipient_to:
+                mail.To = recipient_to
+                _log(f"      To: {recipient_to}")
+            else:
+                _log("      To: (blank — fill in manually before sending)")
+
+        mail.Save()    # DRAFT ONLY — never mail.Send()
+        _log(f"      Draft saved [{tag}]")
+        return True
+
+    except Exception as exc:
+        _log(f"      ERROR: Draft creation failed — {exc}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML FILE OUTPUT  (bonus — opens the same content in the browser)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_html_report(html: str) -> str | None:
+    """Save HTML to a timestamped file and open it in the default browser."""
+    ts       = datetime.now().strftime('%Y%m%d-%H%M%S')
+    out_path = os.path.join(_DIR, f"manual_signoff_{ts}.html")
+    try:
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write(html)
+        _log(f"HTML report saved: {out_path}")
+        try:
+            webbrowser.open('file:///' + out_path.replace('\\', '/'))
+            _log("Report opened in browser.")
+        except Exception as exc:
+            _log(f"NOTE: Could not auto-open browser ({exc}). Open the file manually.")
+        return out_path
+    except Exception as exc:
+        _log(f"ERROR: Could not save HTML report — {exc}")
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -575,8 +590,8 @@ def write_record(label: str, analyst: str, notes: str,
     data['entries'].append({
         'id':                f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
         'timestamp':         datetime.now().isoformat(),
-        'email_subject':     label,        # "Manual Signoff | host1 | host2"
-        'sender':            analyst,      # analyst name / 'Manual Entry'
+        'email_subject':     label,          # "Manual Signoff | host1 | host2"
+        'sender':            analyst,        # analyst name or 'Manual Entry'
         'overall_status':    overall_status,
         'is_revalidation':   False,
         'prior_status':      None,
@@ -588,33 +603,7 @@ def write_record(label: str, analyst: str, notes: str,
         _atomic_write_json(SIGNOFF_DATA_PATH, data)
         _log(f"      Record saved ({overall_status}) → {SIGNOFF_DATA_PATH}")
     except Exception as exc:
-        _log(f"WARNING: Data write failed: {exc}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HTML OUTPUT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def save_html_report(html: str) -> str | None:
-    """Save HTML to a timestamped file next to this script and open in browser."""
-    ts       = datetime.now().strftime('%Y%m%d-%H%M%S')
-    filename = f"manual_signoff_{ts}.html"
-    out_path = os.path.join(_DIR, filename)
-    try:
-        with open(out_path, 'w', encoding='utf-8') as f:
-            f.write(html)
-        _log(f"HTML report saved: {out_path}")
-        try:
-            # file:/// URI needs forward slashes on all platforms
-            uri = 'file:///' + out_path.replace('\\', '/')
-            webbrowser.open(uri)
-            _log("Report opened in browser.")
-        except Exception as exc:
-            _log(f"NOTE: Could not auto-open browser ({exc}). Open the file manually.")
-        return out_path
-    except Exception as exc:
-        _log(f"ERROR: Could not save HTML report: {exc}")
-        return None
+        _log(f"WARNING: Data write failed — {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -634,19 +623,18 @@ _STATUS_LABEL = {
 
 
 def _cprint(text: str, colour: str = '') -> None:
-    """Print with optional ANSI colour."""
     print(f"{colour}{text}{_C['reset']}" if colour else text)
 
 
 def print_banner() -> None:
     _cprint(f"\n{'═'*65}", _C['cyan'])
-    _cprint(f"  QRadar Manual Signoff  v1.0", _C['bold'])
-    _cprint(f"{'═'*65}", _C['cyan'])
+    _cprint(f"  QRadar Manual Signoff  v1.1", _C['bold'])
+    _cprint(f"{'═'*65}\n", _C['cyan'])
 
 
 def prompt_hostnames() -> list:
     """Prompt until at least one valid hostname is entered."""
-    print(f"\n{_C['bold']}  Enter hostname(s) separated by  |{_C['reset']}")
+    print(f"{_C['bold']}  Enter hostname(s) separated by  |{_C['reset']}")
     print(f"  {_C['dim']}Example: server01 | server02 | server03{_C['reset']}")
     print(f"  {_C['dim']}Press Ctrl-C to exit.{_C['reset']}\n")
 
@@ -656,26 +644,32 @@ def prompt_hostnames() -> list:
         except KeyboardInterrupt:
             print()
             return []
-
         hosts = [h.strip() for h in raw.split('|') if h.strip()]
         if hosts:
             return hosts
         print(f"  {_C['yellow']}⚠  No hostnames parsed — try again.{_C['reset']}\n")
 
 
-def prompt_analyst() -> tuple:
-    """Prompt for optional analyst name and notes."""
+def prompt_details() -> tuple:
+    """Prompt for recipient email, analyst name, and optional notes."""
+    print()
     try:
+        recipient = input(
+            f"  {_C['bold']}Recipient email{_C['reset']}"
+            f"{_C['dim']} (To: on the draft — press Enter to leave blank): {_C['reset']}"
+        ).strip()
         analyst = input(
-            f"\n  {_C['dim']}Your name (optional — press Enter to skip): {_C['reset']}"
+            f"  {_C['bold']}Your name     {_C['reset']}"
+            f"{_C['dim']} (optional — press Enter to skip):                {_C['reset']}"
         ).strip() or 'Manual Entry'
         notes = input(
-            f"  {_C['dim']}Notes (optional — press Enter to skip):    {_C['reset']}"
+            f"  {_C['bold']}Notes         {_C['reset']}"
+            f"{_C['dim']} (optional — press Enter to skip):                {_C['reset']}"
         ).strip()
     except KeyboardInterrupt:
         print()
-        analyst, notes = 'Manual Entry', ''
-    return analyst, notes
+        recipient, analyst, notes = '', 'Manual Entry', ''
+    return recipient, analyst, notes
 
 
 def print_summary(hostname_list: list, host_records: list,
@@ -685,7 +679,7 @@ def print_summary(hostname_list: list, host_records: list,
     ov_label  = _STATUS_LABEL.get(overall_status, overall_status.upper())
 
     print(f"\n{'─'*65}")
-    _cprint(f"  RESULT SUMMARY", _C['bold'])
+    _cprint("  RESULT SUMMARY", _C['bold'])
     print(f"{'─'*65}")
 
     col_w = max((len(h) for h in hostname_list), default=20) + 4
@@ -695,7 +689,6 @@ def print_summary(hostname_list: list, host_records: list,
         colour = _STATUS_COLOUR.get(st, '')
         label  = _STATUS_LABEL.get(st, st.upper())
 
-        # Show days-ago for the most recent active type (if available)
         days_info = ''
         for tr in rec.get('type_results', []):
             if tr.get('found') and tr.get('days_ago') is not None:
@@ -717,28 +710,32 @@ def print_summary(hostname_list: list, host_records: list,
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_once() -> None:
+def run_once(outlook_app) -> None:
     """Perform a single manual signoff query."""
     hostname_list = prompt_hostnames()
     if not hostname_list:
         return
 
-    analyst, notes = prompt_analyst()
+    recipient, analyst, notes = prompt_details()
 
     _log(f"\n  Analyst   : {analyst}")
+    _log(f"  Recipient : {recipient or '(blank)'}")
     _log(f"  Hosts     : {hostname_list}")
 
     # ── Query QRadar + build HTML ──────────────────────────────────────────────
     html, overall_status, host_records = build_reply_html(hostname_list, analyst)
     _log(f"  Overall   : {overall_status.upper()}")
 
-    # ── Save HTML report (opens browser) ──────────────────────────────────────
+    # ── Outlook draft (saved, never sent) ─────────────────────────────────────
+    subject_label = f"Security Signoff | {'|'.join(hostname_list)}"
+    create_draft(outlook_app, html, overall_status, subject_label, recipient)
+
+    # ── HTML file (opens in browser) ──────────────────────────────────────────
     out_path = save_html_report(html)
 
-    # ── Persist to signoff_data.json for dashboard ────────────────────────────
-    label = f"Manual Signoff | {'|'.join(hostname_list)}"
+    # ── Persist to signoff_data.json ──────────────────────────────────────────
     write_record(
-        label          = label,
+        label          = f"Manual Signoff | {'|'.join(hostname_list)}",
         analyst        = analyst,
         notes          = notes,
         host_records   = host_records,
@@ -755,7 +752,6 @@ def main() -> None:
 
     _ensure_data_file()
     print_banner()
-
     _log(f"  Data file  : {SIGNOFF_DATA_PATH}")
     _log(f"  Log file   : {RUN_LOG_PATH}")
 
@@ -763,6 +759,12 @@ def main() -> None:
         return
 
     try:
+        # ── Connect to Outlook once; reuse across multi-run loop ───────────────
+        outlook_app = get_outlook_app()
+        if outlook_app is None:
+            _log("ERROR: Outlook unavailable — aborting.")
+            return
+
         if not test_qradar_connection():
             _log("ERROR: QRadar unreachable — aborting.")
             return
@@ -771,7 +773,7 @@ def main() -> None:
 
         # ── Multi-run loop ─────────────────────────────────────────────────────
         while True:
-            run_once()
+            run_once(outlook_app)
 
             try:
                 again = input(
