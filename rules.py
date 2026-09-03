@@ -60,6 +60,7 @@ Outlook included, while still giving you the three views to compare.
 """
 
 import os
+import csv
 import json
 import time
 import tempfile
@@ -117,6 +118,22 @@ LOOKBACK_PERIODS = [
 # not truly dead, just possibly rare.
 RULE_DEAD_THRESHOLD = 0
 
+# ── "Newly Triggered" window (the Progress signal) ────────────────────────────
+# A rule is "Newly Triggered" when EVERY offense it has contributed to,
+# anywhere in our full visibility window (the longest LOOKBACK_PERIODS
+# window above), falls inside the last NEWLY_TRIGGERED_WINDOW_DAYS days —
+# i.e. it fired recently and has zero history before that, as far as we can
+# see. This is the ONLY thing the email's Progress section shows.
+#
+# Independent of the 1/3/6-month views above on purpose, so you can dial in
+# exactly what "recent" means for this specific question (e.g. 7 days to
+# catch this week's changes) without disturbing the Dead/Highly Active
+# thresholds. It MUST be smaller than the longest LOOKBACK_PERIODS window
+# (currently 180 days) — otherwise there's no "before" left to compare
+# against and everything with any activity would qualify. The script warns
+# at runtime if this isn't the case.
+NEWLY_TRIGGERED_WINDOW_DAYS = 7
+
 # ── Output ────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = r'C:\path\to\your\output'   # folder where Excel file is saved
 
@@ -142,6 +159,15 @@ STATE_FILE = os.path.join(OUTPUT_DIR, '.rule_effectiveness_state.json')  # don't
 # whatever the API gives us, or the honest "not available" placeholder if
 # nothing does. Missing file, or a rule_id missing from it, is fine.
 RULE_NOTES_OVERLAY_FILE = os.path.join(OUTPUT_DIR, 'rule_notes_overlay.json')
+
+# ── Manually-tested rules log (drives "Investigated Rules" in the email) ─────
+# This is YOUR record of manual triage — not anything QRadar reports. Add one
+# row per rule the moment you've manually confirmed it fires as expected
+# (via Atomic Red Team, synthetic log injection, whatever method), either by
+# editing this CSV directly or with the mark_rule_tested.py helper (which
+# also prevents duplicate rows for the same rule_id). Created automatically
+# on first run if missing. Columns: rule_id, tested_date, notes.
+TESTED_RULES_LOG_FILE = os.path.join(OUTPUT_DIR, 'tested_rules_log.csv')
 
 # ── API / networking ──────────────────────────────────────────────────────────
 REQUEST_TIMEOUT  = 30    # seconds per HTTP call
@@ -172,11 +198,11 @@ PERIOD_STATUS_DEAD          = 'Dead'
 PERIOD_STATUS_HIGHLY_ACTIVE = 'Highly Active'
 PERIOD_STATUS_ACTIVE        = 'Active'
 
-# A rule tagged "newly active" fired ONLY within the shortest window and had
-# zero contributions anywhere in the rest of the longest window — i.e. as
-# far as we can see, it just started working. This needs no run history —
-# it's derived from a single run's 1/3/6-month counts.
-LABEL_NEWLY_ACTIVE = 'Newly Active (no prior history)'
+# A rule tagged "newly triggered" fired ONLY within NEWLY_TRIGGERED_WINDOW_DAYS
+# and had zero contributions anywhere else in the full lookback window — i.e.
+# as far as we can see, it just started working. Computed fresh from a single
+# run's offense counts; no history file needed.
+LABEL_NEWLY_TRIGGERED = f'Newly Triggered (last {NEWLY_TRIGGERED_WINDOW_DAYS}d, never before)'
 
 PERIOD_NOTE = {
     PERIOD_STATUS_DEAD:          'No offenses in this window — review whether the rule is still needed.',
@@ -441,6 +467,87 @@ def _load_notes_overlay():
         return {}
 
 
+# ─── MANUALLY-TESTED RULES LOG ──────────────────────────────────────────────
+# Everything above this point is derived from QRadar's own data. This part
+# is the one place the auditor tracks something QRadar can't tell it: which
+# rules a human has actually gone and tested.
+
+def _ensure_tested_rules_log_exists():
+    """Creates the CSV with just a header row on first run. Safe to call
+    every run — it's a no-op once the file exists."""
+    if os.path.exists(TESTED_RULES_LOG_FILE):
+        return
+    try:
+        os.makedirs(os.path.dirname(TESTED_RULES_LOG_FILE), exist_ok=True)
+        with open(TESTED_RULES_LOG_FILE, 'w', newline='') as f:
+            csv.writer(f).writerow(['rule_id', 'tested_date', 'notes'])
+        print(f"   📝 Created {TESTED_RULES_LOG_FILE} — add a row (or run "
+              f"mark_rule_tested.py) each time you manually confirm a rule fires.")
+    except Exception as e:
+        logger.warning("Could not create tested rules log (%s).", e)
+
+
+def load_tested_rules_log():
+    """
+    Reads the manually-maintained tested-rules log. De-duplicated by
+    rule_id — if the same rule was logged more than once (e.g. re-tested
+    after a fix), the LAST row for that rule_id wins, but it only ever
+    counts once toward the total.
+    """
+    _ensure_tested_rules_log_exists()
+    entries = {}
+    try:
+        with open(TESTED_RULES_LOG_FILE, 'r', newline='') as f:
+            for row in csv.DictReader(f):
+                rid = str(row.get('rule_id', '')).strip()
+                if not rid:
+                    continue
+                entries[rid] = {
+                    'rule_id':     rid,
+                    'tested_date': (row.get('tested_date') or '').strip(),
+                    'notes':       (row.get('notes') or '').strip(),
+                }
+    except Exception as e:
+        logger.warning("Could not read tested rules log (%s) — treating as empty.", e)
+    return entries
+
+
+def build_tested_rules_view(master_df, tested_entries):
+    """Joins the tested-rules log with CURRENT rule metadata (name/type),
+    so a rename in QRadar doesn't leave the log showing a stale name. A
+    rule_id that no longer exists is kept (the testing work still happened)
+    but flagged as no longer found."""
+    cols = ['rule_id', 'rule_name', 'rule_type', 'tested_date', 'notes']
+    if not tested_entries:
+        return pd.DataFrame(columns=cols)
+
+    lookup = {}
+    if not master_df.empty:
+        for _, r in master_df.iterrows():
+            lookup[str(int(r['rule_id']))] = (r['rule_name'], r['rule_type'])
+
+    rows = []
+    for rid, entry in tested_entries.items():
+        name, rtype = lookup.get(rid, (f'(rule no longer found — ID {rid})', 'Unknown'))
+        rows.append({
+            'rule_id': rid, 'rule_name': name, 'rule_type': rtype,
+            'tested_date': entry['tested_date'], 'notes': entry['notes'],
+        })
+    df = pd.DataFrame(rows)
+
+    def _parse_date(s):
+        for fmt in ('%Y-%m-%d', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f'):
+            try:
+                return datetime.strptime(s, fmt)
+            except (ValueError, TypeError):
+                continue
+        return datetime.min
+
+    df['_sort'] = df['tested_date'].apply(_parse_date)
+    df = df.sort_values('_sort', ascending=False).drop(columns=['_sort']).reset_index(drop=True)
+    return df
+
+
 def _classify_single_period(count, high_activity_threshold):
     """Independent Dead/Highly Active/Active classification using ONLY this window's count."""
     if count <= RULE_DEAD_THRESHOLD:
@@ -499,6 +606,16 @@ def build_master_rule_table(rules, offenses_all):
                 counts[rid] = counts.get(rid, 0) + 1
         period_counts[key] = counts
 
+    # Independent "recent window" for the Newly Triggered signal — deliberately
+    # NOT tied to LOOKBACK_PERIODS[0], so NEWLY_TRIGGERED_WINDOW_DAYS can be
+    # tuned on its own (e.g. 7 days) without disturbing the Dead/Highly Active
+    # per-period thresholds.
+    newly_window_offenses = filter_offenses_by_days(offenses_all, NEWLY_TRIGGERED_WINDOW_DAYS)
+    newly_window_counts = {}
+    for o in newly_window_offenses:
+        for rid in _extract_rule_ids(o):
+            newly_window_counts[rid] = newly_window_counts.get(rid, 0) + 1
+
     notes_overlay = _load_notes_overlay()   # optional, hand-written — see config block
 
     rows = []
@@ -514,6 +631,7 @@ def build_master_rule_table(rules, offenses_all):
             'created':     _format_epoch_ms(rule.get('creation_date')),
             'modified':    _format_epoch_ms(rule.get('modification_date')),
             'description': overlay_note.strip() if overlay_note and overlay_note.strip() else _get_rule_description(rule),
+            'offenses_newly_window': newly_window_counts.get(rid, 0),
         }
         for p in LOOKBACK_PERIODS:
             count = period_counts[p['key']].get(rid, 0)
@@ -541,14 +659,14 @@ def build_master_rule_table(rules, offenses_all):
     df['overall_status']  = df.apply(_overall, axis=1)
     df['recommendation']  = df['overall_status'].map(_recommendation_for_status)
 
-    # "Triggered in the recent window but never before" — everything this
-    # rule has EVER contributed to, within our full visibility window, falls
-    # inside the shortest window. offenses_1m <= offenses_3m <= offenses_6m
-    # always holds (each window is a superset of the shorter ones), so
-    # offenses_6m == offenses_1m means nothing happened in between.
-    df['newly_active'] = (
-        (df[f'offenses_{longest_key}'] == df[f'offenses_{shortest_key}'])
-        & (df[f'offenses_{shortest_key}'] > 0)
+    # "Triggered in the last NEWLY_TRIGGERED_WINDOW_DAYS days and never
+    # before that" — every offense this rule has EVER contributed to, within
+    # our full visibility window, falls inside the recent window. The recent
+    # window is always a subset of the full window, so offenses_6m ==
+    # offenses_newly_window means nothing happened outside it.
+    df['newly_triggered'] = (
+        (df[f'offenses_{longest_key}'] == df['offenses_newly_window'])
+        & (df['offenses_newly_window'] > 0)
     )
     return df
 
@@ -623,27 +741,6 @@ def find_recovered_rules(master_df, previous_state):
                 'previous_run':     prev.get('run_timestamp', 'unknown'),
             })
     return pd.DataFrame(rows)
-
-
-def get_period_view(master_df, period_key):
-    """
-    Extracts one lookback window's self-contained view from the master
-    table — this is what powers each of the three switchable email
-    sections. Sorted with the most actionable rows first.
-    """
-    if master_df.empty:
-        return master_df
-    count_col  = f"offenses_{period_key}"
-    status_col = f"status_{period_key}"
-    view = master_df[['rule_id', 'rule_name', 'rule_type', 'origin', count_col, status_col]].copy()
-    view = view.rename(columns={count_col: 'offense_count', status_col: 'status'})
-    view['note'] = view['status'].map(PERIOD_NOTE).fillna('')
-    order = {PERIOD_STATUS_DEAD: 0, PERIOD_STATUS_HIGHLY_ACTIVE: 1, PERIOD_STATUS_ACTIVE: 2}
-    view['_sort'] = view['status'].map(order).fillna(3)
-    view = (view.sort_values(['_sort', 'offense_count'], ascending=[True, False])
-                .drop(columns=['_sort'])
-                .reset_index(drop=True))
-    return view
 
 
 # ─── CHART ────────────────────────────────────────────────────────────────────
@@ -818,7 +915,7 @@ def _write_master_sheet(wb, master_df):
     period_headers = [f"Offenses ({p['label']})" for p in LOOKBACK_PERIODS]
     cols = (['Rule ID', 'Rule Name', 'Type', 'Origin', 'Owner', 'Created', 'Modified']
             + period_headers
-            + ['Overall Status', 'Newly Active?', 'Recommendation', 'Description / Trigger Logic'])
+            + ['Overall Status', 'Newly Triggered?', 'Recommendation', 'Description / Trigger Logic'])
     widths = ([9, 40, 14, 10, 14, 12, 12]
               + [16] * len(period_headers)
               + [20, 12, 46, 60])
@@ -834,7 +931,7 @@ def _write_master_sheet(wb, master_df):
         values = [int(r['rule_id']), str(r['rule_name']), str(r['rule_type']),
                   str(r['origin']), str(r['owner']), str(r['created']), str(r['modified'])]
         values += [int(r[f"offenses_{p['key']}"]) for p in LOOKBACK_PERIODS]
-        values += [str(r['overall_status']), ('Yes' if r.get('newly_active') else 'No'),
+        values += [str(r['overall_status']), ('Yes' if r.get('newly_triggered') else 'No'),
                    str(r['recommendation']), str(r['description'])]
         ws.append(values)
 
@@ -886,24 +983,53 @@ def _write_progress_sheet(wb, master_df, recovered_df, has_baseline):
     """
     Two stacked blocks on one sheet — deliberately not two more tabs, since
     both lists are usually short:
-      · Recovered Since Last Audit — needs the state file / has_baseline
-      · Newly Active (No Prior History) — needs nothing but this run's data
+      · Newly Triggered — THE headline signal (matches the email exactly):
+        fired only in the last NEWLY_TRIGGERED_WINDOW_DAYS days, nothing
+        before that anywhere in the full lookback window. Needs nothing but
+        this run's data.
+      · Recovered Since Last Audit — a secondary, run-over-run comparison
+        (needs the state file / has_baseline). Kept here for anyone who
+        wants it; the email no longer surfaces it to keep that view to the
+        one clear question you asked for.
     """
-    ws = wb.create_sheet('Recovered & Newly Active')
+    ws = wb.create_sheet('Newly Triggered & Recovered')
     row = 1
 
-    ws.cell(row=row, column=1, value='Recovered Since Last Audit').font = Font(bold=True, size=12, color='065F46')
+    ws.cell(row=row, column=1,
+            value=f'Newly Triggered — Last {NEWLY_TRIGGERED_WINDOW_DAYS} Days, Never Before').font = \
+        Font(bold=True, size=12, color='065F46')
+    row += 2
+    newly = master_df[master_df['newly_triggered']] if 'newly_triggered' in master_df.columns else master_df.iloc[0:0]
+    if newly.empty:
+        ws.cell(row=row, column=1, value='No rules currently fall into this category.')
+        ws.cell(row=row, column=1).font = Font(italic=True, size=10, color='7C6FA0')
+        row += 2
+    else:
+        cols2 = ['Rule ID', 'Rule Name', 'Type', f'Offenses (last {NEWLY_TRIGGERED_WINDOW_DAYS}d)']
+        for i, c in enumerate(cols2, start=1):
+            cell = ws.cell(row=row, column=i, value=c)
+            cell.fill, cell.font, cell.alignment = _FILLS['header'], _HDR_FONT, _CENTRE
+        row += 1
+        for _, r in newly.iterrows():
+            ws.cell(row=row, column=1, value=int(r['rule_id']))
+            ws.cell(row=row, column=2, value=str(r['rule_name']))
+            ws.cell(row=row, column=3, value=str(r['rule_type']))
+            ws.cell(row=row, column=4, value=int(r['offenses_newly_window']))
+            row += 1
+        row += 1
+
+    row += 1
+    ws.cell(row=row, column=1, value='Recovered Since Last Audit (secondary — run-over-run)').font = \
+        Font(bold=True, size=12, color='7C6FA0')
     row += 2
     if not has_baseline:
         ws.cell(row=row, column=1,
                 value='No previous audit on record yet — this run establishes the baseline '
                       'that future runs will compare against.')
         ws.cell(row=row, column=1).font = Font(italic=True, size=10, color='7C6FA0')
-        row += 2
     elif recovered_df.empty:
         ws.cell(row=row, column=1, value='No rules have recovered since the last audit.')
         ws.cell(row=row, column=1).font = Font(italic=True, size=10, color='7C6FA0')
-        row += 2
     else:
         cols = ['Rule ID', 'Rule Name', 'Type', 'Was', 'Now', 'Offenses (recent window)', 'Compared Against Run']
         for i, c in enumerate(cols, start=1):
@@ -921,42 +1047,70 @@ def _write_progress_sheet(wb, master_df, recovered_df, has_baseline):
             ws.cell(row=row, column=6, value=int(r['offenses_recent']))
             ws.cell(row=row, column=7, value=str(r['previous_run']))
             row += 1
-        row += 1
-
-    row += 1
-    ws.cell(row=row, column=1, value='Newly Active — No Prior History in the 6-Month Window').font = \
-        Font(bold=True, size=12, color='065F46')
-    row += 2
-    newly = master_df[master_df['newly_active']] if 'newly_active' in master_df.columns else master_df.iloc[0:0]
-    if newly.empty:
-        ws.cell(row=row, column=1, value='No rules currently fall into this category.')
-        ws.cell(row=row, column=1).font = Font(italic=True, size=10, color='7C6FA0')
-    else:
-        cols2 = ['Rule ID', 'Rule Name', 'Type', f"Offenses ({LOOKBACK_PERIODS[0]['label']})"]
-        for i, c in enumerate(cols2, start=1):
-            cell = ws.cell(row=row, column=i, value=c)
-            cell.fill, cell.font, cell.alignment = _FILLS['header'], _HDR_FONT, _CENTRE
-        row += 1
-        for _, r in newly.iterrows():
-            ws.cell(row=row, column=1, value=int(r['rule_id']))
-            ws.cell(row=row, column=2, value=str(r['rule_name']))
-            ws.cell(row=row, column=3, value=str(r['rule_type']))
-            ws.cell(row=row, column=4, value=int(r[f"offenses_{LOOKBACK_PERIODS[0]['key']}"]))
-            row += 1
 
     for i, w in enumerate([10, 42, 14, 18, 18, 22, 20], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
-def save_excel_report(master_df, recovered_df, has_baseline, path):
+def _write_tested_rules_sheet(wb, tested_view_df, total_rules):
+    """The human-maintained log, laid out as a small report rather than a
+    plain table so 'how much have we covered' is visible at a glance."""
+    ws = wb.create_sheet('Rules Tested & Triggered')
+    investigated = len(tested_view_df)
+    pct = round(investigated / total_rules * 100) if total_rules else 0
+
+    ws['A1'] = 'Rules Tested & Triggered'
+    ws['A1'].font = Font(bold=True, size=14, color='2D2257')
+    ws['A2'] = f'{investigated} of {total_rules} rules manually validated so far ({pct}%)'
+    ws['A2'].font = Font(bold=True, size=11, color='065F46')
+    ws['A3'] = ('Maintained by hand — add a row to tested_rules_log.csv (or run '
+                'mark_rule_tested.py) each time you manually confirm a rule fires as '
+                'expected. Entries persist across runs and are de-duplicated by rule ID, '
+                'so re-testing a rule updates its date rather than adding a second row.')
+    ws['A3'].font = Font(italic=True, size=9, color='7C6FA0')
+    ws['A3'].alignment = _WRAP
+    ws.merge_cells('A3:E3')
+    ws.row_dimensions[3].height = 32
+
+    header_row = 5
+    cols = ['Rule ID', 'Rule Name', 'Type', 'Tested Date', 'Notes']
+    for i, c in enumerate(cols, start=1):
+        cell = ws.cell(row=header_row, column=i, value=c)
+        cell.fill, cell.font, cell.alignment = _FILLS['header'], _HDR_FONT, _CENTRE
+    for i, w in enumerate([10, 42, 14, 14, 60], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    if tested_view_df.empty:
+        ws.cell(row=header_row + 1, column=1, value='No rules logged as tested yet.')
+        ws.cell(row=header_row + 1, column=1).font = Font(italic=True, size=10, color='7C6FA0')
+        return
+
+    row = header_row
+    for _, r in tested_view_df.iterrows():
+        row += 1
+        try:
+            rid_val = int(r['rule_id'])
+        except (TypeError, ValueError):
+            rid_val = str(r['rule_id'])
+        ws.cell(row=row, column=1, value=rid_val)
+        ws.cell(row=row, column=2, value=str(r['rule_name']))
+        ws.cell(row=row, column=3, value=str(r['rule_type']))
+        ws.cell(row=row, column=4, value=str(r['tested_date']))
+        ws.cell(row=row, column=5, value=str(r['notes'])).alignment = _WRAP
+
+    ws.freeze_panes = f'A{header_row + 1}'
+
+
+def save_excel_report(master_df, recovered_df, has_baseline, tested_view_df, path):
     """
-    Saves the six-sheet workbook:
+    Saves the seven-sheet workbook:
       1. Executive Summary
       2. Rule Effectiveness (All Rules) — the sortable master table
       3. Dead Rules — never fired in 6 months, oldest first
       4. Recently Silent — fired historically, quiet in the last 90 days
       5. Highly Active Rules — firing well above typical volume
-      6. Recovered & Newly Active — the progress/insight sheet
+      6. Newly Triggered & Recovered — the automatic progress/insight sheet
+      7. Rules Tested & Triggered — your manual triage log
     """
     try:
         wb = openpyxl.Workbook()
@@ -979,6 +1133,7 @@ def save_excel_report(master_df, recovered_df, has_baseline, path):
         _write_filtered_sheet(wb, master_df, STATUS_HIGHLY_ACTIVE, 'Highly Active Rules',
                                sort_col=f"offenses_{LOOKBACK_PERIODS[0]['key']}", ascending=False)
         _write_progress_sheet(wb, master_df, recovered_df, has_baseline)
+        _write_tested_rules_sheet(wb, tested_view_df, len(master_df))
 
         wb.save(path)
         print(f"✅ Excel saved → {path}")
@@ -1011,368 +1166,214 @@ _C = {
     'badge_gray':  '#2d3748',
     'badge_blue':  '#1e3a5f',
 }
+_CARD_BG = '#150f33'   # metric-card / bar-track background — one step lighter than the page bg
 
 
-def _chip(label, value, color):
-    if value == 0:
-        return ''
-    return (
-        f'<span style="display:inline-block;border-left:3px solid {color};'
-        f'padding:1px 10px 1px 7px;margin:3px 8px 3px 0;font-size:10px;'
-        f'font-family:monospace;color:{color};font-weight:700;letter-spacing:0.3px;">'
-        f'{value}&nbsp;{label}</span>'
-    )
-
-
-def _rule_status_badge(status):
-    meta = {
-        PERIOD_STATUS_DEAD:          {'bg': _C['badge_red'],   'label': 'DEAD',          'icon': '●'},
-        PERIOD_STATUS_HIGHLY_ACTIVE: {'bg': _C['badge_blue'],  'label': 'HIGHLY ACTIVE', 'icon': '▲'},
-        PERIOD_STATUS_ACTIVE:        {'bg': _C['badge_green'], 'label': 'ACTIVE',        'icon': '✔'},
-        STATUS_RECENTLY_SILENT:      {'bg': _C['badge_amber'], 'label': 'INVESTIGATE',   'icon': '?'},
-    }.get(status, {'bg': _C['badge_gray'], 'label': str(status).upper()[:14], 'icon': '◌'})
-    return (
-        f'<span style="background:{meta["bg"]};color:#f0eaff;font-size:9px;'
-        f'font-weight:700;padding:2px 8px;border-radius:3px;letter-spacing:0.5px;'
-        f'white-space:nowrap;font-family:monospace;">{meta["icon"]}&nbsp;{meta["label"]}</span>'
-    )
-
-
-def _build_period_table_html(view_df):
-    """Shows only Dead + Highly Active rows for this window — the actionable
-    ones. Active rules are healthy; the full list is always in the Excel."""
+def _build_highly_active_table_html(master_df):
+    """
+    The email's ONE Highly Active section. Consolidated rather than
+    repeated per window — the 1/3/6-month columns give the same comparison
+    the old three separate sections did, without three near-identical
+    tables. Ranked by the current (shortest-window) count since that's what
+    "highly active right now" actually means.
+    """
     C = _C
-    if view_df.empty:
+    if master_df.empty:
         return f'<p style="color:{C["dim"]};font-size:11px;font-family:monospace;padding:8px 0;">No rule data available.</p>'
 
-    actionable = view_df[view_df['status'].isin([PERIOD_STATUS_DEAD, PERIOD_STATUS_HIGHLY_ACTIVE])]
-    if actionable.empty:
-        return (f'<p style="color:{C["green"]};font-size:11px;font-weight:700;'
-                f'font-family:monospace;padding:8px 0;">✔ No dead or highly active rules in this window.</p>')
-
-    rows_html = ''
-    _rb = f'border-bottom:1px solid {C["dim"]}30;'
-    for _, row in actionable.iterrows():
-        name = str(row['rule_name'])
-        name_short = name[:48] + '…' if len(name) > 48 else name
-        count_color = C['red'] if row['status'] == PERIOD_STATUS_DEAD else C['blue']
-        badge = _rule_status_badge(row['status'])
-        rows_html += f"""
-        <tr>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['violet']};
-                     font-family:monospace;" title="{name}">{name_short}</td>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};
-                     font-family:monospace;text-align:center;">{row['rule_type']}</td>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{count_color};
-                     font-family:monospace;text-align:center;font-weight:700;">{row['offense_count']}</td>
-          <td style="padding:7px 10px;{_rb}text-align:center;">{badge}</td>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};max-width:220px;">{row['note']}</td>
-        </tr>"""
-
-    _hdr = f'border-top:2px solid {C["purple"]};border-bottom:1px solid {C["purple"]}50;'
-    return f"""
-    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:8px;">
-      <thead><tr>
-        <th style="padding:6px 10px;text-align:left;font-size:9px;color:{C['purple']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Rule Name</th>
-        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['purple']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Type</th>
-        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['purple']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Offenses</th>
-        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['purple']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Status</th>
-        <th style="padding:6px 10px;text-align:left;font-size:9px;color:{C['purple']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Note</th>
-      </tr></thead>
-      <tbody>{rows_html}</tbody>
-    </table>"""
-
-
-def _build_silent_table_html(master_df, long_key):
-    C = _C
-    silent = master_df[master_df['overall_status'] == STATUS_RECENTLY_SILENT]
-    if silent.empty:
+    shortest_key = LOOKBACK_PERIODS[0]['key']
+    hi = master_df[master_df[f'status_{shortest_key}'] == PERIOD_STATUS_HIGHLY_ACTIVE]
+    if hi.empty:
         return (f'<p style="color:{C["green"]};font-size:11px;font-weight:700;font-family:monospace;'
-                f'padding:8px 0;">✔ No rules have gone quiet — everything that fired historically '
-                f'is still firing recently.</p>')
+                f'padding:8px 0;">✔ No rules are highly active right now.</p>')
 
-    silent = silent.sort_values(f'offenses_{long_key}', ascending=False)
+    hi = hi.sort_values(f'offenses_{shortest_key}', ascending=False)
     rows_html = ''
-    _rb = f'border-bottom:1px solid {C["dim"]}30;'
-    for _, row in silent.iterrows():
+    _rb = f'border-bottom:1px solid {C["dim"]}25;'
+    for _, row in hi.iterrows():
         name = str(row['rule_name'])
-        name_short = name[:48] + '…' if len(name) > 48 else name
+        name_short = name[:40] + '…' if len(name) > 40 else name
+        cells = ''.join(
+            f'<td style="padding:7px 10px;{_rb}font-size:10px;color:{C["dim"]};'
+            f'font-family:monospace;text-align:center;">{int(row[f"offenses_{p["key"]}"])}</td>'
+            for p in LOOKBACK_PERIODS
+        )
         rows_html += f"""
         <tr>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['violet']};
-                     font-family:monospace;" title="{name}">{name_short}</td>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};
-                     font-family:monospace;text-align:center;">{row['rule_type']}</td>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['amber']};
-                     font-family:monospace;text-align:center;font-weight:700;">{int(row[f'offenses_{long_key}'])}</td>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};
-                     font-family:monospace;text-align:center;">0</td>
+          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['violet']};font-family:monospace;" title="{name}">{name_short}</td>
+          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};font-family:monospace;text-align:center;">{row['rule_type']}</td>
+          {cells}
         </tr>"""
 
-    _hdr = f'border-top:2px solid {C["orange"]};border-bottom:1px solid {C["orange"]}50;'
-    return f"""
-    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:8px;">
-      <thead><tr>
-        <th style="padding:6px 10px;text-align:left;font-size:9px;color:{C['orange']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Rule Name</th>
-        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['orange']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Type</th>
-        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['orange']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Offenses (long window)</th>
-        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['orange']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Offenses (recent)</th>
-      </tr></thead>
-      <tbody>{rows_html}</tbody>
-    </table>"""
-
-
-def _build_comparison_table_html(master_df):
-    """The at-a-glance 'switch between views' table — every window's
-    category counts side by side, no clicking required."""
-    C = _C
-    _hdr = f'border-top:2px solid {C["purple"]};border-bottom:1px solid {C["purple"]}50;'
-    _rb  = f'border-bottom:1px solid {C["dim"]}30;'
-
-    header_cells = ''.join(
-        f'<th style="padding:6px 10px;text-align:center;font-size:9px;color:{C["purple"]};'
-        f'font-weight:700;text-transform:uppercase;letter-spacing:1.2px;'
-        f'font-family:monospace;{_hdr}">{p["label"]}</th>'
+    period_headers = ''.join(
+        f'<th style="padding:6px 10px;text-align:center;font-size:9px;color:{C["blue"]};font-weight:700;'
+        f'text-transform:uppercase;letter-spacing:1px;font-family:monospace;'
+        f'border-top:2px solid {C["blue"]};border-bottom:1px solid {C["blue"]}50;">{p["label"]}</th>'
         for p in LOOKBACK_PERIODS
     )
-
-    def _row(label, color):
-        cells = ''
-        for p in LOOKBACK_PERIODS:
-            count = int((master_df[f"status_{p['key']}"] == label).sum())
-            cells += (f'<td style="padding:7px 10px;{_rb}font-size:12px;color:{color};'
-                      f'font-family:monospace;text-align:center;font-weight:700;">{count}</td>')
-        return (f'<tr><td style="padding:7px 10px;{_rb}font-size:10px;color:{C["violet"]};'
-                f'font-family:monospace;font-weight:700;">{label}</td>{cells}</tr>')
-
-    rows_html = (
-        _row(PERIOD_STATUS_DEAD, C['red'])
-        + _row(PERIOD_STATUS_HIGHLY_ACTIVE, C['blue'])
-        + _row(PERIOD_STATUS_ACTIVE, C['green'])
-    )
-
+    _hdr = f'border-top:2px solid {C["blue"]};border-bottom:1px solid {C["blue"]}50;'
     return f"""
     <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:8px;">
       <thead><tr>
-        <th style="padding:6px 10px;text-align:left;font-size:9px;color:{C['purple']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Status</th>
-        {header_cells}
+        <th style="padding:6px 10px;text-align:left;font-size:9px;color:{C['blue']};font-weight:700;
+                   text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Rule Name</th>
+        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['blue']};font-weight:700;
+                   text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Type</th>
+        {period_headers}
       </tr></thead>
       <tbody>{rows_html}</tbody>
     </table>"""
 
 
-def _build_progress_table_html(master_df, recovered_df, has_baseline):
+def _build_newly_triggered_table_html(master_df):
     """
-    The 'how many have we investigated and triggered' answer, split into the
-    two things that are actually computable:
-      · Recovered since last audit (needs the state file / has_baseline)
-      · Newly active with no prior history (needs nothing extra)
+    The email's Progress section: ONLY rules that triggered in the last
+    NEWLY_TRIGGERED_WINDOW_DAYS days and never before that (as far as the
+    full lookback window lets us see). The run-over-run "recovered since
+    last audit" comparison still runs, but lives in the Excel workbook only
+    now, to keep this view to the one clear question you asked for.
     """
     C = _C
-    newly = master_df[master_df['newly_active']] if not master_df.empty else master_df
-    parts = []
+    if master_df.empty or 'newly_triggered' not in master_df.columns:
+        return f'<p style="color:{C["dim"]};font-size:11px;font-family:monospace;padding:8px 0;">No rule data available.</p>'
 
-    if not has_baseline:
-        parts.append(f'<p style="color:{C["dim"]};font-size:10px;font-family:monospace;padding:4px 0;">'
-                      f'First run with history tracking on — no prior audit to compare against yet. '
-                      f'The next run will be able to show recoveries against this baseline.</p>')
-    elif recovered_df.empty:
-        parts.append(f'<p style="color:{C["dim"]};font-size:10px;font-family:monospace;padding:4px 0;">'
-                      f'No rules have recovered since the last audit.</p>')
-    else:
-        rows_html = ''
-        _rb = f'border-bottom:1px solid {C["dim"]}30;'
-        for _, row in recovered_df.iterrows():
-            name = str(row['rule_name'])
-            name_short = name[:44] + '…' if len(name) > 44 else name
-            rows_html += f"""
+    newly = master_df[master_df['newly_triggered']]
+    if newly.empty:
+        return (f'<p style="color:{C["green"]};font-size:11px;font-weight:700;font-family:monospace;'
+                f'padding:8px 0;">✔ Nothing newly triggered in the last {NEWLY_TRIGGERED_WINDOW_DAYS} '
+                f'day(s) — no movement to report this run.</p>')
+
+    newly = newly.sort_values('offenses_newly_window', ascending=False)
+    rows_html = ''
+    _rb = f'border-bottom:1px solid {C["dim"]}25;'
+    for _, row in newly.iterrows():
+        name = str(row['rule_name'])
+        name_short = name[:48] + '…' if len(name) > 48 else name
+        rows_html += f"""
         <tr>
-          <td style="padding:6px 10px;{_rb}font-size:10px;color:{C['violet']};font-family:monospace;" title="{name}">{name_short}</td>
-          <td style="padding:6px 10px;{_rb}font-size:9px;color:{C['red']};font-family:monospace;text-align:center;">{row['previous_status']}</td>
-          <td style="padding:6px 10px;{_rb}font-size:9px;color:{C['green']};font-family:monospace;text-align:center;font-weight:700;">{row['current_status']}</td>
-          <td style="padding:6px 10px;{_rb}font-size:10px;color:{C['dim']};font-family:monospace;text-align:center;">{row['offenses_recent']}</td>
+          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['violet']};font-family:monospace;" title="{name}">{name_short}</td>
+          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};font-family:monospace;text-align:center;">{row['rule_type']}</td>
+          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['green']};font-family:monospace;text-align:center;font-weight:700;">{int(row['offenses_newly_window'])}</td>
         </tr>"""
-        parts.append(f"""
-    <div style="font-size:9px;color:{C['green']};text-transform:uppercase;letter-spacing:1.2px;
-                font-family:monospace;font-weight:700;margin-top:4px;">Recovered since last audit</div>
-    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:4px;">
+
+    _hdr = f'border-top:2px solid {C["green"]};border-bottom:1px solid {C["green"]}50;'
+    return f"""
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:8px;">
       <thead><tr>
         <th style="padding:6px 10px;text-align:left;font-size:9px;color:{C['green']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1px;font-family:monospace;border-bottom:1px solid {C['green']}50;">Rule</th>
+                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Rule Name</th>
         <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['green']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1px;font-family:monospace;border-bottom:1px solid {C['green']}50;">Was</th>
+                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Type</th>
         <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['green']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1px;font-family:monospace;border-bottom:1px solid {C['green']}50;">Now</th>
-        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['green']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1px;font-family:monospace;border-bottom:1px solid {C['green']}50;">Offenses</th>
+                   text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Offenses (last {NEWLY_TRIGGERED_WINDOW_DAYS}d)</th>
       </tr></thead>
       <tbody>{rows_html}</tbody>
-    </table>""")
-
-    if not newly.empty:
-        rows_html2 = ''
-        _rb = f'border-bottom:1px solid {C["dim"]}30;'
-        for _, row in newly.iterrows():
-            name = str(row['rule_name'])
-            name_short = name[:44] + '…' if len(name) > 44 else name
-            rows_html2 += f"""
-        <tr>
-          <td style="padding:6px 10px;{_rb}font-size:10px;color:{C['violet']};font-family:monospace;" title="{name}">{name_short}</td>
-          <td style="padding:6px 10px;{_rb}font-size:9px;color:{C['dim']};font-family:monospace;text-align:center;">{row['rule_type']}</td>
-          <td style="padding:6px 10px;{_rb}font-size:10px;color:{C['green']};font-family:monospace;text-align:center;font-weight:700;">{int(row[f"offenses_{LOOKBACK_PERIODS[0]['key']}"])}</td>
-        </tr>"""
-        parts.append(f"""
-    <div style="font-size:9px;color:{C['green']};text-transform:uppercase;letter-spacing:1.2px;
-                font-family:monospace;font-weight:700;margin-top:16px;">Newly active — no history anywhere in the 6-month window before this</div>
-    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:4px;">
-      <thead><tr>
-        <th style="padding:6px 10px;text-align:left;font-size:9px;color:{C['green']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1px;font-family:monospace;border-bottom:1px solid {C['green']}50;">Rule</th>
-        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['green']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1px;font-family:monospace;border-bottom:1px solid {C['green']}50;">Type</th>
-        <th style="padding:6px 10px;text-align:center;font-size:9px;color:{C['green']};font-weight:700;
-                   text-transform:uppercase;letter-spacing:1px;font-family:monospace;border-bottom:1px solid {C['green']}50;">Offenses (recent)</th>
-      </tr></thead>
-      <tbody>{rows_html2}</tbody>
-    </table>""")
-    elif has_baseline and recovered_df.empty:
-        # Both lists are empty and we HAVE a baseline — say so plainly rather
-        # than leaving a blank-looking section.
-        parts.append(f'<p style="color:{C["green"]};font-size:11px;font-weight:700;font-family:monospace;'
-                      f'padding:6px 0 0;">✔ Nothing newly active either — no movement to report this run.</p>')
-
-    return ''.join(parts)
+    </table>"""
 
 
-def build_email_html(master_df, recovered_df, has_baseline, chart_cid):
+def _coverage_bar_html(current, total, color):
+    """Email-safe progress bar — two <td>s with percentage widths, no CSS
+    gradients or box-shadow, so it renders the same in Outlook as anywhere
+    else."""
+    C = _C
+    total_safe = max(total, 1)
+    pct = min(100, round(current / total_safe * 100))
+    return f"""
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:10px;">
+      <tr>
+        <td width="{pct}%" style="background:{color};height:7px;font-size:1px;line-height:1px;">&nbsp;</td>
+        <td width="{100 - pct}%" style="background:{_CARD_BG};height:7px;font-size:1px;line-height:1px;">&nbsp;</td>
+      </tr>
+    </table>
+    <div style="font-size:9px;color:{C['dim']};margin-top:4px;font-family:monospace;text-align:right;">
+      {current} of {total} rules manually verified ({pct}%)
+    </div>"""
+
+
+def build_email_html(master_df, recovered_df, has_baseline, tested_view_df, chart_cid):
     """Assembles the full HTML email body."""
     C        = _C
     run_time = datetime.now().strftime('%d %b %Y  ·  %H:%M:%S')
 
     if master_df.empty:
-        return f"""<!DOCTYPE html><html><body style="font-family:monospace;padding:24px;">
+        return f"""<!DOCTYPE html><html><body bgcolor="{_BG}" style="margin:0;padding:0;background-color:{_BG};font-family:monospace;">
+        <table width="100%" bgcolor="{_BG}" style="background-color:{_BG};"><tr><td style="padding:24px;">
         <h2 style="color:{C['purple']};">QRadar Rule Effectiveness Report</h2>
         <p style="color:{C['dim']};">No enabled rules or offense data were available at
         {run_time}. Check the console output for connection or permission errors.</p>
-        </body></html>"""
+        </td></tr></table></body></html>"""
 
     total_rules   = len(master_df)
-    dead_total    = int((master_df['overall_status'] == STATUS_DEAD).sum())
-    silent_total  = int((master_df['overall_status'] == STATUS_RECENTLY_SILENT).sum())
     hi_1m_total   = int((master_df[f"status_{LOOKBACK_PERIODS[0]['key']}"] == PERIOD_STATUS_HIGHLY_ACTIVE).sum())
-    newly_total   = int(master_df['newly_active'].sum())
-    positive_total = len(recovered_df) + newly_total
+    newly_triggered_total = int(master_df['newly_triggered'].sum())
+    investigated_total    = len(tested_view_df) if tested_view_df is not None else 0
 
-    if dead_total > 10 or silent_total > 5:
-        hdr_bg, hdr_txt = C['badge_red'], f'⚠  {dead_total + silent_total} RULES NEED ATTENTION'
-    elif dead_total > 0 or silent_total > 0:
-        hdr_bg, hdr_txt = C['badge_amber'], f'⚠  {dead_total + silent_total} RULES NEED ATTENTION'
+    if newly_triggered_total > 0:
+        hdr_bg, hdr_txt = C['badge_green'], f'✔  {newly_triggered_total} NEWLY TRIGGERED'
+    elif hi_1m_total > 0:
+        hdr_bg, hdr_txt = C['badge_blue'], f'▲  {hi_1m_total} HIGHLY ACTIVE'
     else:
-        hdr_bg, hdr_txt = C['badge_green'], '✔  RULES HEALTHY'
+        hdr_bg, hdr_txt = C['badge_green'], '✔  STEADY STATE'
 
     def badge(bg, txt):
         return (f'<span style="background:{bg};color:#f0eaff;font-size:10px;font-weight:700;'
                 f'padding:4px 12px;border-radius:3px;letter-spacing:0.8px;'
                 f'font-family:monospace;white-space:nowrap;">{txt}</span>')
 
-    def metric(label, value, color, note=''):
-        note_html = (f'<div style="font-size:9px;color:{C["dim"]};margin-top:3px;'
+    def metric_card(label, value, color, note=''):
+        note_html = (f'<div style="font-size:9px;color:{C["dim"]};margin-top:4px;'
                      f'font-family:monospace;">{note}</div>') if note else ''
-        return (f'<td style="padding:0 22px 0 0;text-align:center;vertical-align:top;">'
-                f'<div style="font-size:30px;font-weight:800;color:{color};line-height:1;'
+        return (f'<td width="25%" style="padding:4px;">'
+                f'<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">'
+                f'<tr><td style="background:{_CARD_BG};border:1px solid {color}55;border-radius:10px;'
+                f'padding:14px 8px;text-align:center;">'
+                f'<div style="font-size:26px;font-weight:800;color:{color};line-height:1;'
                 f'font-family:monospace;letter-spacing:-1px;">{value}</div>'
-                f'<div style="font-size:9px;color:{C["dim"]};margin-top:4px;'
-                f'text-transform:uppercase;letter-spacing:1.2px;">{label}</div>{note_html}</td>')
+                f'<div style="font-size:9px;color:{C["dim"]};margin-top:6px;'
+                f'text-transform:uppercase;letter-spacing:1px;">{label}</div>{note_html}'
+                f'</td></tr></table></td>')
 
     headline_metrics = (
-        metric('Total Rules', total_rules, C['purple'])
-        + metric('Dead (6mo)', dead_total, C['red'] if dead_total > 0 else C['green'])
-        + metric('Investigate', silent_total, C['orange'] if silent_total > 0 else C['green'], 'quiet after firing')
-        + metric('Highly Active (1mo)', hi_1m_total, C['blue'] if hi_1m_total > 0 else C['green'])
-        + metric('Recovered / New', positive_total, C['green'], 'since last audit + newly active')
+        metric_card('Total Rules', total_rules, C['purple'])
+        + metric_card('Highly Active (1mo)', hi_1m_total, C['blue'])
+        + metric_card(f'Newly Triggered ({NEWLY_TRIGGERED_WINDOW_DAYS}d)', newly_triggered_total, C['green'])
+        + metric_card('Investigated Rules', investigated_total, C['cyan'])
     )
+    coverage_bar = _coverage_bar_html(investigated_total, total_rules, C['cyan'])
 
-    nav_pill_style = (f'display:inline-block;padding:6px 16px;margin:0 6px 8px 0;'
-                      f'border:1px solid {C["purple"]}60;border-radius:20px;'
-                      f'color:{C["violet"]};font-size:10px;font-weight:700;'
-                      f'font-family:monospace;text-decoration:none;letter-spacing:0.5px;')
-    nav_html = ''.join(
-        f'<a href="#view-{p["key"]}" style="{nav_pill_style}">{p["label"].upper()}</a>'
-        for p in LOOKBACK_PERIODS
-    )
-
-    comparison_table = _build_comparison_table_html(master_df)
-    silent_table      = _build_silent_table_html(master_df, LOOKBACK_PERIODS[-1]['key'])
-    progress_html     = _build_progress_table_html(master_df, recovered_df, has_baseline)
     chart_html = (f'<img src="cid:{chart_cid}" alt="Rule status trend chart" '
-                  f'style="display:block;max-width:100%;margin:14px auto 0;">') if chart_cid else ''
+                  f'style="display:block;max-width:100%;margin:14px auto 0;border-radius:8px;">') if chart_cid else ''
+    progress_html      = _build_newly_triggered_table_html(master_df)
+    highly_active_html = _build_highly_active_table_html(master_df)
 
-    period_sections = ''
-    for p in LOOKBACK_PERIODS:
-        view = get_period_view(master_df, p['key'])
-        dead_n   = int((view['status'] == PERIOD_STATUS_DEAD).sum())          if not view.empty else 0
-        hi_n     = int((view['status'] == PERIOD_STATUS_HIGHLY_ACTIVE).sum()) if not view.empty else 0
-        active_n = int((view['status'] == PERIOD_STATUS_ACTIVE).sum())        if not view.empty else 0
-
-        if dead_n > 10 or hi_n > 5:
-            p_bg, p_txt = C['badge_red'], f'⚠ {dead_n + hi_n} flagged'
-        elif dead_n > 0 or hi_n > 0:
-            p_bg, p_txt = C['badge_amber'], f'⚠ {dead_n + hi_n} flagged'
-        else:
-            p_bg, p_txt = C['badge_green'], '✔ healthy'
-
-        table_html = _build_period_table_html(view)
-
-        period_sections += f"""
-  <tr><td id="view-{p['key']}" style="padding:28px 0 4px;border-top:2px solid {C['purple']}50;">
-    <table width="100%" cellpadding="0" cellspacing="0"><tr>
-      <td>
-        <span style="font-size:13px;font-weight:700;color:{C['purple']};font-family:monospace;">
-          {p['label']} View</span>
-        <span style="font-size:10px;color:{C['dim']};margin-left:12px;font-family:monospace;">
-          lookback: {p['days']} days</span>
-      </td>
-      <td align="right">{badge(p_bg, p_txt)}</td>
-    </tr></table>
-    <div style="margin-top:8px;">
-      {_chip('Dead', dead_n, C['red'])}
-      {_chip('Highly Active', hi_n, C['blue'])}
-      {_chip('Active', active_n, C['green'])}
-    </div>
-    {table_html}
+    def section_header(icon, title, color, subtitle):
+        return f"""
+  <tr><td style="padding:24px 0 4px;border-top:2px solid {color}60;">
+    <span style="font-size:13px;font-weight:700;color:{color};font-family:monospace;">{icon} {title}</span>
+    <div style="font-size:10px;color:{C['dim']};margin-top:4px;">{subtitle}</div>
   </td></tr>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="color-scheme" content="light dark">
-<meta name="supported-color-schemes" content="light dark">
+<meta name="color-scheme" content="dark">
+<meta name="supported-color-schemes" content="dark">
 </head>
-<body style="margin:0;padding:0;font-family:'Segoe UI',Helvetica,Arial,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0;">
+<body bgcolor="{_BG}" style="margin:0;padding:0;background-color:{_BG};font-family:'Segoe UI',Helvetica,Arial,sans-serif;">
+<table width="100%" bgcolor="{_BG}" cellpadding="0" cellspacing="0" style="background-color:{_BG};padding:24px 0;">
 <tr><td align="center">
-<table width="660" cellpadding="0" cellspacing="0" style="max-width:660px;width:100%;">
+<table width="660" cellpadding="0" cellspacing="0" style="max-width:660px;width:100%;background-color:{_BG};">
 
   <!-- ══ MASTHEAD ══ -->
-  <tr><td style="padding:0 0 10px;border-bottom:3px solid {C['purple']};">
+  <tr><td style="padding:4px 0 14px;border-bottom:3px solid {C['purple']};">
     <table width="100%" cellpadding="0" cellspacing="0"><tr>
       <td>
         <div style="font-size:9px;color:{C['dim']};letter-spacing:3px;
                     text-transform:uppercase;font-family:monospace;margin-bottom:8px;">
           QRadar &nbsp;·&nbsp; Weekly Intelligence Report
         </div>
-        <div style="font-size:23px;font-weight:800;color:{C['violet']};
+        <div style="font-size:24px;font-weight:800;color:{C['violet']};
                     letter-spacing:-0.5px;line-height:1.2;">
           Rule Effectiveness Auditor
         </div>
@@ -1383,57 +1384,34 @@ def build_email_html(master_df, recovered_df, has_baseline, chart_cid):
   </td></tr>
 
   <!-- ══ HEADLINE METRICS ══ -->
-  <tr><td style="padding:20px 0 8px;">
-    <table cellpadding="0" cellspacing="0"><tr>{headline_metrics}</tr></table>
+  <tr><td style="padding:20px 0 4px;">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>{headline_metrics}</tr></table>
   </td></tr>
+  <tr><td style="padding:4px 4px 8px;">{coverage_bar}</td></tr>
 
-  <!-- ══ COMPARISON — the "all three views at once" table ══ -->
+  <!-- ══ TREND CHART — unchanged 1/3/6-month comparison ══ -->
   <tr><td style="padding:16px 0 2px;">
     <span style="font-size:9px;color:{C['purple']};text-transform:uppercase;letter-spacing:2px;
-                 font-family:monospace;font-weight:700;">1 / 3 / 6 Month Comparison</span>
-    <span style="font-size:10px;color:{C['dim']};margin-left:10px;">
-      Rule count by status, across every lookback window
-    </span>
+                 font-family:monospace;font-weight:700;">1 / 3 / 6 Month Trend</span>
   </td></tr>
-  <tr><td style="padding:0 0 8px;">{comparison_table}</td></tr>
-  <tr><td style="padding:0 0 20px;text-align:center;">{chart_html}</td></tr>
+  <tr><td style="padding:0 0 8px;text-align:center;">{chart_html}</td></tr>
 
-  <!-- ══ NEEDS INVESTIGATION ══ -->
-  <tr><td style="padding:20px 0 4px;border-top:2px solid {C['orange']}60;">
-    <span style="font-size:13px;font-weight:700;color:{C['orange']};font-family:monospace;">
-      ⚠ Needs Investigation — Recently Silent</span>
-    <div style="font-size:10px;color:{C['dim']};margin-top:4px;">
-      Fired at some point in the last {LOOKBACK_PERIODS[-1]['days']} days, but nothing in the
-      last {LOOKBACK_PERIODS[1]['days']} — check these before assuming they're just low-frequency.
-    </div>
-  </td></tr>
-  <tr><td style="padding:0 0 28px;">{silent_table}</td></tr>
+  {section_header('✔', 'Progress — Newly Triggered', C['green'],
+                   f"Fired in the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s) and never before that, "
+                   f"anywhere in the full lookback window.")}
+  <tr><td style="padding:0 0 8px;">{progress_html}</td></tr>
 
-  <!-- ══ PROGRESS — recovered + newly active ══ -->
-  <tr><td style="padding:20px 0 4px;border-top:2px solid {C['green']}60;">
-    <span style="font-size:13px;font-weight:700;color:{C['green']};font-family:monospace;">
-      ✔ Progress — Recovered &amp; Newly Active</span>
-    <div style="font-size:10px;color:{C['dim']};margin-top:4px;">
-      Rules that were flagged before and are firing again, plus rules with no
-      history at all until this window — the "did it actually get fixed" view.
-    </div>
-  </td></tr>
-  <tr><td style="padding:0 0 28px;">{progress_html}</td></tr>
-
-  <!-- ══ QUICK NAV ══ -->
-  <tr><td style="padding:4px 0 4px;border-top:1px solid {C['purple']}30;">
-    <div style="font-size:9px;color:{C['dim']};text-transform:uppercase;letter-spacing:1.5px;
-                font-family:monospace;padding:14px 0 6px;">Jump to a window's detail</div>
-    {nav_html}
-  </td></tr>
-
-  {period_sections}
+  {section_header('▲', 'Highly Active Rules', C['blue'],
+                   "Firing well above typical volume for their window right now — worth confirming "
+                   "the volume is genuine and thresholds are tuned as intended.")}
+  <tr><td style="padding:0 0 20px;">{highly_active_html}</td></tr>
 
   <!-- ══ FOOTER ══ -->
-  <tr><td style="padding:20px 0 20px;border-top:1px solid {C['purple']}30;">
-    <div style="font-size:9px;color:{C['dim']};font-family:monospace;letter-spacing:0.5px;">
-      QRadar Rule Effectiveness Auditor &nbsp;·&nbsp; Auto-generated {run_time} &nbsp;·&nbsp;
-      Source: QRadar REST API (no AQL) &nbsp;·&nbsp; Full data for every rule in the Excel attachment
+  <tr><td style="padding:16px 0 20px;border-top:1px solid {C['purple']}30;">
+    <div style="font-size:9px;color:{C['dim']};font-family:monospace;letter-spacing:0.5px;line-height:1.6;">
+      QRadar Rule Effectiveness Auditor &nbsp;·&nbsp; Auto-generated {run_time}<br>
+      Dead &amp; Recently Silent rules, the full Highly Active history, and the tested-rules log
+      are all in the attached Excel workbook — this email intentionally shows only what's moving.
     </div>
   </td></tr>
 
@@ -1534,22 +1512,31 @@ def main():
               f"environment actually returns, and consider populating {RULE_NOTES_OVERLAY_FILE} "
               f"for your Dead / Recently Silent rules.")
 
-    # ── Run-history comparison (recovered since last audit) ──────────────────
+    longest_days = LOOKBACK_PERIODS[-1]['days']
+    if NEWLY_TRIGGERED_WINDOW_DAYS >= longest_days:
+        print(f"\n   ⚠️  NEWLY_TRIGGERED_WINDOW_DAYS ({NEWLY_TRIGGERED_WINDOW_DAYS}) should be smaller "
+              f"than the longest lookback window ({longest_days} days) — otherwise there's no "
+              f"'before' period left to compare against and every rule with any activity would "
+              f"qualify as 'newly triggered'.")
+
+    newly_triggered_count = int(master_df['newly_triggered'].sum())
+    print(f"\n   ↑ {newly_triggered_count} rule(s) triggered in the last {NEWLY_TRIGGERED_WINDOW_DAYS} "
+          f"day(s) and never before that.")
+
+    # ── Run-history comparison (recovered since last audit — Excel only) ─────
     previous_state = load_previous_state() if ENABLE_RUN_HISTORY else None
     has_baseline   = previous_state is not None
     recovered_df   = find_recovered_rules(master_df, previous_state) if has_baseline else pd.DataFrame()
-    newly_active_count = int(master_df['newly_active'].sum())
 
     if not ENABLE_RUN_HISTORY:
-        print("\n   ℹ️  Run-history tracking is off (ENABLE_RUN_HISTORY=False) — "
-              "'recovered since last audit' will be skipped this run.")
+        print("   ℹ️  Run-history tracking is off (ENABLE_RUN_HISTORY=False) — "
+              "'recovered since last audit' (Excel only) will be skipped this run.")
     elif not has_baseline:
-        print("\n   ℹ️  No previous audit on record — this run establishes the baseline. "
-              "Next run will be able to show recoveries against it.")
+        print("   ℹ️  No previous audit on record — this run establishes the baseline for "
+              "the Excel workbook's 'recovered since last audit' comparison.")
     else:
-        print(f"\n   ↑ {len(recovered_df)} rule(s) recovered since the last audit "
-              f"(previously Dead / Recently Silent, now firing again).")
-    print(f"   ↑ {newly_active_count} rule(s) newly active with no prior history in the 6-month window.")
+        print(f"   ℹ️  {len(recovered_df)} rule(s) recovered since the last audit "
+              f"(see the Excel workbook — this run's email focuses on Newly Triggered only).")
 
     if ENABLE_RUN_HISTORY:
         save_current_state(master_df, datetime.now().isoformat())
@@ -1569,11 +1556,10 @@ def main():
     html_body = build_email_html(master_df, recovered_df, has_baseline,
                                   chart_cid='rule_trend' if chart_path else None)
 
-    dead_total     = int((master_df['overall_status'] == STATUS_DEAD).sum())
-    positive_total = len(recovered_df) + newly_active_count
+    dead_total = int((master_df['overall_status'] == STATUS_DEAD).sum())
     subject = (
         f"QRadar Rule Effectiveness — {dead_total} dead, "
-        f"{silent_count} need investigation, {positive_total} recovered/new"
+        f"{silent_count} need investigation, {newly_triggered_count} newly triggered"
     )
 
     images = {'rule_trend': chart_path} if chart_path else {}
