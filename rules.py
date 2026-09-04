@@ -175,6 +175,9 @@ MAX_RETRIES      = 3     # attempts before giving up (exponential backoff)
 RETRY_DELAY_BASE = 1.5   # seconds — waits: 1.5s → 3s → 6s
 API_PAGE_SIZE    = 9999  # max items per page (QRadar Range header, 0-indexed)
 MAX_PAGES        = 100   # safety cap on pagination loops (100 x 10000 = 1M items)
+QRADAR_API_VERSION = '14.0'   # sent as the 'Version' header on every request — bump
+                               # this if your deployment is on a materially different
+                               # QRadar release and you hit unexpected 4xx errors
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  END CONFIGURATION
@@ -225,7 +228,7 @@ def _api_get_page(path, range_start, range_end, params=None, label='request'):
     url     = f"{QRADAR_HOST.rstrip('/')}{path}"
     headers = {
         'Accept':  'application/json',
-        'Version': '14.0',
+        'Version': QRADAR_API_VERSION,
         'Range':   f'items={range_start}-{range_end}',
     }
     last_err = None
@@ -322,6 +325,51 @@ def _api_get_all(path, params=None, label='request', page_size=None, max_pages=M
 
 
 # ─── CONNECTION TEST ──────────────────────────────────────────────────────────
+
+def validate_config():
+    """
+    Catches the mistakes people actually make editing the config block,
+    before they turn into a confusing failure five minutes into a run.
+    Returns True if it's safe to proceed.
+    """
+    problems = []
+
+    if QRADAR_HOST.rstrip('/') in ('https://your-qradar-host', ''):
+        problems.append("QRADAR_HOST is still the placeholder — set it to your real console URL.")
+    if QRADAR_USERNAME in ('your-username', '') or QRADAR_PASSWORD in ('your-password', ''):
+        problems.append("QRADAR_USERNAME / QRADAR_PASSWORD look like the placeholders.")
+    if OUTPUT_DIR == r'C:\path\to\your\output':
+        problems.append("OUTPUT_DIR is still the placeholder path.")
+
+    days = [p['days'] for p in LOOKBACK_PERIODS]
+    if len(LOOKBACK_PERIODS) != 3:
+        problems.append(f"LOOKBACK_PERIODS has {len(LOOKBACK_PERIODS)} entries — the auditor "
+                         f"assumes exactly 3 (short/mid/long) throughout.")
+    elif days != sorted(days) or len(set(days)) != 3:
+        problems.append(f"LOOKBACK_PERIODS days must be strictly increasing (got {days}).")
+
+    thresholds = [p['high_activity_threshold'] for p in LOOKBACK_PERIODS]
+    if thresholds != sorted(thresholds):
+        problems.append(f"high_activity_threshold should increase with window length (got {thresholds}) "
+                         f"— otherwise 'Highly Active' won't mean a consistent rate across windows.")
+
+    if NEWLY_TRIGGERED_WINDOW_DAYS >= LOOKBACK_PERIODS[-1]['days']:
+        problems.append(f"NEWLY_TRIGGERED_WINDOW_DAYS ({NEWLY_TRIGGERED_WINDOW_DAYS}) must be smaller "
+                         f"than the longest lookback window ({LOOKBACK_PERIODS[-1]['days']} days).")
+    if NEWLY_TRIGGERED_WINDOW_DAYS <= 0:
+        problems.append("NEWLY_TRIGGERED_WINDOW_DAYS must be a positive number of days.")
+
+    if problems:
+        print("⚠️  Configuration issues found:")
+        for p in problems:
+            print(f"   - {p}")
+        print()
+
+    # Placeholder host/creds are fatal (nothing downstream will work);
+    # everything else is a warning we can still run with.
+    fatal = any('placeholder' in p and 'QRADAR_' in p for p in problems)
+    return not fatal
+
 
 def test_connection():
     print("🔗 Testing QRadar connection...")
@@ -423,6 +471,39 @@ def _extract_rule_ids(offense):
             except (TypeError, ValueError):
                 pass
     return ids
+
+
+def _html_escape(text):
+    """
+    Every rule name / description / note that lands in the email comes from
+    QRadar or a human-edited file, not from us — none of it is guaranteed
+    to be HTML-safe. A rule named "Alerts < 5 & > 1" or a CSV note with a
+    stray "<" would otherwise corrupt the email's markup. Cheap insurance,
+    always applied right before a value is dropped into an f-string of HTML.
+    """
+    if text is None:
+        return ''
+    text = str(text)
+    return (text.replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;')
+                .replace('"', '&quot;'))
+
+
+def _csv_formula_safe(text):
+    """
+    Defangs a value before it's written into a cell that Excel/CSV might
+    interpret as a formula (a leading =, +, -, @, tab, or CR can trigger
+    "CSV/Excel formula injection" if the file is ever opened by someone
+    other than its author). These notes come from a human-edited file, so
+    the risk here is low, but it costs nothing to prefix defensively.
+    """
+    if text is None:
+        return ''
+    text = str(text)
+    if text and text[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + text
+    return text
 
 
 def _format_epoch_ms(val):
@@ -531,7 +612,7 @@ def build_tested_rules_view(master_df, tested_entries):
         name, rtype = lookup.get(rid, (f'(rule no longer found — ID {rid})', 'Unknown'))
         rows.append({
             'rule_id': rid, 'rule_name': name, 'rule_type': rtype,
-            'tested_date': entry['tested_date'], 'notes': entry['notes'],
+            'tested_date': entry['tested_date'], 'notes': _csv_formula_safe(entry['notes']),
         })
     df = pd.DataFrame(rows)
 
@@ -624,13 +705,13 @@ def build_master_rule_table(rules, offenses_all):
         overlay_note = notes_overlay.get(str(rid))
         row = {
             'rule_id':     rid,
-            'rule_name':   rule.get('name', f'Rule {rid}'),
+            'rule_name':   _csv_formula_safe(rule.get('name', f'Rule {rid}')),
             'rule_type':   rule.get('type', 'UNKNOWN'),
             'origin':      rule.get('origin', 'UNKNOWN'),
             'owner':       rule.get('owner', 'Unknown'),
             'created':     _format_epoch_ms(rule.get('creation_date')),
             'modified':    _format_epoch_ms(rule.get('modification_date')),
-            'description': overlay_note.strip() if overlay_note and overlay_note.strip() else _get_rule_description(rule),
+            'description': _csv_formula_safe(overlay_note.strip() if overlay_note and overlay_note.strip() else _get_rule_description(rule)),
             'offenses_newly_window': newly_window_counts.get(rid, 0),
         }
         for p in LOOKBACK_PERIODS:
@@ -943,6 +1024,7 @@ def _write_master_sheet(wb, master_df):
         ws.cell(row=r_idx, column=desc_col_idx).alignment = _WRAP
 
     ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
 
 
 def _write_filtered_sheet(wb, master_df, status_value, sheet_title, sort_col, ascending):
@@ -977,6 +1059,7 @@ def _write_filtered_sheet(wb, master_df, status_value, sheet_title, sort_col, as
         ws.cell(row=ws.max_row, column=desc_col_idx).alignment = _WRAP
 
     ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
 
 
 def _write_progress_sheet(wb, master_df, recovered_df, has_baseline):
@@ -1099,6 +1182,7 @@ def _write_tested_rules_sheet(wb, tested_view_df, total_rules):
         ws.cell(row=row, column=5, value=str(r['notes'])).alignment = _WRAP
 
     ws.freeze_panes = f'A{header_row + 1}'
+    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(cols))}{ws.max_row}"
 
 
 def save_excel_report(master_df, recovered_df, has_baseline, tested_view_df, path):
@@ -1111,6 +1195,11 @@ def save_excel_report(master_df, recovered_df, has_baseline, tested_view_df, pat
       5. Highly Active Rules — firing well above typical volume
       6. Newly Triggered & Recovered — the automatic progress/insight sheet
       7. Rules Tested & Triggered — your manual triage log
+
+    Returns the path actually written to (may differ from `path` if it was
+    locked and we fell back to a timestamped filename), or None on total
+    failure. A locked output file used to mean the whole run's analysis was
+    thrown away — now it just lands next to the usual file instead.
     """
     try:
         wb = openpyxl.Workbook()
@@ -1120,28 +1209,34 @@ def save_excel_report(master_df, recovered_df, has_baseline, tested_view_df, pat
             ws.title = 'No Data'
             ws['A1'] = 'No enabled rules or offense data were available to analyze.'
             ws['A1'].font = _BOLD
+        else:
+            _write_summary_sheet(wb, master_df)
+            _write_master_sheet(wb, master_df)
+            _write_filtered_sheet(wb, master_df, STATUS_DEAD, 'Dead Rules',
+                                   sort_col='created', ascending=True)
+            _write_filtered_sheet(wb, master_df, STATUS_RECENTLY_SILENT, 'Recently Silent',
+                                   sort_col=f"offenses_{LOOKBACK_PERIODS[-1]['key']}", ascending=False)
+            _write_filtered_sheet(wb, master_df, STATUS_HIGHLY_ACTIVE, 'Highly Active Rules',
+                                   sort_col=f"offenses_{LOOKBACK_PERIODS[0]['key']}", ascending=False)
+            _write_progress_sheet(wb, master_df, recovered_df, has_baseline)
+            _write_tested_rules_sheet(wb, tested_view_df, len(master_df))
+
+        try:
             wb.save(path)
-            print(f"⚠️  Excel saved with no data → {path}")
-            return
+            print(f"✅ Excel saved → {path}")
+            return path
+        except PermissionError:
+            fallback = path.replace('.xlsx', f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+            print(f"⚠️  '{path}' is open elsewhere — saving to '{fallback}' instead so this "
+                  f"run isn't lost. Close the original file to have future runs overwrite it again.")
+            wb.save(fallback)
+            print(f"✅ Excel saved → {fallback}")
+            return fallback
 
-        _write_summary_sheet(wb, master_df)
-        _write_master_sheet(wb, master_df)
-        _write_filtered_sheet(wb, master_df, STATUS_DEAD, 'Dead Rules',
-                               sort_col='created', ascending=True)
-        _write_filtered_sheet(wb, master_df, STATUS_RECENTLY_SILENT, 'Recently Silent',
-                               sort_col=f"offenses_{LOOKBACK_PERIODS[-1]['key']}", ascending=False)
-        _write_filtered_sheet(wb, master_df, STATUS_HIGHLY_ACTIVE, 'Highly Active Rules',
-                               sort_col=f"offenses_{LOOKBACK_PERIODS[0]['key']}", ascending=False)
-        _write_progress_sheet(wb, master_df, recovered_df, has_baseline)
-        _write_tested_rules_sheet(wb, tested_view_df, len(master_df))
-
-        wb.save(path)
-        print(f"✅ Excel saved → {path}")
-    except PermissionError:
-        print(f"❌ Cannot save Excel — is '{path}' already open?")
     except Exception as e:
         logger.error("Excel save failed:\n%s", traceback.format_exc())
         print(f"❌ Excel save error: {e}")
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1191,8 +1286,9 @@ def _build_highly_active_table_html(master_df):
     rows_html = ''
     _rb = f'border-bottom:1px solid {C["dim"]}25;'
     for _, row in hi.iterrows():
-        name = str(row['rule_name'])
+        name = _html_escape(row['rule_name'])
         name_short = name[:40] + '…' if len(name) > 40 else name
+        rtype = _html_escape(row['rule_type'])
         cells = ''.join(
             f'<td style="padding:7px 10px;{_rb}font-size:10px;color:{C["dim"]};'
             f'font-family:monospace;text-align:center;">{int(row[f"offenses_{p["key"]}"])}</td>'
@@ -1201,7 +1297,7 @@ def _build_highly_active_table_html(master_df):
         rows_html += f"""
         <tr>
           <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['violet']};font-family:monospace;" title="{name}">{name_short}</td>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};font-family:monospace;text-align:center;">{row['rule_type']}</td>
+          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};font-family:monospace;text-align:center;">{rtype}</td>
           {cells}
         </tr>"""
 
@@ -1247,12 +1343,13 @@ def _build_newly_triggered_table_html(master_df):
     rows_html = ''
     _rb = f'border-bottom:1px solid {C["dim"]}25;'
     for _, row in newly.iterrows():
-        name = str(row['rule_name'])
+        name = _html_escape(row['rule_name'])
         name_short = name[:48] + '…' if len(name) > 48 else name
+        rtype = _html_escape(row['rule_type'])
         rows_html += f"""
         <tr>
           <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['violet']};font-family:monospace;" title="{name}">{name_short}</td>
-          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};font-family:monospace;text-align:center;">{row['rule_type']}</td>
+          <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['dim']};font-family:monospace;text-align:center;">{rtype}</td>
           <td style="padding:7px 10px;{_rb}font-size:10px;color:{C['green']};font-family:monospace;text-align:center;font-weight:700;">{int(row['offenses_newly_window'])}</td>
         </tr>"""
 
@@ -1423,7 +1520,7 @@ def build_email_html(master_df, recovered_df, has_baseline, tested_view_df, char
 
 # ─── OUTLOOK DRAFT ────────────────────────────────────────────────────────────
 
-def create_outlook_draft(excel_path, subject, html_body, images):
+def create_outlook_draft(excel_path, subject, html_body, images, high_importance=False):
     """
     Creates an Outlook draft with embedded PNG chart(s) and Excel attachment.
     images = {'cid_key': '/path/to/file.png', ...}
@@ -1432,6 +1529,8 @@ def create_outlook_draft(excel_path, subject, html_body, images):
         outlook = win32com.client.Dispatch('Outlook.Application')
         mail    = outlook.CreateItem(0)
         mail.Subject = subject
+        if high_importance:
+            mail.Importance = 2   # olImportanceHigh
 
         if excel_path and os.path.exists(excel_path):
             mail.Attachments.Add(excel_path)
@@ -1469,8 +1568,13 @@ def main():
     print("=" * 62)
     print(f"  Host            : {QRADAR_HOST}")
     print(f"  Lookback windows: {', '.join(p['label'] for p in LOOKBACK_PERIODS)}")
+    print(f"  Newly-triggered : last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s), never before")
     print(f"  Retry config    : {MAX_RETRIES} attempts, {RETRY_DELAY_BASE}s base backoff")
     print("=" * 62)
+
+    if not validate_config():
+        print("❌ Fix the configuration issues above before running.")
+        return
 
     if not test_connection():
         return
@@ -1506,18 +1610,11 @@ def main():
 
     placeholder_desc = 'Not exposed via API'
     undocumented = int(master_df['description'].str.contains(placeholder_desc, na=False).sum())
-    if undocumented and undocumented == len(master_df):
-        print(f"\n   ℹ️  Trigger-logic descriptions are unavailable via the API for all "
-              f"{undocumented} rule(s). Run inspect_rule_fields.py once to confirm what your "
-              f"environment actually returns, and consider populating {RULE_NOTES_OVERLAY_FILE} "
-              f"for your Dead / Recently Silent rules.")
-
-    longest_days = LOOKBACK_PERIODS[-1]['days']
-    if NEWLY_TRIGGERED_WINDOW_DAYS >= longest_days:
-        print(f"\n   ⚠️  NEWLY_TRIGGERED_WINDOW_DAYS ({NEWLY_TRIGGERED_WINDOW_DAYS}) should be smaller "
-              f"than the longest lookback window ({longest_days} days) — otherwise there's no "
-              f"'before' period left to compare against and every rule with any activity would "
-              f"qualify as 'newly triggered'.")
+    if undocumented:
+        scope = "all" if undocumented == len(master_df) else f"{undocumented} of {len(master_df)}"
+        print(f"\n   ℹ️  Trigger-logic descriptions are unavailable via the API for {scope} rule(s). "
+              f"Run inspect_rule_fields.py once to confirm what your environment actually returns, "
+              f"and consider populating {RULE_NOTES_OVERLAY_FILE} for your Dead / Recently Silent rules.")
 
     newly_triggered_count = int(master_df['newly_triggered'].sum())
     print(f"\n   ↑ {newly_triggered_count} rule(s) triggered in the last {NEWLY_TRIGGERED_WINDOW_DAYS} "
@@ -1541,9 +1638,16 @@ def main():
     if ENABLE_RUN_HISTORY:
         save_current_state(master_df, datetime.now().isoformat())
 
+    # ── Manually-tested rules log ─────────────────────────────────────────────
+    tested_entries  = load_tested_rules_log()
+    tested_view_df  = build_tested_rules_view(master_df, tested_entries)
+    investigated_count = len(tested_view_df)
+    print(f"   📋 {investigated_count} of {len(master_df)} rules manually verified so far "
+          f"(tested_rules_log.csv).")
+
     print(f"\n💾 Saving Excel report → {OUTPUT_EXCEL}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    save_excel_report(master_df, recovered_df, has_baseline, OUTPUT_EXCEL)
+    saved_excel_path = save_excel_report(master_df, recovered_df, has_baseline, tested_view_df, OUTPUT_EXCEL)
 
     print("\n📊 Generating trend chart...")
     chart_path = generate_rule_trend_chart(master_df)
@@ -1553,17 +1657,20 @@ def main():
         print("   ⚠️  Trend chart skipped (no rule data).")
 
     print("\n✉️  Building email draft...")
-    html_body = build_email_html(master_df, recovered_df, has_baseline,
+    html_body = build_email_html(master_df, recovered_df, has_baseline, tested_view_df,
                                   chart_cid='rule_trend' if chart_path else None)
 
     dead_total = int((master_df['overall_status'] == STATUS_DEAD).sum())
     subject = (
-        f"QRadar Rule Effectiveness — {dead_total} dead, "
-        f"{silent_count} need investigation, {newly_triggered_count} newly triggered"
+        f"QRadar Rule Effectiveness — {newly_triggered_count} newly triggered, "
+        f"{investigated_count} investigated, {dead_total} dead"
     )
+    # Flag the email urgent only when there's a lot of fresh signal to look at —
+    # not for the steady-state case, so "High" actually means something.
+    high_importance = (newly_triggered_count + silent_count) > 10
 
     images = {'rule_trend': chart_path} if chart_path else {}
-    create_outlook_draft(OUTPUT_EXCEL, subject, html_body, images)
+    create_outlook_draft(saved_excel_path, subject, html_body, images, high_importance=high_importance)
     print("\n✅ Done!")
 
 
