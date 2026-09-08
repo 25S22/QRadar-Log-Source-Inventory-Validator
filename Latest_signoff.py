@@ -1,16 +1,19 @@
 """
-QRadar Signoff Runner  v3.0
+QRadar Signoff Runner  v3.1
 ────────────────────────────────────────────────────────────────────────────
-Scans Outlook for SIEM signoff emails, queries QRadar, saves HTML draft replies,
-and writes results to signoff_data.json.
+Scans Outlook for SIEM signoff emails, queries QRadar, and replies with the
+result — either as a draft for review, or sent immediately when configured.
 
 Key behaviours
   • First-email-only policy — any subject starting with RE: / FW: / FWD: is
     skipped immediately.  No prefix-stripping, no chain chasing.
-  • Draft-only — reply.Save() is called, NEVER reply.Send().
+  • Draft-by-default — reply.Save() unless AUTO_SEND_ON_ACTIVE=True, in which
+    case a fully-Active result (ALL hosts confirmed) is sent immediately.
+    Partial / Not-Found results are ALWAYS drafted for human review and
+    escalation — this is never overridden by AUTO_SEND_ON_ACTIVE.
   • Atomic JSON writes — data file is never left in a corrupt half-written state.
   • Single-instance lock — a lockfile prevents concurrent runs.
-  • Runtime dedup — the same hostname set is never drafted twice per run.
+  • Runtime dedup — the same hostname set is never drafted/sent twice per run.
   • Conversation dedup — Sent + Drafts folders are scanned for prior outcomes.
 
 Dashboard
@@ -21,9 +24,11 @@ Dashboard
 import json
 import os
 import tempfile
+import time
 import uuid
 import urllib3
 import win32com.client
+import pywintypes
 import requests
 
 from datetime import datetime, timedelta
@@ -68,9 +73,33 @@ TRIGGER_DL = '@SOC-DL@yourorg.com'
 ESCALATION_TO = ['onboarding-owner@yourorg.com']
 ESCALATION_CC = ['@SOC-DL@yourorg.com']
 
+# ─── Send behaviour ─────────────────────────────────────────────────────────────
+# When True: a fully-Active result (every host in the subject line confirmed
+# reporting) is sent immediately via reply.Send() instead of being saved as
+# a draft.  Partial / Not-Found results are ALWAYS drafted for escalation —
+# this flag has no effect on them, by design.
+AUTO_SEND_ON_ACTIVE = False
+
+# Safety net for rollout: when True, an Active result that WOULD be sent is
+# instead logged (so you can see exactly what would have gone out) and still
+# saved as a draft.  Run with this on for a few cycles before flipping it off.
+AUTO_SEND_DRY_RUN = True
+
 # ─── Outlook ──────────────────────────────────────────────────────────────────
 # Sub-folder of Inbox to scan.  Set to None to scan the full Inbox.
 SIGNOFF_FOLDER_NAME = 'SIEM Signoffs'
+
+# Named MAPI profile to log on with. Leave '' to use whatever profile is
+# already loaded (the normal case when Outlook is already open under your
+# own session). Only set this for scheduled-task setups where the profile
+# needs to be selected explicitly.
+OUTLOOK_PROFILE_NAME = os.environ.get('OUTLOOK_PROFILE_NAME', '')
+
+# How many times to retry connecting to Outlook before giving up, and how
+# long to wait between attempts. Useful if this script is launched at the
+# same time Outlook itself is starting (e.g. both at login).
+OUTLOOK_CONNECT_RETRIES     = 3
+OUTLOOK_CONNECT_RETRY_DELAY = 5   # seconds
 
 # ─── OS type validation ───────────────────────────────────────────────────────
 # Map OS group names to required QRadar log source type keywords.
@@ -214,6 +243,79 @@ def _qradar_get(path: str, params: dict = None) -> requests.Response:
     )
 
 
+def _qradar_get_with_retry(path: str, params: dict = None, headers: dict = None,
+                           max_retries: int = 3) -> requests.Response | None:
+    """
+    GET with exponential backoff on network errors, 429 (rate limit), and 5xx.
+    Returns None if every attempt fails — callers must handle that case.
+    """
+    headers = headers or {'Accept': 'application/json', 'Version': '14.0'}
+    backoff = 1.0
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(
+                f"{QRADAR_HOST.rstrip('/')}{path}",
+                params=params,
+                auth=(QRADAR_USERNAME, QRADAR_PASSWORD),
+                verify=VERIFY_SSL,
+                timeout=REQUEST_TIMEOUT,
+                headers=headers,
+            )
+        except requests.exceptions.RequestException as exc:
+            _log(f"      WARNING: QRadar request error (attempt {attempt}/{max_retries}): {exc}")
+            if attempt == max_retries:
+                return None
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+
+        if r.status_code == 429:
+            retry_after = float(r.headers.get('Retry-After', backoff))
+            _log(f"      WARNING: QRadar rate-limited (429) — retrying in {retry_after:.0f}s")
+            time.sleep(retry_after)
+            backoff *= 2
+            continue
+
+        if r.status_code >= 500 and attempt < max_retries:
+            _log(f"      WARNING: QRadar HTTP {r.status_code} — retrying in {backoff:.0f}s")
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+
+        return r
+    return None
+
+
+def _qradar_get_all(path: str, params: dict = None, page_size: int = 100) -> list:
+    """
+    Fetch a full QRadar list endpoint using Range-header pagination.
+    QRadar list endpoints cap results per request (commonly 50-1000 depending
+    on config) — without this, a broad hostname substring match could
+    silently return only a partial result set.
+    """
+    results = []
+    start   = 0
+    while True:
+        headers = {
+            'Accept': 'application/json',
+            'Version': '14.0',
+            'Range': f'items={start}-{start + page_size - 1}',
+        }
+        r = _qradar_get_with_retry(path, params=params, headers=headers)
+        if r is None or r.status_code not in (200, 206):
+            if r is not None:
+                _log(f"      WARNING: QRadar HTTP {r.status_code} paginating {path}")
+            break
+        chunk = r.json()
+        if not chunk:
+            break
+        results.extend(chunk)
+        if len(chunk) < page_size:
+            break
+        start += page_size
+    return results
+
+
 def test_qradar_connection() -> bool:
     _log("Testing QRadar connection...")
     try:
@@ -266,13 +368,10 @@ def query_log_sources(hostname: str) -> dict:
     """Query QRadar for all log sources whose name contains the hostname."""
     clean = hostname.replace('"', '').replace("'", '').strip()
     try:
-        r = _qradar_get(
+        raw = _qradar_get_all(
             '/api/config/event_sources/log_source_management/log_sources',
             params={'filter': f'name ilike "%{clean}%"'},
         )
-        if r.status_code != 200:
-            return {'status': f'API Error {r.status_code}', 'sources': []}
-        raw = r.json()
         if not raw:
             return {'status': 'Not Found', 'sources': []}
         sources = []
@@ -329,6 +428,25 @@ def detect_os_group(sources: list) -> tuple:
 # ══════════════════════════════════════════════════════════════════════════════
 # EMAIL GUARDS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _get_sender_smtp(mail_item) -> str:
+    """
+    Resolve the sender's real SMTP address.
+
+    For on-prem/hybrid Exchange accounts, mail_item.SenderEmailAddress often
+    returns an X.500 legacyExchangeDN (e.g. "/O=ORG/OU=.../cn=recipients/...")
+    instead of an smtp address. That silently breaks ALLOWED_SENDERS and
+    self-sent domain matching, since neither ever equals an '@domain' string.
+    """
+    try:
+        if getattr(mail_item, 'SenderEmailType', '') == 'EX':
+            smtp = mail_item.Sender.GetExchangeUser().PrimarySmtpAddress
+            if smtp:
+                return smtp
+    except Exception:
+        pass
+    return mail_item.SenderEmailAddress or ''
+
 
 def is_sender_allowed(addr: str) -> bool:
     if not ALLOWED_SENDERS:
@@ -660,7 +778,7 @@ def build_reply_html(hostname_list: list) -> tuple:
 
 def write_record(email_subject: str, sender: str, host_records: list,
                  overall_status: str, is_revalidation: bool,
-                 prior_status: str | None) -> None:
+                 prior_status: str | None, was_sent: bool = False) -> None:
     data = _load_data()
     data.setdefault('entries', [])
     data['entries'].append({
@@ -671,6 +789,7 @@ def write_record(email_subject: str, sender: str, host_records: list,
         'overall_status':    overall_status,
         'is_revalidation':   is_revalidation,
         'prior_status':      prior_status,
+        'was_sent':          was_sent,   # True = auto-sent, False = saved as draft
         'hosts':             host_records,
         'manually_resolved': False,
         'notes':             '',
@@ -683,63 +802,152 @@ def write_record(email_subject: str, sender: str, host_records: list,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DRAFT CREATOR
+# REPLY FINALIZER  (draft, or send when configured)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def create_draft(mail_item, html_body: str, overall_status: str,
-                 is_revalidation: bool = False) -> bool:
+def finalize_reply(mail_item, html_body: str, overall_status: str,
+                   is_revalidation: bool = False) -> tuple:
     """
-    Create and Save a draft reply.  Never calls reply.Send().
-    Escalation recipients are applied for Partial and Not-Found outcomes.
+    Build the ReplyAll, tag the subject, and either Send() or Save() it.
+
+      • overall_status in ('partial', 'not_found'):
+          ALWAYS drafted with escalation recipients applied. AUTO_SEND_ON_ACTIVE
+          has no effect here — these outcomes always need human review.
+      • overall_status == 'active':
+          Sent immediately via reply.Send() only if AUTO_SEND_ON_ACTIVE is True
+          and AUTO_SEND_DRY_RUN is False. Otherwise saved as a draft (dry-run
+          mode logs what WOULD have been sent so you can validate before
+          flipping AUTO_SEND_DRY_RUN off).
+
+    Returns (success: bool, was_sent: bool).
     """
     tag_map = {'active': TAG_ACTIVE, 'partial': TAG_PARTIAL, 'not_found': TAG_NOT_FOUND}
     tag     = tag_map.get(overall_status, TAG_ACTIVE)
     prefix  = '[Revalidated] ' if is_revalidation else ''
+
     try:
         reply          = mail_item.ReplyAll()
         reply.HTMLBody = html_body
         reply.Subject  = f"{prefix}{tag} {mail_item.Subject}"
+
+        # Partial / Not-Found — escalate, always draft, never auto-send.
         if overall_status in ('partial', 'not_found'):
             if ESCALATION_TO:
                 reply.To = '; '.join(ESCALATION_TO)
             if ESCALATION_CC:
                 reply.CC = '; '.join(ESCALATION_CC)
-            _log(f"      Escalation → To: {reply.To}  |  CC: {reply.CC or '(none)'}")
-        else:
-            _log("      ReplyAll (Active)")
-        reply.Save()  # DRAFT ONLY — never reply.Send()
+            reply.Save()
+            _log(f"      Draft saved [{tag}]{' — REVAL' if is_revalidation else ''} "
+                 f"(escalation → To: {reply.To}  |  CC: {reply.CC or '(none)'})")
+            return True, False
+
+        # Active — every host confirmed reporting.
+        if AUTO_SEND_ON_ACTIVE and AUTO_SEND_DRY_RUN:
+            _log(f"      DRY-RUN: would SEND [{tag}] → {reply.To} "
+                 f"(AUTO_SEND_DRY_RUN=True — saving as draft instead)")
+            reply.Save()
+            return True, False
+
+        if AUTO_SEND_ON_ACTIVE:
+            reply.Send()  # sent immediately — no human review for this outcome
+            _log(f"      SENT [{tag}]{' — REVAL' if is_revalidation else ''} → {reply.To}")
+            return True, True
+
+        reply.Save()
         _log(f"      Draft saved [{tag}]{' — REVAL' if is_revalidation else ''}")
-        return True
+        return True, False
+
     except Exception as exc:
-        _log(f"      ERROR: Draft creation failed: {exc}")
-        return False
+        _log(f"      ERROR: Reply creation failed: {exc}")
+        return False, False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # OUTLOOK
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_outlook_folders():
-    """Connect to Outlook and return (inbox, drafts, sent) folder objects."""
+# Known pywin32 COM error HRESULTs mapped to an actionable hint. This turns a
+# bare "outlook connection failed" into something you can actually act on
+# instead of guessing. Not exhaustive — extend as you hit new codes.
+_OUTLOOK_COM_ERROR_HINTS = {
+    -2147221005: ("Class not registered — Outlook isn't installed for this "
+                  "account, or there's a 32-bit/64-bit mismatch between "
+                  "Python and Outlook. Match Python's bitness to Outlook's."),
+    -2147023174: ("RPC server unavailable — Outlook is not running or is "
+                  "still starting up. OUTLOOK_CONNECT_RETRIES will retry "
+                  "this automatically; increase it if Outlook is slow to load."),
+    -2147024891: ("Access denied — likely the Outlook Object Model Guard or "
+                  "antivirus mail-scan add-in blocking programmatic access. "
+                  "This usually shows as an on-screen security prompt, which "
+                  "blocks unattended runs. See Implementation Notes."),
+    -2147352567: ("Outlook rejected the call — often a MAPI profile issue. "
+                  "Set OUTLOOK_PROFILE_NAME, or open Outlook manually once "
+                  "under the account this script runs as."),
+}
+
+
+def _connect_outlook_application():
+    """
+    Dispatch Outlook.Application, preferring early binding (gencache) for
+    better attribute/type checking, falling back to late binding if the
+    gen_py cache is stale (common after an Office update).
+    """
     try:
-        outlook    = win32com.client.Dispatch('Outlook.Application')
-        ns         = outlook.GetNamespace('MAPI')
-        main_inbox = ns.GetDefaultFolder(6)    # olFolderInbox
-        drafts     = ns.GetDefaultFolder(16)   # olFolderDrafts
-        sent       = ns.GetDefaultFolder(5)    # olFolderSentMail
-        if SIGNOFF_FOLDER_NAME:
-            try:
-                inbox = main_inbox.Folders[SIGNOFF_FOLDER_NAME]
-                _log(f"Folder: Inbox\\{SIGNOFF_FOLDER_NAME}")
-            except Exception:
-                _log(f"WARNING: '{SIGNOFF_FOLDER_NAME}' sub-folder not found — scanning full Inbox.")
+        return win32com.client.gencache.EnsureDispatch('Outlook.Application')
+    except AttributeError:
+        _log("WARNING: win32com gen_py cache looks stale — using late binding. "
+             "(Fix permanently by deleting the folder under "
+             "%LOCALAPPDATA%\\Temp\\gen_py and re-running.)")
+        return win32com.client.Dispatch('Outlook.Application')
+
+
+def get_outlook_folders():
+    """
+    Connect to Outlook and return (inbox, drafts, sent) folder objects.
+    Retries transient failures (e.g. Outlook still starting) up to
+    OUTLOOK_CONNECT_RETRIES times before giving up.
+    """
+    last_exc = None
+    for attempt in range(1, OUTLOOK_CONNECT_RETRIES + 1):
+        try:
+            outlook = _connect_outlook_application()
+            ns      = outlook.GetNamespace('MAPI')
+
+            if OUTLOOK_PROFILE_NAME:
+                ns.Logon(OUTLOOK_PROFILE_NAME, None, False, True)
+
+            main_inbox = ns.GetDefaultFolder(6)    # olFolderInbox
+            drafts     = ns.GetDefaultFolder(16)   # olFolderDrafts
+            sent       = ns.GetDefaultFolder(5)    # olFolderSentMail
+
+            if SIGNOFF_FOLDER_NAME:
+                try:
+                    inbox = main_inbox.Folders[SIGNOFF_FOLDER_NAME]
+                    _log(f"Folder: Inbox\\{SIGNOFF_FOLDER_NAME}")
+                except Exception:
+                    _log(f"WARNING: '{SIGNOFF_FOLDER_NAME}' sub-folder not found — scanning full Inbox.")
+                    inbox = main_inbox
+            else:
                 inbox = main_inbox
-        else:
-            inbox = main_inbox
-        return inbox, drafts, sent
-    except Exception as exc:
-        _log(f"ERROR: Outlook connection failed: {exc}")
-        return None, None, None
+
+            return inbox, drafts, sent
+
+        except pywintypes.com_error as com_exc:
+            last_exc = com_exc
+            hresult  = com_exc.args[0] if com_exc.args else None
+            hint     = _OUTLOOK_COM_ERROR_HINTS.get(
+                hresult, "See Implementation Notes for general Outlook COM troubleshooting steps.")
+            _log(f"ERROR: Outlook COM connection failed (attempt {attempt}/{OUTLOOK_CONNECT_RETRIES}, "
+                 f"HRESULT {hresult}): {com_exc}. {hint}")
+        except Exception as exc:
+            last_exc = exc
+            _log(f"ERROR: Outlook connection failed (attempt {attempt}/{OUTLOOK_CONNECT_RETRIES}): {exc}")
+
+        if attempt < OUTLOOK_CONNECT_RETRIES:
+            time.sleep(OUTLOOK_CONNECT_RETRY_DELAY)
+
+    _log(f"ERROR: Giving up on Outlook after {OUTLOOK_CONNECT_RETRIES} attempts. Last error: {last_exc}")
+    return None, None, None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -752,12 +960,19 @@ def main() -> None:
 
     _ensure_data_file()
 
+    if AUTO_SEND_ON_ACTIVE and AUTO_SEND_DRY_RUN:
+        send_policy = 'draft-only | AUTO-SEND enabled but in DRY-RUN (no real sends)'
+    elif AUTO_SEND_ON_ACTIVE:
+        send_policy = 'Active results SENT immediately | Partial/NotFound always drafted'
+    else:
+        send_policy = 'draft-only'
+
     _log('=' * 65)
-    _log('QRadar Signoff Runner  v3.0')
+    _log('QRadar Signoff Runner  v3.1')
     _log(f'  Inbox scan : last {LOOKBACK_DAYS}d')
     _log(f'  Sent scan  : last {SENT_SCAN_DAYS}d')
     _log(f'  Active-skip: {ACTIVE_SKIP_DAYS}d')
-    _log(f'  Policy     : first-email-only | draft-only')
+    _log(f'  Policy     : first-email-only | {send_policy}')
     _log(f'  Data file  : {SIGNOFF_DATA_PATH}')
     _log(f'  Log file   : {RUN_LOG_PATH}')
     _log('=' * 65)
@@ -782,7 +997,7 @@ def main() -> None:
         items = list(inbox.Items.Restrict(f"[ReceivedTime] >= '{cutoff_str}'"))
         _log(f"\n{len(items)} email(s) found in last {LOOKBACK_DAYS}d\n{'─'*40}")
 
-        processed = skipped = drafted = revalidated = 0
+        processed = skipped = drafted = sent_count = revalidated = 0
 
         for mail in items:
             # Only process mail items (Class 43)
@@ -794,7 +1009,7 @@ def main() -> None:
 
             try:
                 subject = mail.Subject or ''
-                sender  = mail.SenderEmailAddress or ''
+                sender  = _get_sender_smtp(mail)
             except Exception:
                 continue
 
@@ -860,9 +1075,10 @@ def main() -> None:
             html_body, overall_status, host_records = build_reply_html(hostname_list)
             _log(f"  Overall   : {overall_status.upper()}")
 
-            success = create_draft(mail, html_body, overall_status, is_revalidation=is_reval)
+            success, was_sent = finalize_reply(mail, html_body, overall_status, is_revalidation=is_reval)
             if success:
-                drafted     += 1
+                drafted     += int(not was_sent)
+                sent_count  += int(was_sent)
                 revalidated += int(is_reval)
                 mark_drafted_this_run(hostname_list)
                 write_record(
@@ -872,11 +1088,12 @@ def main() -> None:
                     overall_status  = overall_status,
                     is_revalidation = is_reval,
                     prior_status    = last_tag,
+                    was_sent        = was_sent,
                 )
             processed += 1
 
         _log(f"\n{'='*65}")
-        _log(f"Run complete — {processed} processed | {drafted} drafted "
+        _log(f"Run complete — {processed} processed | {drafted} drafted | {sent_count} sent "
              f"({revalidated} revalidation{'s' if revalidated != 1 else ''}) | "
              f"{skipped} skipped")
         _log(f"Data : {SIGNOFF_DATA_PATH}")
