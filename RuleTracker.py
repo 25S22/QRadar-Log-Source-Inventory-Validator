@@ -12,7 +12,6 @@ import pandas as pd
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.formatting.rule import DataBarRule
 import win32com.client
 
 import matplotlib
@@ -32,9 +31,9 @@ QRADAR_USERNAME = 'your-username'
 QRADAR_PASSWORD = 'your-password'
 VERIFY_SSL      = False
 
-NEWLY_TRIGGERED_WINDOW_DAYS = 7
-FULL_HISTORY_LOOKBACK_DAYS  = None
-RULE_DEAD_THRESHOLD         = 0
+TRACKER_VALIDATION_WINDOW_DAYS = 7
+FULL_HISTORY_LOOKBACK_DAYS     = None
+RULE_DEAD_THRESHOLD            = 0
 
 TRACKER_EXCEL_PATH                 = ''
 TRACKER_HEADER_ROW                 = 1
@@ -44,8 +43,10 @@ TRACKER_BACKUP_BEFORE_WRITE        = True
 
 OUTPUT_DIR = r'C:\path\to\your\output'
 
+REPORT_TITLE = 'Rules Under Investigation & Dead'
+
 EMAIL_TABLE_ROW_CAP = 25
-EMAIL_HIGH_IMPORTANCE_NEWLY_THRESHOLD = 10
+EMAIL_HIGH_IMPORTANCE_DEAD_THRESHOLD = 15
 DEAD_RULE_STALE_AGE_DAYS = 365
 
 REQUEST_TIMEOUT    = 30
@@ -55,7 +56,7 @@ API_PAGE_SIZE      = 9999
 MAX_PAGES          = 150
 QRADAR_API_VERSION = '14.0'
 
-OUTPUT_EXCEL = os.path.join(OUTPUT_DIR, 'qradar_rule_status.xlsx')
+OUTPUT_EXCEL = os.path.join(OUTPUT_DIR, 'qradar_rules_under_investigation_and_dead.xlsx')
 
 _MAPI_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
 
@@ -164,16 +165,16 @@ def validate_config():
     if OUTPUT_DIR == r'C:\path\to\your\output':
         problems.append("OUTPUT_DIR is still the placeholder path.")
 
-    if NEWLY_TRIGGERED_WINDOW_DAYS <= 0:
-        problems.append("NEWLY_TRIGGERED_WINDOW_DAYS must be a positive number of days.")
+    if TRACKER_VALIDATION_WINDOW_DAYS <= 0:
+        problems.append("TRACKER_VALIDATION_WINDOW_DAYS must be a positive number of days.")
 
     if FULL_HISTORY_LOOKBACK_DAYS is not None:
         if FULL_HISTORY_LOOKBACK_DAYS <= 0:
             problems.append("FULL_HISTORY_LOOKBACK_DAYS must be None (unbounded) or a positive number of days.")
-        elif FULL_HISTORY_LOOKBACK_DAYS <= NEWLY_TRIGGERED_WINDOW_DAYS:
+        elif FULL_HISTORY_LOOKBACK_DAYS <= TRACKER_VALIDATION_WINDOW_DAYS:
             problems.append(
                 f"FULL_HISTORY_LOOKBACK_DAYS ({FULL_HISTORY_LOOKBACK_DAYS}) must be greater than "
-                f"NEWLY_TRIGGERED_WINDOW_DAYS ({NEWLY_TRIGGERED_WINDOW_DAYS})."
+                f"TRACKER_VALIDATION_WINDOW_DAYS ({TRACKER_VALIDATION_WINDOW_DAYS})."
             )
 
     if TRACKER_EXCEL_PATH and not os.path.exists(TRACKER_EXCEL_PATH):
@@ -182,7 +183,7 @@ def validate_config():
         )
 
     if problems:
-        print("⚠️  Configuration issues found:")
+        print("⚠  Configuration issues found:")
         for p in problems:
             print(f"   - {p}")
         print()
@@ -201,7 +202,7 @@ def test_connection():
         if result:
             print("✅ QRadar connection successful!")
             return True
-        print("⚠️  Unexpected empty response from /api/help/versions")
+        print("⚠  Unexpected empty response from /api/help/versions")
         return False
     except RuntimeError as e:
         print(f"❌ {e}")
@@ -249,7 +250,7 @@ def fetch_all_offenses():
         return data
     except Exception as e:
         if filter_str:
-            print(f"   ⚠️  Filtered offense fetch failed ({e}). Trying unfiltered fetch...")
+            print(f"   ⚠  Filtered offense fetch failed ({e}). Trying unfiltered fetch...")
             try:
                 data = _api_get_all('/api/siem/offenses', params={'fields': fields_str},
                                      label='offenses (unfiltered)')
@@ -399,17 +400,17 @@ def load_tracker_file(path):
         )
 
     return {
-        'raw':                df,
-        'sheet_name':         sheet_name,
-        'name_col':           name_col,
-        'investigation_col':  inv_col,
-        'tested_col':         tested_col,
-        'changed_cells':      [],
-        'auto_marked_rows':   [],
+        'raw':                 df,
+        'sheet_name':          sheet_name,
+        'name_col':            name_col,
+        'investigation_col':   inv_col,
+        'tested_col':          tested_col,
+        'changed_cells':       [],
+        'auto_marked_rows':    [],
         'auto_marked_indices': set(),
-        'unmatched_count':    None,
+        'unmatched_count':     None,
         'under_investigation_count': 0,
-        'tested_count':       0,
+        'tested_count':        0,
     }
 
 
@@ -516,7 +517,7 @@ def build_master_rule_table(rules, offenses_all):
         for rid in _extract_rule_ids(o):
             full_counts[rid] = full_counts.get(rid, 0) + 1
 
-    recent_offenses = filter_offenses_by_days(offenses_all, NEWLY_TRIGGERED_WINDOW_DAYS)
+    recent_offenses = filter_offenses_by_days(offenses_all, TRACKER_VALIDATION_WINDOW_DAYS)
     recent_counts = {}
     for o in recent_offenses:
         for rid in _extract_rule_ids(o):
@@ -528,19 +529,18 @@ def build_master_rule_table(rules, offenses_all):
         total  = full_counts.get(rid, 0)
         recent = recent_counts.get(rid, 0)
         rows.append({
-            'rule_id':            rid,
-            'rule_name':          _csv_formula_safe(rule.get('name', f'Rule {rid}')),
-            'rule_type':          rule.get('type', 'UNKNOWN'),
-            'origin':             rule.get('origin', 'UNKNOWN'),
-            'owner':              rule.get('owner', 'Unknown'),
-            'created':            _format_epoch_ms(rule.get('creation_date')),
-            'created_age_days':   _age_days_from_epoch(rule.get('creation_date')),
-            'modified':           _format_epoch_ms(rule.get('modification_date')),
-            'description':        _csv_formula_safe(_get_rule_description(rule)),
-            'offenses_total':     total,
-            'offenses_recent':    recent,
-            'is_dead':            total <= RULE_DEAD_THRESHOLD,
-            'is_newly_triggered': (recent == total) and (recent > 0),
+            'rule_id':          rid,
+            'rule_name':        _csv_formula_safe(rule.get('name', f'Rule {rid}')),
+            'rule_type':        rule.get('type', 'UNKNOWN'),
+            'origin':           rule.get('origin', 'UNKNOWN'),
+            'owner':            rule.get('owner', 'Unknown'),
+            'created':          _format_epoch_ms(rule.get('creation_date')),
+            'created_age_days': _age_days_from_epoch(rule.get('creation_date')),
+            'modified':         _format_epoch_ms(rule.get('modification_date')),
+            'description':      _csv_formula_safe(_get_rule_description(rule)),
+            'offenses_total':   total,
+            'offenses_recent':  recent,
+            'is_dead':          total <= RULE_DEAD_THRESHOLD,
         })
     return pd.DataFrame(rows)
 
@@ -591,19 +591,18 @@ def _pct(n, total):
     return f"{(n / total * 100):.1f}%" if total else "0.0%"
 
 
-def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules):
+def _write_summary_sheet(wb, dead_df, tracker_info, total_rules):
     ws = wb.active
     ws.title = 'Executive Summary'
 
-    ws['A1'] = 'QRadar Rule Status Report'
+    ws['A1'] = f'QRadar — {REPORT_TITLE}'
     ws['A1'].font = Font(bold=True, size=16, color='2D2257')
     ws['A2'] = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     ws['A2'].font = Font(italic=True, size=10, color='7C6FA0')
 
     hist_note = ('unbounded — all offenses currently retained by QRadar'
                  if not FULL_HISTORY_LOOKBACK_DAYS else f'last {FULL_HISTORY_LOOKBACK_DAYS} days')
-    ws['A3'] = (f"Full-history window: {hist_note}   ·   "
-                f"Newly-triggered window: last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s)")
+    ws['A3'] = f"Full-history window: {hist_note}   ·   Tracker validation window: last {TRACKER_VALIDATION_WINDOW_DAYS} day(s)"
     ws['A3'].font = Font(size=10, color='7C6FA0')
 
     ws['A5'] = 'Total enabled correlation rules analyzed:'
@@ -619,11 +618,9 @@ def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules):
         ws.cell(row=row, column=c).alignment = _CENTRE
     row += 1
 
-    dead_n  = len(dead_df)
-    newly_n = len(newly_df)
+    dead_n = len(dead_df)
     metrics = [
         ('Dead — Never Fired', dead_n, _pct(dead_n, total_rules), 'red'),
-        (f'Newly Triggered (last {NEWLY_TRIGGERED_WINDOW_DAYS}d)', newly_n, _pct(newly_n, total_rules), 'green'),
         ('Under Investigation', tracker_info['under_investigation_count'] if tracker_info else 'N/A', '', 'orange'),
         ('Testing Completed',   tracker_info['tested_count']              if tracker_info else 'N/A', '', 'blue'),
     ]
@@ -660,10 +657,10 @@ def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules):
     caveat = (
         'Rule descriptions reflect whatever metadata QRadar exposes via REST API; full boolean '
         'trigger logic is not reliably exposed in most versions — cross-reference the Rules console. '
-        '"Dead" and "Newly Triggered" are bounded by whatever offense history QRadar currently retains '
-        '(or by FULL_HISTORY_LOOKBACK_DAYS, if set). Auto-marking Tested uses recent offense activity as '
-        'a proxy for "fired since you started investigating" — it does not confirm the offense was caused '
-        'by your specific test versus unrelated real traffic.'
+        '"Dead" is bounded by whatever offense history QRadar currently retains (or by '
+        'FULL_HISTORY_LOOKBACK_DAYS, if set). Auto-marking Tested uses recent offense activity as a '
+        'proxy for "fired since you started investigating" — it does not confirm the offense was '
+        'caused by your specific test versus unrelated real traffic.'
     )
     ws.cell(row=row, column=1, value=caveat).font = Font(italic=True, size=9, color='7C6FA0')
     ws.cell(row=row, column=1).alignment = _WRAP
@@ -705,46 +702,13 @@ def _write_dead_sheet(wb, dead_df):
     ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
 
 
-def _write_newly_triggered_sheet(wb, newly_df):
-    ws = wb.create_sheet('Newly Triggered')
-    offense_col_name = f'Offenses (last {NEWLY_TRIGGERED_WINDOW_DAYS}d)'
-    cols   = ['Rule ID', 'Rule Name', 'Type', 'Owner', 'Created', offense_col_name,
-              'Description / Trigger Logic']
-    widths = [9, 42, 14, 14, 12, 18, 60]
-    _write_sheet_header(ws, cols, widths)
-
-    if newly_df.empty:
-        ws.append(['No rules triggered for the first time in this window.'])
-        return
-
-    sorted_df = newly_df.sort_values('offenses_recent', ascending=False)
-    desc_idx    = len(cols)
-    offense_idx = cols.index(offense_col_name) + 1
-    first_row   = ws.max_row + 1
-
-    for _, r in sorted_df.iterrows():
-        ws.append([int(r['rule_id']), str(r['rule_name']), str(r['rule_type']), str(r['owner']),
-                   str(r['created']), int(r['offenses_recent']), str(r['description'])])
-        ws.cell(row=ws.max_row, column=desc_idx).alignment = _WRAP
-
-    last_row = ws.max_row
-    _apply_zebra_and_borders(ws, first_row, last_row, len(cols))
-
-    if last_row >= first_row:
-        col_letter = get_column_letter(offense_idx)
-        rule = DataBarRule(start_type='min', end_type='max', color='34D399')
-        ws.conditional_formatting.add(f"{col_letter}{first_row}:{col_letter}{last_row}", rule)
-
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
-
-
 def _write_tracker_sheet(wb, tracker_info):
     ws = wb.create_sheet('Investigation & Testing Tracker')
     df = tracker_info['raw']
     original_cols = [c for c in df.columns if not str(c).startswith('_')]
     has_match_info = '_matched_to_qradar' in df.columns
     extra_cols = (
-        ['Matched to QRadar Rule?', f'Offenses (last {NEWLY_TRIGGERED_WINDOW_DAYS}d)',
+        ['Matched to QRadar Rule?', f'Offenses (last {TRACKER_VALIDATION_WINDOW_DAYS}d)',
          'Offenses (Total)', 'Auto-Marked Tested This Run?']
         if has_match_info else []
     )
@@ -787,12 +751,11 @@ def _write_tracker_sheet(wb, tracker_info):
     ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
 
 
-def save_excel_report(dead_df, newly_df, tracker_info, total_rules, path):
+def save_excel_report(dead_df, tracker_info, total_rules, path):
     try:
         wb = openpyxl.Workbook()
-        _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules)
+        _write_summary_sheet(wb, dead_df, tracker_info, total_rules)
         _write_dead_sheet(wb, dead_df)
-        _write_newly_triggered_sheet(wb, newly_df)
         if tracker_info is not None:
             _write_tracker_sheet(wb, tracker_info)
 
@@ -802,7 +765,7 @@ def save_excel_report(dead_df, newly_df, tracker_info, total_rules, path):
             return path
         except PermissionError:
             fallback = path.replace('.xlsx', f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-            print(f"⚠️  '{path}' is open elsewhere — saving to '{fallback}' instead.")
+            print(f"⚠  '{path}' is open elsewhere — saving to '{fallback}' instead.")
             wb.save(fallback)
             print(f"✅ Excel saved → {fallback}")
             return fallback
@@ -812,42 +775,40 @@ def save_excel_report(dead_df, newly_df, tracker_info, total_rules, path):
         return None
 
 
-_CHART_BG    = '#07051a'
-_CHART_GRID  = '#241c4d'
-_CHART_TEXT  = '#c9bdf5'
-_CHART_TITLE = '#b79dfa'
-_CHART_AXIS  = '#4a3e85'
+_CHART_BG    = '#0a0a10'
+_CHART_GRID  = '#201c33'
+_CHART_TEXT  = '#cfc8ea'
+_CHART_TITLE = '#a78bfa'
+_CHART_AXIS  = '#332c50'
 
 
-def generate_status_chart(dead_count, newly_count, tracker_info, total_rules):
-    labels  = ['Dead', 'Newly\nTriggered']
-    values  = [dead_count, newly_count]
-    colours = ['#f87171', '#34d399']
+def generate_status_chart(dead_count, tracker_info, total_rules):
+    labels  = ['Dead']
+    values  = [dead_count]
+    colours = ['#f87171']
 
     if tracker_info is not None:
         labels  += ['Under\nInvestigation', 'Testing\nCompleted']
         values  += [tracker_info['under_investigation_count'], tracker_info['tested_count']]
-        colours += ['#fb923c', '#60a5fa']
+        colours += ['#f5b155', '#5b8cff']
 
-    fig, ax = plt.subplots(figsize=(6.4, 4.2), facecolor=_CHART_BG)
+    fig, ax = plt.subplots(figsize=(6.0, 4.0), facecolor=_CHART_BG)
     ax.set_facecolor(_CHART_BG)
     ax.yaxis.grid(True, color=_CHART_GRID, linewidth=0.8, zorder=0)
     ax.set_axisbelow(True)
 
-    bars = ax.bar(labels, values, color=colours, edgecolor=_CHART_BG, linewidth=1.2, zorder=3, width=0.6)
+    bars = ax.bar(labels, values, color=colours, edgecolor=_CHART_BG, linewidth=1.2, zorder=3, width=0.5)
     max_val = max(values + [1])
     for bar, val in zip(bars, values):
         pct = f"{val / total_rules * 100:.1f}% of rules" if total_rules else ""
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max_val * 0.03, str(val),
-                ha='center', va='bottom', color=_CHART_TEXT, fontsize=11, fontweight='bold',
-                fontfamily='monospace')
+                ha='center', va='bottom', color=_CHART_TEXT, fontsize=11, fontweight='bold')
         if pct:
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 0.5, pct,
-                    ha='center', va='center', color=_CHART_BG, fontsize=7.5, fontfamily='monospace')
+                    ha='center', va='center', color=_CHART_BG, fontsize=7.5)
 
     ax.set_ylim(0, max_val * 1.25)
-    ax.set_title('Rule Status Overview', color=_CHART_TITLE, fontsize=12, fontweight='700',
-                 fontfamily='monospace', pad=14)
+    ax.set_title('Rule Status Overview', color=_CHART_TITLE, fontsize=12, fontweight='700', pad=14)
     ax.tick_params(colors=_CHART_TEXT, labelsize=9.5)
     for spine in ax.spines.values():
         spine.set_edgecolor(_CHART_AXIS)
@@ -865,111 +826,110 @@ def generate_status_chart(dead_count, newly_count, tracker_info, total_rules):
 
 
 _C = {
-    'page':        '#07051a',
-    'container':   '#0f0b2e',
-    'card':        '#171233',
-    'card_alt':    '#1c1640',
-    'border':      '#332a66',
-    'purple':      '#9b72f5',
-    'violet':      '#c9bdf5',
-    'dim':         '#8b7fb8',
-    'text':        '#f1edff',
-    'red':         '#f87171',
-    'green':       '#34d399',
-    'orange':      '#fb923c',
-    'blue':        '#60a5fa',
-    'badge_red':   '#4c1414',
-    'badge_amber': '#4a2f0a',
-    'badge_green': '#0b3a2d',
-    'badge_blue':  '#0e2c4c',
+    'page':   '#0a0a10',
+    'card':   '#111017',
+    'border': '#26223a',
+    'purple': '#8b5cf6',
+    'violet': '#a78bfa',
+    'dim':    '#8d87a8',
+    'text':   '#f4f2fb',
+    'red':    '#f87171',
+    'amber':  '#f5b155',
+    'blue':   '#5b8cff',
 }
+
+
+def _dot(color):
+    return f'<span style="color:{color};font-size:10px;vertical-align:middle;">●</span>'
 
 
 def _build_dead_table_html(dead_df):
     C = _C
     if dead_df.empty:
-        return (f'<p style="color:{C["green"]};font-size:11px;font-weight:700;font-family:monospace;'
-                f'padding:8px 0;">✔ No dead rules — every enabled rule has fired at least once.</p>')
+        return (f'<p style="color:{C["blue"]};font-size:12px;font-weight:600;padding:8px 0;margin:0;">'
+                f'{_dot(C["blue"])} No dead rules — every enabled rule has fired at least once.</p>')
 
     shown = dead_df.sort_values('created_age_days', ascending=False, na_position='last').head(EMAIL_TABLE_ROW_CAP)
     rows_html = ''
     for i, (_, row) in enumerate(shown.iterrows()):
-        bg = C['card'] if i % 2 == 0 else C['card_alt']
+        bg = C['page'] if i % 2 == 0 else C['card']
         name = _html_escape(row['rule_name'])
         name_short = name[:42] + '…' if len(name) > 42 else name
         age = row['created_age_days']
         age_txt = f"{age}d" if age is not None else '—'
         rows_html += f"""
-        <tr style="background-color:{bg};">
-          <td style="padding:8px 10px;border-left:3px solid {C['red']};font-size:11px;color:{C['text']};font-family:monospace;" title="{name}">{name_short}</td>
-          <td style="padding:8px 10px;font-size:11px;color:{C['dim']};font-family:monospace;text-align:center;">{_html_escape(row['rule_type'])}</td>
-          <td style="padding:8px 10px;font-size:11px;color:{C['dim']};font-family:monospace;text-align:center;">{_html_escape(row['owner'])}</td>
-          <td style="padding:8px 10px;font-size:11px;color:{C['dim']};font-family:monospace;text-align:center;">{_html_escape(row['created'])}</td>
-          <td style="padding:8px 10px;font-size:11px;color:{C['red']};font-family:monospace;text-align:center;font-weight:700;">{age_txt}</td>
+        <tr bgcolor="{bg}" style="background-color:{bg};">
+          <td bgcolor="{bg}" style="padding:9px 12px;border-left:2px solid {C['red']};font-size:12px;color:{C['text']};" title="{name}">{name_short}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['rule_type'])}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['owner'])}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['created'])}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['red']};text-align:center;font-weight:600;">{age_txt}</td>
         </tr>"""
 
     more_note = ''
     if len(dead_df) > EMAIL_TABLE_ROW_CAP:
-        more_note = (f'<div style="font-size:10px;color:{C["dim"]};margin-top:8px;font-family:monospace;">'
+        more_note = (f'<div style="font-size:10px;color:{C["dim"]};margin-top:8px;">'
                      f'+ {len(dead_df) - EMAIL_TABLE_ROW_CAP} more — see attached Excel for the full list.</div>')
 
-    _hdr = f'background:{C["card_alt"]};border-bottom:2px solid {C["red"]};'
     return f"""
-    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:10px;border:1px solid {C['border']};border-radius:8px;overflow:hidden;">
+    <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="border-collapse:collapse;margin-top:10px;background-color:{C['page']};">
       <thead><tr>
-        <th style="padding:8px 10px;text-align:left;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Rule Name</th>
-        <th style="padding:8px 10px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Type</th>
-        <th style="padding:8px 10px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Owner</th>
-        <th style="padding:8px 10px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Created</th>
-        <th style="padding:8px 10px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Age</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:left;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Rule Name</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Type</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Owner</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Created</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Age</th>
       </tr></thead>
       <tbody>{rows_html}</tbody>
     </table>{more_note}"""
 
 
-def _build_newly_triggered_table_html(newly_df):
+def _build_under_investigation_table_html(tracker_info):
     C = _C
-    if newly_df.empty:
-        return (f'<p style="color:{C["green"]};font-size:11px;font-weight:700;font-family:monospace;'
-                f'padding:8px 0;">✔ Nothing newly triggered in the last {NEWLY_TRIGGERED_WINDOW_DAYS} '
-                f'day(s) — no movement to report this run.</p>')
+    if tracker_info is None or not tracker_info.get('investigation_col'):
+        return (f'<p style="color:{C["dim"]};font-size:12px;padding:8px 0;margin:0;">'
+                f'Tracker not configured — set TRACKER_EXCEL_PATH to see active investigations here.</p>')
 
-    shown = newly_df.sort_values('offenses_recent', ascending=False).head(EMAIL_TABLE_ROW_CAP)
-    max_offenses = max(int(shown['offenses_recent'].max()), 1)
+    df = tracker_info['raw']
+    inv_col, name_col = tracker_info['investigation_col'], tracker_info['name_col']
+    has_match = '_matched_to_qradar' in df.columns
+
+    mask = df[inv_col].apply(_to_bool)
+    shown = df[mask]
+    if shown.empty:
+        return (f'<p style="color:{C["blue"]};font-size:12px;font-weight:600;padding:8px 0;margin:0;">'
+                f'{_dot(C["blue"])} Nothing currently under investigation.</p>')
+
+    shown = shown.head(EMAIL_TABLE_ROW_CAP)
     rows_html = ''
     for i, (_, row) in enumerate(shown.iterrows()):
-        bg = C['card'] if i % 2 == 0 else C['card_alt']
-        name = _html_escape(row['rule_name'])
-        name_short = name[:40] + '…' if len(name) > 40 else name
-        count = int(row['offenses_recent'])
-        bar_pct = max(6, round(count / max_offenses * 100))
+        bg = C['page'] if i % 2 == 0 else C['card']
+        name = _html_escape(row[name_col]) if name_col else '(no name column)'
+        name_short = name[:42] + '…' if len(name) > 42 else name
+        recent = row['_offenses_recent'] if has_match else None
+        if recent is not None and pd.notna(recent):
+            fired_txt, fired_color = ('Yes', C['blue']) if recent > 0 else ('No', C['dim'])
+            recent_txt = str(int(recent))
+        else:
+            fired_txt, fired_color, recent_txt = '—', C['dim'], '—'
         rows_html += f"""
-        <tr style="background-color:{bg};">
-          <td style="padding:8px 10px;border-left:3px solid {C['green']};font-size:11px;color:{C['text']};font-family:monospace;" title="{name}">{name_short}</td>
-          <td style="padding:8px 10px;font-size:11px;color:{C['dim']};font-family:monospace;text-align:center;">{_html_escape(row['rule_type'])}</td>
-          <td style="padding:8px 10px;font-size:11px;font-family:monospace;">
-            <table cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;">
-              <tr>
-                <td width="{bar_pct}%" style="background:{C['green']};height:9px;font-size:1px;line-height:1px;border-radius:4px;">&nbsp;</td>
-                <td width="{100 - bar_pct}%" style="font-size:1px;line-height:1px;">&nbsp;</td>
-                <td style="padding-left:8px;color:{C['green']};font-weight:700;white-space:nowrap;">{count}</td>
-              </tr>
-            </table>
-          </td>
+        <tr bgcolor="{bg}" style="background-color:{bg};">
+          <td bgcolor="{bg}" style="padding:9px 12px;border-left:2px solid {C['amber']};font-size:12px;color:{C['text']};" title="{name}">{name_short}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{fired_color};text-align:center;font-weight:600;">{fired_txt}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{recent_txt}</td>
         </tr>"""
 
     more_note = ''
-    if len(newly_df) > EMAIL_TABLE_ROW_CAP:
-        more_note = (f'<div style="font-size:10px;color:{C["dim"]};margin-top:8px;font-family:monospace;">'
-                     f'+ {len(newly_df) - EMAIL_TABLE_ROW_CAP} more — see attached Excel for the full list.</div>')
+    if mask.sum() > EMAIL_TABLE_ROW_CAP:
+        more_note = (f'<div style="font-size:10px;color:{C["dim"]};margin-top:8px;">'
+                     f'+ {int(mask.sum()) - EMAIL_TABLE_ROW_CAP} more — see attached Excel for the full list.</div>')
 
-    _hdr = f'background:{C["card_alt"]};border-bottom:2px solid {C["green"]};'
     return f"""
-    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:10px;border:1px solid {C['border']};border-radius:8px;overflow:hidden;">
+    <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="border-collapse:collapse;margin-top:10px;background-color:{C['page']};">
       <thead><tr>
-        <th style="padding:8px 10px;text-align:left;font-size:9px;color:{C['green']};font-weight:700;text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Rule Name</th>
-        <th style="padding:8px 10px;text-align:center;font-size:9px;color:{C['green']};font-weight:700;text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Type</th>
-        <th style="padding:8px 10px;text-align:left;font-size:9px;color:{C['green']};font-weight:700;text-transform:uppercase;letter-spacing:1.4px;font-family:monospace;{_hdr}">Offenses (last {NEWLY_TRIGGERED_WINDOW_DAYS}d)</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:left;font-size:9px;color:{C['amber']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Rule Name</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['amber']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Fired Recently?</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['amber']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Offenses (last {TRACKER_VALIDATION_WINDOW_DAYS}d)</th>
       </tr></thead>
       <tbody>{rows_html}</tbody>
     </table>{more_note}"""
@@ -984,100 +944,93 @@ def _build_auto_validated_table_html(tracker_info):
     shown = rows[:EMAIL_TABLE_ROW_CAP]
     rows_html = ''
     for i, r in enumerate(shown):
-        bg = C['card'] if i % 2 == 0 else C['card_alt']
+        bg = C['page'] if i % 2 == 0 else C['card']
         name = _html_escape(r['rule_name'])
         name_short = name[:48] + '…' if len(name) > 48 else name
         rows_html += f"""
-        <tr style="background-color:{bg};">
-          <td style="padding:8px 10px;border-left:3px solid {C['blue']};font-size:11px;color:{C['text']};font-family:monospace;" title="{name}">{name_short}</td>
-          <td style="padding:8px 10px;font-size:11px;color:{C['blue']};font-family:monospace;text-align:center;font-weight:700;">{r['offenses_recent']}</td>
+        <tr bgcolor="{bg}" style="background-color:{bg};">
+          <td bgcolor="{bg}" style="padding:9px 12px;border-left:2px solid {C['blue']};font-size:12px;color:{C['text']};" title="{name}">{name_short}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['blue']};text-align:center;font-weight:600;">{r['offenses_recent']}</td>
         </tr>"""
 
     more_note = ''
     if len(rows) > EMAIL_TABLE_ROW_CAP:
-        more_note = (f'<div style="font-size:10px;color:{C["dim"]};margin-top:8px;font-family:monospace;">'
+        more_note = (f'<div style="font-size:10px;color:{C["dim"]};margin-top:8px;">'
                      f'+ {len(rows) - EMAIL_TABLE_ROW_CAP} more — see attached Excel.</div>')
 
-    _hdr = f'background:{C["card_alt"]};border-bottom:2px solid {C["blue"]};'
     return f"""
-    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:10px;border:1px solid {C['border']};border-radius:8px;overflow:hidden;">
+    <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="border-collapse:collapse;margin-top:10px;background-color:{C['page']};">
       <thead><tr>
-        <th style="padding:8px 10px;text-align:left;font-size:9px;color:{C['blue']};font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Rule Name</th>
-        <th style="padding:8px 10px;text-align:center;font-size:9px;color:{C['blue']};font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Offenses (last {NEWLY_TRIGGERED_WINDOW_DAYS}d)</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:left;font-size:9px;color:{C['blue']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Rule Name</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['blue']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Offenses (last {TRACKER_VALIDATION_WINDOW_DAYS}d)</th>
       </tr></thead>
       <tbody>{rows_html}</tbody>
     </table>{more_note}"""
 
 
-def build_email_html(dead_df, newly_df, tracker_info, total_rules, chart_cid):
+def build_email_html(dead_df, tracker_info, total_rules, chart_cid):
     C = _C
     run_time = datetime.now().strftime('%d %b %Y  ·  %H:%M:%S')
 
     dead_count   = len(dead_df)
-    newly_count  = len(newly_df)
     inv_count    = tracker_info['under_investigation_count'] if tracker_info else None
     tested_count = tracker_info['tested_count']              if tracker_info else None
     auto_marked  = tracker_info['auto_marked_rows']          if tracker_info else []
 
-    if newly_count > 0:
-        hdr_bg, hdr_txt = C['badge_green'], f'✔  {newly_count} NEWLY TRIGGERED'
-    elif dead_count > 0:
-        hdr_bg, hdr_txt = C['badge_amber'], f'⚠  {dead_count} DEAD RULE(S) TO REVIEW'
+    if dead_count > 0:
+        hdr_txt, hdr_color = f'{dead_count} DEAD RULE(S) TO REVIEW', C['red']
+    elif auto_marked:
+        hdr_txt, hdr_color = f'{len(auto_marked)} AUTO-VALIDATED THIS RUN', C['blue']
     else:
-        hdr_bg, hdr_txt = C['badge_green'], '✔  STEADY STATE'
+        hdr_txt, hdr_color = 'STEADY STATE', C['violet']
 
-    def badge(bg, txt):
-        return (f'<span style="background:{bg};color:{C["text"]};font-size:10px;font-weight:700;'
-                f'padding:5px 13px;border-radius:20px;letter-spacing:0.8px;border:1px solid {C["border"]};'
-                f'font-family:monospace;white-space:nowrap;">{txt}</span>')
+    def badge(color, txt):
+        return (f'<span style="color:{color};font-size:10px;font-weight:700;'
+                f'padding:5px 13px;border-radius:20px;letter-spacing:0.6px;border:1px solid {color}80;'
+                f'white-space:nowrap;">{txt}</span>')
 
-    def metric_card(icon, label, value, color, note=''):
+    def metric_card(label, value, color, note=''):
         display_val = value if value is not None else '—'
-        note_html = (f'<div style="font-size:9px;color:{C["dim"]};margin-top:4px;'
-                     f'font-family:monospace;">{note}</div>') if note else ''
-        return (f'<td width="25%" style="padding:5px;">'
-                f'<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">'
-                f'<tr><td style="background:{C["card"]};border:1px solid {color}66;border-top:3px solid {color};'
-                f'border-radius:10px;padding:14px 8px;text-align:center;">'
-                f'<div style="font-size:15px;line-height:1;margin-bottom:6px;">{icon}</div>'
-                f'<div style="font-size:26px;font-weight:800;color:{color};line-height:1;'
-                f'font-family:monospace;letter-spacing:-1px;">{display_val}</div>'
-                f'<div style="font-size:9px;color:{C["dim"]};margin-top:6px;'
-                f'text-transform:uppercase;letter-spacing:1px;">{label}</div>{note_html}'
-                f'</td></tr></table></td>')
+        note_html = (f'<div style="font-size:9px;color:{C["dim"]};margin-top:4px;">{note}</div>'
+                     if note else '')
+        return (f'<td width="33%" bgcolor="{C["page"]}" style="padding:5px;background-color:{C["page"]};">'
+                f'<table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C["card"]}" '
+                f'style="border-collapse:collapse;background-color:{C["card"]};border:1px solid {C["border"]};'
+                f'border-top:2px solid {color};border-radius:8px;">'
+                f'<tr><td bgcolor="{C["card"]}" style="background-color:{C["card"]};padding:16px 8px;text-align:center;">'
+                f'<div style="font-size:28px;font-weight:800;color:{color};line-height:1;letter-spacing:-1px;">{display_val}</div>'
+                f'<div style="font-size:9px;color:{C["dim"]};margin-top:6px;text-transform:uppercase;letter-spacing:1px;">{label}</div>'
+                f'{note_html}</td></tr></table></td>')
 
-    dead_pct  = f"{dead_count / total_rules * 100:.1f}% of rules"  if total_rules else ''
-    newly_pct = f"{newly_count / total_rules * 100:.1f}% of rules" if total_rules else ''
-    inv_note    = '' if tracker_info else 'tracker not configured'
-    tested_note = f"+{len(auto_marked)} auto-marked this run" if auto_marked else ('' if tracker_info else 'tracker not configured')
+    dead_pct = f"{dead_count / total_rules * 100:.1f}% of rules" if total_rules else ''
+    inv_note = '' if tracker_info else 'not configured'
+    tested_note = f"+{len(auto_marked)} auto-marked this run" if auto_marked else ('' if tracker_info else 'not configured')
 
     headline_metrics = (
-        metric_card('💀', 'Dead Rules', dead_count, C['red'], dead_pct)
-        + metric_card('✔', f'Newly Triggered ({NEWLY_TRIGGERED_WINDOW_DAYS}d)', newly_count, C['green'], newly_pct)
-        + metric_card('🔍', 'Under Investigation', inv_count, C['orange'], inv_note)
-        + metric_card('✅', 'Testing Completed', tested_count, C['blue'], tested_note)
+        metric_card('Dead Rules', dead_count, C['red'], dead_pct)
+        + metric_card('Under Investigation', inv_count, C['amber'], inv_note)
+        + metric_card('Testing Completed', tested_count, C['blue'], tested_note)
     )
 
     chart_html = (f'<img src="cid:{chart_cid}" alt="Rule status chart" '
-                  f'style="display:block;max-width:100%;margin:16px auto 0;border-radius:10px;'
-                  f'border:1px solid {C["border"]};">') if chart_cid else ''
-    dead_table_html  = _build_dead_table_html(dead_df)
-    newly_table_html = _build_newly_triggered_table_html(newly_df)
-    auto_table_html  = _build_auto_validated_table_html(tracker_info)
+                  f'style="display:block;max-width:100%;margin:18px auto 0;">') if chart_cid else ''
+    dead_table_html   = _build_dead_table_html(dead_df)
+    inv_table_html    = _build_under_investigation_table_html(tracker_info)
+    auto_table_html   = _build_auto_validated_table_html(tracker_info)
 
-    def section_header(icon, title, color, subtitle):
+    def section_header(color, title, subtitle):
         return f"""
-  <tr><td style="padding:26px 0 4px;border-top:2px solid {color}55;">
-    <span style="font-size:13px;font-weight:700;color:{color};font-family:monospace;">{icon} {title}</span>
+  <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:28px 0 4px;border-top:1px solid {C['border']};">
+    <span style="font-size:13px;font-weight:700;color:{C['text']};">{_dot(color)}&nbsp;&nbsp;{title}</span>
     <div style="font-size:10px;color:{C['dim']};margin-top:4px;">{subtitle}</div>
   </td></tr>"""
 
     auto_section = ''
     if auto_table_html:
         auto_section = (
-            section_header('✏️', 'Auto-Validated This Run', C['blue'],
-                           'Marked Under Investigation and fired since — Tested has been set to Yes in your tracker file.')
-            + f'<tr><td style="padding:0 0 20px;">{auto_table_html}</td></tr>'
+            section_header(C['blue'], 'Auto-Validated This Run',
+                            'Marked Under Investigation and fired since — Tested has been set to Yes in your tracker file.')
+            + f'<tr><td bgcolor="{C["page"]}" style="background-color:{C["page"]};padding:0 0 20px;">{auto_table_html}</td></tr>'
         )
 
     hist_note = ('all offenses currently retained by QRadar' if not FULL_HISTORY_LOOKBACK_DAYS
@@ -1088,81 +1041,64 @@ def build_email_html(dead_df, newly_df, tracker_info, total_rules, chart_cid):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="color-scheme" content="light dark">
-<meta name="supported-color-schemes" content="light dark">
-<style>
-:root {{ color-scheme: light dark; }}
-body, table, td {{ background-color:{C['page']} !important; }}
-.email-text {{ color:{C['text']} !important; }}
-.email-dim {{ color:{C['dim']} !important; }}
-.email-card {{ background-color:{C['card']} !important; }}
-[data-ogsc] body, [data-ogsc] table, [data-ogsc] td {{ background-color:{C['page']} !important; }}
-[data-ogsc] .email-text {{ color:{C['text']} !important; }}
-@media (prefers-color-scheme: light) {{
-  body, table, td {{ background-color:{C['page']} !important; }}
-  .email-text {{ color:{C['text']} !important; }}
-}}
-@media (prefers-color-scheme: dark) {{
-  body, table, td {{ background-color:{C['page']} !important; }}
-  .email-text {{ color:{C['text']} !important; }}
-}}
-</style>
+<meta name="color-scheme" content="dark">
+<meta name="supported-color-schemes" content="dark">
+<title>{REPORT_TITLE}</title>
 <!--[if mso]>
 <style type="text/css">
-table, td {{ font-family:Arial, sans-serif !important; }}
+table, td {{ font-family:Segoe UI, Arial, sans-serif !important; }}
 </style>
 <![endif]-->
 </head>
 <body bgcolor="{C['page']}" style="margin:0;padding:0;background-color:{C['page']};font-family:'Segoe UI',Helvetica,Arial,sans-serif;">
-<table width="100%" bgcolor="{C['page']}" cellpadding="0" cellspacing="0" style="background-color:{C['page']};padding:28px 0;">
-<tr><td align="center">
-<table width="660" cellpadding="0" cellspacing="0" bgcolor="{C['container']}" class="email-card"
-       style="max-width:660px;width:100%;background-color:{C['container']};border:1px solid {C['border']};
-              border-radius:14px;padding:24px 28px;">
+<table role="presentation" width="100%" bgcolor="{C['page']}" cellpadding="0" cellspacing="0" style="background-color:{C['page']};">
+<tr>
+<td align="center" bgcolor="{C['page']}" style="background-color:{C['page']};padding:32px 16px;">
 
-  <tr><td style="padding:4px 0 14px;border-bottom:3px solid {C['purple']};">
-    <table width="100%" cellpadding="0" cellspacing="0"><tr>
-      <td>
-        <div style="font-size:9px;color:{C['dim']};letter-spacing:3px;
-                    text-transform:uppercase;font-family:monospace;margin-bottom:8px;">
-          QRadar &nbsp;·&nbsp; Rule Status Report
+<table role="presentation" width="640" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="width:640px;max-width:640px;background-color:{C['page']};">
+
+  <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 18px;border-bottom:2px solid {C['purple']};">
+    <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="background-color:{C['page']};"><tr>
+      <td bgcolor="{C['page']}" style="background-color:{C['page']};">
+        <div style="font-size:9px;color:{C['dim']};letter-spacing:3px;text-transform:uppercase;margin-bottom:8px;">
+          QRadar
         </div>
-        <div class="email-text" style="font-size:24px;font-weight:800;color:{C['text']};
-                    letter-spacing:-0.5px;line-height:1.2;">
-          Dead &amp; Newly Triggered Rules
+        <div style="font-size:23px;font-weight:800;color:{C['text']};letter-spacing:-0.4px;line-height:1.25;">
+          {REPORT_TITLE}
         </div>
-        <div style="margin-top:8px;font-size:11px;color:{C['dim']};font-family:monospace;">{run_time}</div>
+        <div style="margin-top:8px;font-size:11px;color:{C['dim']};">{run_time}</div>
       </td>
-      <td align="right" valign="top">{badge(hdr_bg, hdr_txt)}</td>
+      <td align="right" valign="top" bgcolor="{C['page']}" style="background-color:{C['page']};">{badge(hdr_color, hdr_txt)}</td>
     </tr></table>
   </td></tr>
 
-  <tr><td style="padding:20px 0 4px;">
-    <table width="100%" cellpadding="0" cellspacing="0"><tr>{headline_metrics}</tr></table>
+  <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:20px 0 4px;">
+    <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="background-color:{C['page']};"><tr>{headline_metrics}</tr></table>
   </td></tr>
 
-  <tr><td style="padding:6px 0 2px;text-align:center;">{chart_html}</td></tr>
+  <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 4px;text-align:center;">{chart_html}</td></tr>
 
-  {section_header('💀', 'Dead Rules — Never Fired', C['red'],
+  {section_header(C['red'], 'Dead Rules — Never Fired',
                    f"Zero offenses across {hist_note}. Candidates for review or removal.")}
-  <tr><td style="padding:0 0 8px;">{dead_table_html}</td></tr>
+  <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 8px;">{dead_table_html}</td></tr>
 
-  {section_header('✔', 'Newly Triggered', C['green'],
-                   f"Fired in the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s) and never before that, "
-                   f"anywhere in {hist_note}.")}
-  <tr><td style="padding:0 0 20px;">{newly_table_html}</td></tr>
+  {section_header(C['amber'], 'Rules Under Investigation',
+                   f"Currently flagged in your tracker — 'Fired Recently?' checks the last {TRACKER_VALIDATION_WINDOW_DAYS} day(s).")}
+  <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 8px;">{inv_table_html}</td></tr>
 
   {auto_section}
 
-  <tr><td style="padding:18px 0 4px;border-top:1px solid {C['border']};">
-    <div style="font-size:9px;color:{C['dim']};font-family:monospace;letter-spacing:0.5px;line-height:1.6;">
+  <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:18px 0 4px;border-top:1px solid {C['border']};">
+    <div style="font-size:9px;color:{C['dim']};letter-spacing:0.3px;line-height:1.6;">
       QRadar Rule Status Auditor &nbsp;·&nbsp; Auto-generated {run_time}<br>
       Full rule details, and the Investigation/Testing tracker (if configured), are in the attached Excel workbook.
     </div>
   </td></tr>
 
 </table>
-</td></tr>
+
+</td>
+</tr>
 </table>
 </body></html>"""
 
@@ -1185,7 +1121,7 @@ def create_outlook_draft(excel_path, subject, html_body, images, high_importance
 
         mail.HTMLBody = html_body
         mail.Display()
-        print("\n✉️  Outlook draft created.")
+        print("\n✉  Outlook draft created.")
     except Exception as e:
         logger.error("Outlook draft failed:\n%s", traceback.format_exc())
         print(f"\n❌ Outlook draft error: {e}")
@@ -1203,15 +1139,15 @@ def main():
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     print("=" * 62)
-    print("  QRadar Rule Status Auditor — Dead / Newly Triggered / Tracker")
+    print(f"  QRadar — {REPORT_TITLE}")
     print("=" * 62)
-    print(f"  Host            : {QRADAR_HOST}")
-    print(f"  Newly-triggered : last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s), never before")
-    print(f"  Full history    : "
+    print(f"  Host                     : {QRADAR_HOST}")
+    print(f"  Tracker validation window: last {TRACKER_VALIDATION_WINDOW_DAYS} day(s)")
+    print(f"  Full history             : "
           f"{'unbounded (all retained offenses)' if not FULL_HISTORY_LOOKBACK_DAYS else f'{FULL_HISTORY_LOOKBACK_DAYS} days'}")
-    print(f"  Tracker file    : {TRACKER_EXCEL_PATH or '(not configured)'}")
-    print(f"  Auto-mark Tested: {AUTO_UPDATE_TRACKER_TESTED}")
-    print(f"  Retry config    : {MAX_RETRIES} attempts, {RETRY_DELAY_BASE}s base backoff")
+    print(f"  Tracker file             : {TRACKER_EXCEL_PATH or '(not configured)'}")
+    print(f"  Auto-mark Tested         : {AUTO_UPDATE_TRACKER_TESTED}")
+    print(f"  Retry config             : {MAX_RETRIES} attempts, {RETRY_DELAY_BASE}s base backoff")
     print("=" * 62)
 
     if not validate_config():
@@ -1228,67 +1164,65 @@ def main():
 
     offenses_all = fetch_all_offenses()
     if not offenses_all:
-        print("\n⚠️  WARNING: no offenses were retrieved — check the warnings above before "
+        print("\n⚠  WARNING: no offenses were retrieved — check the warnings above before "
               "treating every rule below as 'Dead'.")
 
     print("\n🔍 Classifying rules...")
     master_df = build_master_rule_table(rules, offenses_all)
     dead_df   = master_df[master_df['is_dead']].copy()
-    newly_df  = master_df[master_df['is_newly_triggered']].copy()
 
-    print(f"   💀 Dead — never fired: {len(dead_df)}")
-    print(f"   ↑  Newly triggered (last {NEWLY_TRIGGERED_WINDOW_DAYS}d, never before): {len(newly_df)}")
+    print(f"   Dead — never fired: {len(dead_df)}")
 
     undocumented = int(master_df['description'].str.contains('Not exposed via API', na=False).sum())
     if undocumented:
-        print(f"\n   ℹ️  Trigger-logic descriptions are unavailable via the API for {undocumented} "
+        print(f"\n   ℹ  Trigger-logic descriptions are unavailable via the API for {undocumented} "
               f"of {len(master_df)} rule(s).")
 
     print("\n📋 Loading investigation/testing tracker...")
     tracker_info = load_tracker_file(TRACKER_EXCEL_PATH) if TRACKER_EXCEL_PATH else None
     if tracker_info is None:
-        print("   ℹ️  Tracker not configured or unavailable this run.")
+        print("   ℹ  Tracker not configured or unavailable this run.")
     else:
         tracker_info = reconcile_tracker_with_qradar(tracker_info, master_df)
         print(f"   ✅ {tracker_info['under_investigation_count']} under investigation, "
               f"{tracker_info['tested_count']} testing completed "
               f"(of {len(tracker_info['raw'])} tracked row(s)).")
         if tracker_info['name_col'] and tracker_info['unmatched_count']:
-            print(f"   ⚠️  {tracker_info['unmatched_count']} tracker row(s) didn't match any enabled QRadar rule by name.")
+            print(f"   ⚠  {tracker_info['unmatched_count']} tracker row(s) didn't match any enabled QRadar rule by name.")
 
         if tracker_info['changed_cells']:
             result = persist_tracker_updates(TRACKER_EXCEL_PATH, tracker_info)
             n_auto = len(tracker_info['auto_marked_rows'])
             if result == 'written':
-                print(f"   ✏️  Auto-marked {n_auto} rule(s) as Tested — written back to {TRACKER_EXCEL_PATH} "
+                print(f"   ✏  Auto-marked {n_auto} rule(s) as Tested — written back to {TRACKER_EXCEL_PATH} "
                       f"(backup saved alongside it).")
             elif result == 'locked':
-                print(f"   ⚠️  {n_auto} rule(s) qualify to be auto-marked Tested, but the tracker file is "
+                print(f"   ⚠  {n_auto} rule(s) qualify to be auto-marked Tested, but the tracker file is "
                       f"open elsewhere — close it and re-run to persist.")
             elif result == 'disabled':
-                print(f"   ℹ️  {n_auto} rule(s) qualify to be auto-marked Tested "
+                print(f"   ℹ  {n_auto} rule(s) qualify to be auto-marked Tested "
                       f"(AUTO_UPDATE_TRACKER_TESTED=False — not written back).")
             elif result == 'error':
-                print(f"   ❌ Could not write updates back to the tracker file — see log for details.")
+                print("   ❌ Could not write updates back to the tracker file — see log for details.")
 
     print(f"\n💾 Saving Excel report → {OUTPUT_EXCEL}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    saved_excel_path = save_excel_report(dead_df, newly_df, tracker_info, len(master_df), OUTPUT_EXCEL)
+    saved_excel_path = save_excel_report(dead_df, tracker_info, len(master_df), OUTPUT_EXCEL)
 
     print("\n📊 Generating status chart...")
-    chart_path = generate_status_chart(len(dead_df), len(newly_df), tracker_info, len(master_df))
+    chart_path = generate_status_chart(len(dead_df), tracker_info, len(master_df))
 
-    print("\n✉️  Building email draft...")
-    html_body = build_email_html(dead_df, newly_df, tracker_info, len(master_df),
+    print("\n✉  Building email draft...")
+    html_body = build_email_html(dead_df, tracker_info, len(master_df),
                                   chart_cid='rule_status' if chart_path else None)
 
-    subject_parts = [f"{len(dead_df)} dead", f"{len(newly_df)} newly triggered"]
+    subject_parts = [f"{len(dead_df)} dead"]
     if tracker_info is not None:
         subject_parts.append(f"{tracker_info['under_investigation_count']} under investigation")
         subject_parts.append(f"{tracker_info['tested_count']} testing completed")
-    subject = "QRadar Rule Status — " + ", ".join(subject_parts)
+    subject = f"{REPORT_TITLE} — " + ", ".join(subject_parts)
 
-    high_importance = len(newly_df) >= EMAIL_HIGH_IMPORTANCE_NEWLY_THRESHOLD
+    high_importance = len(dead_df) >= EMAIL_HIGH_IMPORTANCE_DEAD_THRESHOLD
 
     images = {'rule_status': chart_path} if chart_path else {}
     create_outlook_draft(saved_excel_path, subject, html_body, images, high_importance=high_importance)
