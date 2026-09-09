@@ -1,4 +1,5 @@
 import os
+import shutil
 import time
 import tempfile
 import traceback
@@ -35,7 +36,11 @@ NEWLY_TRIGGERED_WINDOW_DAYS = 7
 FULL_HISTORY_LOOKBACK_DAYS  = None
 RULE_DEAD_THRESHOLD         = 0
 
-TRACKER_EXCEL_PATH = ''
+TRACKER_EXCEL_PATH                 = ''
+TRACKER_HEADER_ROW                 = 1
+AUTO_UPDATE_TRACKER_TESTED         = True
+AUTO_CLEAR_INVESTIGATION_ON_TESTED = True
+TRACKER_BACKUP_BEFORE_WRITE        = True
 
 OUTPUT_DIR = r'C:\path\to\your\output'
 
@@ -54,6 +59,7 @@ OUTPUT_EXCEL = os.path.join(OUTPUT_DIR, 'qradar_rule_status.xlsx')
 
 _MAPI_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
 
+_RULE_NAME_COL_ALIASES     = ['alert rule name', 'rule name', 'name']
 _INVESTIGATION_COL_ALIASES = ['under investigation', 'investigation', 'investigating']
 _TESTED_COL_ALIASES        = ['tested', 'testing completed', 'test completed', 'testing']
 _TRUE_STRINGS = {'true', 'yes', 'y', '1', 'x', '✓', 'done', 'complete', 'completed'}
@@ -172,8 +178,7 @@ def validate_config():
 
     if TRACKER_EXCEL_PATH and not os.path.exists(TRACKER_EXCEL_PATH):
         problems.append(
-            f"TRACKER_EXCEL_PATH is set to '{TRACKER_EXCEL_PATH}' but that file doesn't exist yet — "
-            f"Under Investigation / Testing Completed metrics will show as unavailable until it does."
+            f"TRACKER_EXCEL_PATH is set to '{TRACKER_EXCEL_PATH}' but that file doesn't exist yet."
         )
 
     if problems:
@@ -363,6 +368,10 @@ def _to_bool(val):
     return str(val).strip().lower() in _TRUE_STRINGS
 
 
+def _normalize_name(s):
+    return ' '.join(str(s).strip().lower().split())
+
+
 def load_tracker_file(path):
     if not path:
         return None
@@ -370,30 +379,135 @@ def load_tracker_file(path):
         logger.warning("Tracker file not found at '%s'.", path)
         return None
     try:
-        df = pd.read_excel(path, engine='openpyxl')
+        df = pd.read_excel(path, engine='openpyxl', sheet_name=0)
+        sheet_name = pd.ExcelFile(path, engine='openpyxl').sheet_names[0]
     except Exception as e:
         logger.warning("Could not read tracker file '%s' (%s) — skipping it this run.", path, e)
         return None
 
+    name_col   = _find_col(df.columns, _RULE_NAME_COL_ALIASES)
     inv_col    = _find_col(df.columns, _INVESTIGATION_COL_ALIASES)
     tested_col = _find_col(df.columns, _TESTED_COL_ALIASES)
 
     if inv_col is None and tested_col is None and not df.empty:
+        logger.warning("Tracker file '%s' has neither an 'Under Investigation' nor a 'Tested' column.", path)
+    if name_col is None and not df.empty:
         logger.warning(
-            "Tracker file '%s' has neither an 'Under Investigation' nor a 'Tested' column "
-            "(columns found: %s).", path, list(df.columns)
+            "Tracker file '%s' has no recognizable Rule Name column — cross-referencing against "
+            "QRadar and the auto-mark-tested logic are disabled this run; only raw counts will be reported.",
+            path
         )
 
-    inv_count    = int(df[inv_col].apply(_to_bool).sum())    if inv_col    else 0
-    tested_count = int(df[tested_col].apply(_to_bool).sum()) if tested_col else 0
-
     return {
-        'raw':                       df,
-        'investigation_col':         inv_col,
-        'tested_col':                tested_col,
-        'under_investigation_count': inv_count,
-        'tested_count':              tested_count,
+        'raw':                df,
+        'sheet_name':         sheet_name,
+        'name_col':           name_col,
+        'investigation_col':  inv_col,
+        'tested_col':         tested_col,
+        'changed_cells':      [],
+        'auto_marked_rows':   [],
+        'auto_marked_indices': set(),
+        'unmatched_count':    None,
+        'under_investigation_count': 0,
+        'tested_count':       0,
     }
+
+
+def reconcile_tracker_with_qradar(tracker_info, master_df):
+    df = tracker_info['raw']
+    name_col   = tracker_info['name_col']
+    inv_col    = tracker_info['investigation_col']
+    tested_col = tracker_info['tested_col']
+
+    lookup = {}
+    if not master_df.empty:
+        for _, r in master_df.iterrows():
+            key = _normalize_name(r['rule_name'])
+            if key not in lookup:
+                lookup[key] = r
+
+    matched_flags, recent_list, total_list = [], [], []
+    changed_cells, auto_marked_rows, auto_marked_indices = [], [], set()
+
+    for idx, row in df.iterrows():
+        matched_rule = lookup.get(_normalize_name(row[name_col])) if name_col else None
+
+        is_investigating = _to_bool(row[inv_col]) if inv_col else False
+        is_tested        = _to_bool(row[tested_col]) if tested_col else False
+        recent = int(matched_rule['offenses_recent']) if matched_rule is not None else None
+        total  = int(matched_rule['offenses_total']) if matched_rule is not None else None
+
+        matched_flags.append(matched_rule is not None)
+        recent_list.append(recent)
+        total_list.append(total)
+
+        should_auto_mark = (
+            AUTO_UPDATE_TRACKER_TESTED
+            and matched_rule is not None
+            and is_investigating
+            and not is_tested
+            and tested_col is not None
+            and recent is not None
+            and recent > 0
+        )
+        if should_auto_mark:
+            df.at[idx, tested_col] = True
+            changed_cells.append((idx, tested_col, True))
+            if AUTO_CLEAR_INVESTIGATION_ON_TESTED and inv_col:
+                df.at[idx, inv_col] = False
+                changed_cells.append((idx, inv_col, False))
+            auto_marked_indices.add(idx)
+            auto_marked_rows.append({
+                'rule_name': str(row[name_col]),
+                'offenses_recent': recent,
+            })
+
+    df['_matched_to_qradar'] = matched_flags
+    df['_offenses_recent']   = recent_list
+    df['_offenses_total']    = total_list
+
+    tracker_info['raw'] = df
+    tracker_info['changed_cells'] = changed_cells
+    tracker_info['auto_marked_rows'] = auto_marked_rows
+    tracker_info['auto_marked_indices'] = auto_marked_indices
+    tracker_info['unmatched_count'] = int(len(matched_flags) - sum(matched_flags)) if name_col else None
+    tracker_info['under_investigation_count'] = int(df[inv_col].apply(_to_bool).sum()) if inv_col else 0
+    tracker_info['tested_count'] = int(df[tested_col].apply(_to_bool).sum()) if tested_col else 0
+    return tracker_info
+
+
+def persist_tracker_updates(path, tracker_info):
+    changed_cells = tracker_info.get('changed_cells') or []
+    if not changed_cells:
+        return 'no_changes'
+    if not AUTO_UPDATE_TRACKER_TESTED:
+        return 'disabled'
+
+    try:
+        if TRACKER_BACKUP_BEFORE_WRITE:
+            backup_path = path.replace('.xlsx', f"_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+            shutil.copy2(path, backup_path)
+
+        wb = openpyxl.load_workbook(path)
+        ws = wb[tracker_info['sheet_name']]
+        header_cells = ws[TRACKER_HEADER_ROW]
+        col_letter_by_name = {str(c.value).strip(): get_column_letter(c.column) for c in header_cells if c.value}
+
+        for idx, col_name, value in changed_cells:
+            col_letter = col_letter_by_name.get(col_name)
+            if not col_letter:
+                continue
+            excel_row = idx + TRACKER_HEADER_ROW + 1
+            ws[f'{col_letter}{excel_row}'] = value
+
+        wb.save(path)
+        return 'written'
+    except PermissionError:
+        logger.warning("Tracker file '%s' is open elsewhere — could not persist updates this run.", path)
+        return 'locked'
+    except Exception as e:
+        logger.error("Could not write updates back to tracker file '%s': %s", path, e)
+        return 'error'
 
 
 def build_master_rule_table(rules, offenses_all):
@@ -432,14 +546,15 @@ def build_master_rule_table(rules, offenses_all):
 
 
 _FILLS = {
-    'red':    PatternFill(start_color='FF6B6B', end_color='FF6B6B', fill_type='solid'),
-    'orange': PatternFill(start_color='FFBF47', end_color='FFBF47', fill_type='solid'),
-    'green':  PatternFill(start_color='A8E6CF', end_color='A8E6CF', fill_type='solid'),
-    'blue':   PatternFill(start_color='74B9FF', end_color='74B9FF', fill_type='solid'),
-    'header': PatternFill(start_color='2D2257', end_color='2D2257', fill_type='solid'),
-    'zebra_a': PatternFill(start_color='FFFFFF', end_color='FFFFFF', fill_type='solid'),
-    'zebra_b': PatternFill(start_color='F3F1FB', end_color='F3F1FB', fill_type='solid'),
-    'stale':   PatternFill(start_color='FFE2E2', end_color='FFE2E2', fill_type='solid'),
+    'red':         PatternFill(start_color='FF6B6B', end_color='FF6B6B', fill_type='solid'),
+    'orange':      PatternFill(start_color='FFBF47', end_color='FFBF47', fill_type='solid'),
+    'green':       PatternFill(start_color='A8E6CF', end_color='A8E6CF', fill_type='solid'),
+    'blue':        PatternFill(start_color='74B9FF', end_color='74B9FF', fill_type='solid'),
+    'header':      PatternFill(start_color='2D2257', end_color='2D2257', fill_type='solid'),
+    'zebra_a':     PatternFill(start_color='FFFFFF', end_color='FFFFFF', fill_type='solid'),
+    'zebra_b':     PatternFill(start_color='F3F1FB', end_color='F3F1FB', fill_type='solid'),
+    'stale':       PatternFill(start_color='FFE2E2', end_color='FFE2E2', fill_type='solid'),
+    'auto_marked': PatternFill(start_color='C6F6D5', end_color='C6F6D5', fill_type='solid'),
 }
 _HDR_FONT   = Font(bold=True, color='E8E0FF', size=10)
 _BOLD       = Font(bold=True, size=10)
@@ -528,18 +643,27 @@ def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules):
             f"(TRACKER_EXCEL_PATH = '{TRACKER_EXCEL_PATH or '(blank)'}')."
         )
     else:
-        tracker_note = f"Tracker source: {TRACKER_EXCEL_PATH}  ·  {len(tracker_info['raw'])} row(s) read."
+        crossref = 'enabled (matched by Rule Name)' if tracker_info['name_col'] else 'disabled (no Rule Name column found)'
+        auto_n = len(tracker_info['auto_marked_rows'])
+        unmatched = tracker_info['unmatched_count']
+        tracker_note = (
+            f"Tracker source: {TRACKER_EXCEL_PATH}  ·  {len(tracker_info['raw'])} row(s) read  ·  "
+            f"Cross-referencing: {crossref}  ·  Auto-marked Tested this run: {auto_n}"
+            + (f"  ·  Unmatched rows: {unmatched}" if unmatched is not None else "")
+        )
     ws.cell(row=row, column=1, value=tracker_note).font = Font(italic=True, size=9, color='7C6FA0')
     ws.cell(row=row, column=1).alignment = _WRAP
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-    ws.row_dimensions[row].height = 32
+    ws.row_dimensions[row].height = 40
     row += 2
 
     caveat = (
         'Rule descriptions reflect whatever metadata QRadar exposes via REST API; full boolean '
         'trigger logic is not reliably exposed in most versions — cross-reference the Rules console. '
         '"Dead" and "Newly Triggered" are bounded by whatever offense history QRadar currently retains '
-        '(or by FULL_HISTORY_LOOKBACK_DAYS, if set).'
+        '(or by FULL_HISTORY_LOOKBACK_DAYS, if set). Auto-marking Tested uses recent offense activity as '
+        'a proxy for "fired since you started investigating" — it does not confirm the offense was caused '
+        'by your specific test versus unrelated real traffic.'
     )
     ws.cell(row=row, column=1, value=caveat).font = Font(italic=True, size=9, color='7C6FA0')
     ws.cell(row=row, column=1).alignment = _WRAP
@@ -615,22 +739,45 @@ def _write_newly_triggered_sheet(wb, newly_df):
 
 
 def _write_tracker_sheet(wb, tracker_info):
-    ws  = wb.create_sheet('Investigation & Testing Tracker')
-    df  = tracker_info['raw']
-    cols = list(df.columns)
-    widths = [max(14, min(50, len(str(c)) + 4)) for c in cols]
-    _write_sheet_header(ws, [str(c) for c in cols], widths)
+    ws = wb.create_sheet('Investigation & Testing Tracker')
+    df = tracker_info['raw']
+    original_cols = [c for c in df.columns if not str(c).startswith('_')]
+    has_match_info = '_matched_to_qradar' in df.columns
+    extra_cols = (
+        ['Matched to QRadar Rule?', f'Offenses (last {NEWLY_TRIGGERED_WINDOW_DAYS}d)',
+         'Offenses (Total)', 'Auto-Marked Tested This Run?']
+        if has_match_info else []
+    )
+    cols = [str(c) for c in original_cols] + extra_cols
+    widths = [max(14, min(50, len(str(c)) + 4)) for c in original_cols] + [20, 18, 16, 20][:len(extra_cols)]
+    _write_sheet_header(ws, cols, widths)
 
     if df.empty:
         ws.append(['Tracker file has no rows.'])
         return
 
     inv_col, tested_col = tracker_info['investigation_col'], tracker_info['tested_col']
+    auto_marked_indices = tracker_info.get('auto_marked_indices', set())
     first_row = ws.max_row + 1
-    for _, r in df.iterrows():
-        ws.append([_native(r[c]) for c in cols])
+
+    for idx, r in df.iterrows():
+        values = [_native(r[c]) for c in original_cols]
+        if has_match_info:
+            recent, total = r['_offenses_recent'], r['_offenses_total']
+            values += [
+                'Yes' if r['_matched_to_qradar'] else 'No',
+                int(recent) if pd.notna(recent) else '—',
+                int(total) if pd.notna(total) else '—',
+                'Yes' if idx in auto_marked_indices else 'No',
+            ]
+        ws.append(values)
         r_idx = ws.max_row
-        for c_idx, c in enumerate(cols, start=1):
+
+        if idx in auto_marked_indices:
+            for c_idx in range(1, len(cols) + 1):
+                ws.cell(row=r_idx, column=c_idx).fill = _FILLS['auto_marked']
+
+        for c_idx, c in enumerate(original_cols, start=1):
             if c == inv_col and _to_bool(r[c]):
                 ws.cell(row=r_idx, column=c_idx).fill = _FILLS['orange']
             elif c == tested_col and _to_bool(r[c]):
@@ -665,11 +812,11 @@ def save_excel_report(dead_df, newly_df, tracker_info, total_rules, path):
         return None
 
 
-_CHART_BG     = '#07051a'
-_CHART_GRID   = '#241c4d'
-_CHART_TEXT   = '#c9bdf5'
-_CHART_TITLE  = '#b79dfa'
-_CHART_AXIS   = '#4a3e85'
+_CHART_BG    = '#07051a'
+_CHART_GRID  = '#241c4d'
+_CHART_TEXT  = '#c9bdf5'
+_CHART_TITLE = '#b79dfa'
+_CHART_AXIS  = '#4a3e85'
 
 
 def generate_status_chart(dead_count, newly_count, tracker_info, total_rules):
@@ -828,6 +975,40 @@ def _build_newly_triggered_table_html(newly_df):
     </table>{more_note}"""
 
 
+def _build_auto_validated_table_html(tracker_info):
+    C = _C
+    rows = tracker_info.get('auto_marked_rows') if tracker_info else None
+    if not rows:
+        return None
+
+    shown = rows[:EMAIL_TABLE_ROW_CAP]
+    rows_html = ''
+    for i, r in enumerate(shown):
+        bg = C['card'] if i % 2 == 0 else C['card_alt']
+        name = _html_escape(r['rule_name'])
+        name_short = name[:48] + '…' if len(name) > 48 else name
+        rows_html += f"""
+        <tr style="background-color:{bg};">
+          <td style="padding:8px 10px;border-left:3px solid {C['blue']};font-size:11px;color:{C['text']};font-family:monospace;" title="{name}">{name_short}</td>
+          <td style="padding:8px 10px;font-size:11px;color:{C['blue']};font-family:monospace;text-align:center;font-weight:700;">{r['offenses_recent']}</td>
+        </tr>"""
+
+    more_note = ''
+    if len(rows) > EMAIL_TABLE_ROW_CAP:
+        more_note = (f'<div style="font-size:10px;color:{C["dim"]};margin-top:8px;font-family:monospace;">'
+                     f'+ {len(rows) - EMAIL_TABLE_ROW_CAP} more — see attached Excel.</div>')
+
+    _hdr = f'background:{C["card_alt"]};border-bottom:2px solid {C["blue"]};'
+    return f"""
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:10px;border:1px solid {C['border']};border-radius:8px;overflow:hidden;">
+      <thead><tr>
+        <th style="padding:8px 10px;text-align:left;font-size:9px;color:{C['blue']};font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Rule Name</th>
+        <th style="padding:8px 10px;text-align:center;font-size:9px;color:{C['blue']};font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:monospace;{_hdr}">Offenses (last {NEWLY_TRIGGERED_WINDOW_DAYS}d)</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>{more_note}"""
+
+
 def build_email_html(dead_df, newly_df, tracker_info, total_rules, chart_cid):
     C = _C
     run_time = datetime.now().strftime('%d %b %Y  ·  %H:%M:%S')
@@ -836,6 +1017,7 @@ def build_email_html(dead_df, newly_df, tracker_info, total_rules, chart_cid):
     newly_count  = len(newly_df)
     inv_count    = tracker_info['under_investigation_count'] if tracker_info else None
     tested_count = tracker_info['tested_count']              if tracker_info else None
+    auto_marked  = tracker_info['auto_marked_rows']          if tracker_info else []
 
     if newly_count > 0:
         hdr_bg, hdr_txt = C['badge_green'], f'✔  {newly_count} NEWLY TRIGGERED'
@@ -864,15 +1046,16 @@ def build_email_html(dead_df, newly_df, tracker_info, total_rules, chart_cid):
                 f'text-transform:uppercase;letter-spacing:1px;">{label}</div>{note_html}'
                 f'</td></tr></table></td>')
 
-    tracker_note = '' if tracker_info else 'tracker not configured'
     dead_pct  = f"{dead_count / total_rules * 100:.1f}% of rules"  if total_rules else ''
     newly_pct = f"{newly_count / total_rules * 100:.1f}% of rules" if total_rules else ''
+    inv_note    = '' if tracker_info else 'tracker not configured'
+    tested_note = f"+{len(auto_marked)} auto-marked this run" if auto_marked else ('' if tracker_info else 'tracker not configured')
 
     headline_metrics = (
         metric_card('💀', 'Dead Rules', dead_count, C['red'], dead_pct)
         + metric_card('✔', f'Newly Triggered ({NEWLY_TRIGGERED_WINDOW_DAYS}d)', newly_count, C['green'], newly_pct)
-        + metric_card('🔍', 'Under Investigation', inv_count, C['orange'], tracker_note)
-        + metric_card('✅', 'Testing Completed', tested_count, C['blue'], tracker_note)
+        + metric_card('🔍', 'Under Investigation', inv_count, C['orange'], inv_note)
+        + metric_card('✅', 'Testing Completed', tested_count, C['blue'], tested_note)
     )
 
     chart_html = (f'<img src="cid:{chart_cid}" alt="Rule status chart" '
@@ -880,6 +1063,7 @@ def build_email_html(dead_df, newly_df, tracker_info, total_rules, chart_cid):
                   f'border:1px solid {C["border"]};">') if chart_cid else ''
     dead_table_html  = _build_dead_table_html(dead_df)
     newly_table_html = _build_newly_triggered_table_html(newly_df)
+    auto_table_html  = _build_auto_validated_table_html(tracker_info)
 
     def section_header(icon, title, color, subtitle):
         return f"""
@@ -887,6 +1071,14 @@ def build_email_html(dead_df, newly_df, tracker_info, total_rules, chart_cid):
     <span style="font-size:13px;font-weight:700;color:{color};font-family:monospace;">{icon} {title}</span>
     <div style="font-size:10px;color:{C['dim']};margin-top:4px;">{subtitle}</div>
   </td></tr>"""
+
+    auto_section = ''
+    if auto_table_html:
+        auto_section = (
+            section_header('✏️', 'Auto-Validated This Run', C['blue'],
+                           'Marked Under Investigation and fired since — Tested has been set to Yes in your tracker file.')
+            + f'<tr><td style="padding:0 0 20px;">{auto_table_html}</td></tr>'
+        )
 
     hist_note = ('all offenses currently retained by QRadar' if not FULL_HISTORY_LOOKBACK_DAYS
                  else f'the last {FULL_HISTORY_LOOKBACK_DAYS} days')
@@ -960,6 +1152,8 @@ table, td {{ font-family:Arial, sans-serif !important; }}
                    f"anywhere in {hist_note}.")}
   <tr><td style="padding:0 0 20px;">{newly_table_html}</td></tr>
 
+  {auto_section}
+
   <tr><td style="padding:18px 0 4px;border-top:1px solid {C['border']};">
     <div style="font-size:9px;color:{C['dim']};font-family:monospace;letter-spacing:0.5px;line-height:1.6;">
       QRadar Rule Status Auditor &nbsp;·&nbsp; Auto-generated {run_time}<br>
@@ -1016,6 +1210,7 @@ def main():
     print(f"  Full history    : "
           f"{'unbounded (all retained offenses)' if not FULL_HISTORY_LOOKBACK_DAYS else f'{FULL_HISTORY_LOOKBACK_DAYS} days'}")
     print(f"  Tracker file    : {TRACKER_EXCEL_PATH or '(not configured)'}")
+    print(f"  Auto-mark Tested: {AUTO_UPDATE_TRACKER_TESTED}")
     print(f"  Retry config    : {MAX_RETRIES} attempts, {RETRY_DELAY_BASE}s base backoff")
     print("=" * 62)
 
@@ -1054,9 +1249,27 @@ def main():
     if tracker_info is None:
         print("   ℹ️  Tracker not configured or unavailable this run.")
     else:
+        tracker_info = reconcile_tracker_with_qradar(tracker_info, master_df)
         print(f"   ✅ {tracker_info['under_investigation_count']} under investigation, "
               f"{tracker_info['tested_count']} testing completed "
               f"(of {len(tracker_info['raw'])} tracked row(s)).")
+        if tracker_info['name_col'] and tracker_info['unmatched_count']:
+            print(f"   ⚠️  {tracker_info['unmatched_count']} tracker row(s) didn't match any enabled QRadar rule by name.")
+
+        if tracker_info['changed_cells']:
+            result = persist_tracker_updates(TRACKER_EXCEL_PATH, tracker_info)
+            n_auto = len(tracker_info['auto_marked_rows'])
+            if result == 'written':
+                print(f"   ✏️  Auto-marked {n_auto} rule(s) as Tested — written back to {TRACKER_EXCEL_PATH} "
+                      f"(backup saved alongside it).")
+            elif result == 'locked':
+                print(f"   ⚠️  {n_auto} rule(s) qualify to be auto-marked Tested, but the tracker file is "
+                      f"open elsewhere — close it and re-run to persist.")
+            elif result == 'disabled':
+                print(f"   ℹ️  {n_auto} rule(s) qualify to be auto-marked Tested "
+                      f"(AUTO_UPDATE_TRACKER_TESTED=False — not written back).")
+            elif result == 'error':
+                print(f"   ❌ Could not write updates back to the tracker file — see log for details.")
 
     print(f"\n💾 Saving Excel report → {OUTPUT_EXCEL}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
