@@ -212,6 +212,50 @@ def _com_dt_to_py(com_dt) -> datetime | None:
         return None
 
 
+def _items_since(items_collection, cutoff_dt: datetime, sort_property: str, get_dt) -> list:
+    """
+    Return every item in `items_collection` dated on/after `cutoff_dt`, WITHOUT
+    using Outlook's string-based Restrict()/Find() for the date comparison.
+
+    ROOT CAUSE OF "0 emails found" BUGS: Restrict() filters like
+    "[ReceivedTime] >= '09/01/2026 12:00 AM'" are parsed by Outlook using the
+    *Windows regional short-date format* of the account the script runs
+    under — not necessarily MM/DD/YYYY. If that machine's Region settings use
+    DD/MM/YYYY, YYYY-MM-DD, or anything else, the filter string is silently
+    misread and matches nothing — no error, no exception, just an empty
+    result set. This is a long-standing, well-documented Outlook COM quirk.
+
+    Fix: sort the collection by the same field (descending) and compare real
+    Python datetime objects instead of building a locale-dependent string.
+    Sorting first lets us break out early once we pass the cutoff, so this
+    stays fast even on large folders. If Sort() itself fails for any reason,
+    we fall back to scanning every item (slower, but still correct) rather
+    than risking a false "0 found" ever showing up again.
+    """
+    sorted_ok = True
+    try:
+        items_collection.Sort(f"[{sort_property}]", True)  # True = descending, newest first
+    except Exception as exc:
+        sorted_ok = False
+        _log(f"      WARNING: Sort by [{sort_property}] failed ({exc}) — "
+             f"scanning every item instead (slower, still correct).")
+
+    matched = []
+    for item in items_collection:
+        try:
+            dt = get_dt(item)
+        except Exception:
+            continue
+        if dt is None:
+            continue
+        if dt < cutoff_dt:
+            if sorted_ok:
+                break   # collection is sorted newest-first — nothing later can qualify
+            continue    # unsorted fallback — keep scanning the rest
+        matched.append(item)
+    return matched
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # RUNTIME DEDUP
 # ══════════════════════════════════════════════════════════════════════════════
@@ -545,11 +589,13 @@ def check_conversation_status(mail_item, sent_folder, drafts_folder) -> tuple:
         if tag and (last_dt is None or (dt and dt > last_dt)):
             last_tag, last_dt = tag, dt
 
-    cutoff = (datetime.now() - timedelta(days=SENT_SCAN_DAYS)).strftime('%m/%d/%Y %I:%M %p')
+    cutoff = datetime.now() - timedelta(days=SENT_SCAN_DAYS)
 
     # Sent Items
     try:
-        for item in sent_folder.Items.Restrict(f"[SentOn] >= '{cutoff}'"):
+        sent_candidates = _items_since(sent_folder.Items, cutoff, 'SentOn',
+                                       lambda it: _com_dt_to_py(it.SentOn))
+        for item in sent_candidates:
             try:
                 if item.ConversationID == conv_id:
                     _update(_tag_from_subject(item.Subject), _com_dt_to_py(item.SentOn))
@@ -560,7 +606,9 @@ def check_conversation_status(mail_item, sent_folder, drafts_folder) -> tuple:
 
     # Drafts (same date window to keep large mailboxes fast)
     try:
-        for item in drafts_folder.Items.Restrict(f"[LastModificationTime] >= '{cutoff}'"):
+        draft_candidates = _items_since(drafts_folder.Items, cutoff, 'LastModificationTime',
+                                        lambda it: _com_dt_to_py(it.LastModificationTime))
+        for item in draft_candidates:
             try:
                 if item.ConversationID == conv_id:
                     _update(_tag_from_subject(item.Subject),
@@ -991,10 +1039,11 @@ def main() -> None:
 
         fetch_log_source_types()
 
-        cutoff_str         = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime('%m/%d/%Y %I:%M %p')
+        lookback_cutoff    = datetime.now() - timedelta(days=LOOKBACK_DAYS)
         active_skip_cutoff = datetime.now() - timedelta(days=ACTIVE_SKIP_DAYS)
 
-        items = list(inbox.Items.Restrict(f"[ReceivedTime] >= '{cutoff_str}'"))
+        items = _items_since(inbox.Items, lookback_cutoff, 'ReceivedTime',
+                             lambda it: _com_dt_to_py(it.ReceivedTime))
         _log(f"\n{len(items)} email(s) found in last {LOOKBACK_DAYS}d\n{'─'*40}")
 
         processed = skipped = drafted = sent_count = revalidated = 0
