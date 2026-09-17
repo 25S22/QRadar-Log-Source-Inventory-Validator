@@ -1,5 +1,5 @@
 """
-QRadar Signoff Runner  v3.1
+QRadar Signoff Runner  v3.2
 ────────────────────────────────────────────────────────────────────────────
 Scans Outlook for SIEM signoff emails, queries QRadar, and replies with the
 result — either as a draft for review, or sent immediately when configured.
@@ -7,6 +7,12 @@ result — either as a draft for review, or sent immediately when configured.
 Key behaviours
   • First-email-only policy — any subject starting with RE: / FW: / FWD: is
     skipped immediately.  No prefix-stripping, no chain chasing.
+  • Tolerant subject parsing (v3.2) — the keyword is matched regardless of
+    spacing/hyphenation ("Sign-off", "Sign off"), extra words between the
+    keyword and the hostnames are ignored ("Security Signoff for | ..."),
+    hostnames may be separated by | , ; / or a spaced dash, and environment
+    tags such as "OnPrem" / "Azure" / "Prod" are dropped before lookup.
+    Run `python signoff_runner.py --selftest` to see the parser in action.
   • Draft-by-default — reply.Save() unless AUTO_SEND_ON_ACTIVE=True, in which
     case a fully-Active result (ALL hosts confirmed) is sent immediately.
     Partial / Not-Found results are ALWAYS drafted for human review and
@@ -23,6 +29,8 @@ Dashboard
 
 import json
 import os
+import re
+import sys
 import tempfile
 import time
 import uuid
@@ -53,6 +61,39 @@ VERIFY_SSL      = False          # set True + supply a CA bundle in production
 # ─── Subject matching ─────────────────────────────────────────────────────────
 SUBJECT_KEYWORD   = 'Security Signoff'   # must appear left of SUBJECT_SEPARATOR
 SUBJECT_SEPARATOR = '|'                  # separates keyword from hostname list
+
+# ─── Subject parsing tolerance  (NEW in v3.2 — purely additive) ───────────────
+# Extra characters that ALSO separate hostnames, for senders who don't use '|'.
+# A plain '-' is handled separately: it only splits when surrounded by spaces
+# (" SRV1 - SRV2 "), so embedded dashes in names like PRD-SQL-01 stay intact.
+EXTRA_HOST_SEPARATORS = [',', ';', '/', '\n', '\r']
+
+# Tokens/words dropped before the QRadar lookup: environment and platform tags
+# plus the usual subject-line filler.  Matching ignores case, spaces, dots and
+# dashes — so one entry 'onprem' covers "OnPrem", "On-Prem" and "on prem".
+# A word is only dropped on an EXACT match, so 'AZURE01' survives 'azure'.
+SUBJECT_NOISE_WORDS = [
+    # placement / platform
+    'onprem', 'onpremise', 'onpremises', 'premise', 'premises', 'cloud',
+    'azure', 'aws', 'gcp', 'oci', 'vmware', 'vm', 'physical', 'virtual',
+    # environment
+    'prod', 'production', 'nonprod', 'preprod', 'dev', 'development',
+    'test', 'testing', 'uat', 'sit', 'qa', 'stage', 'staging', 'dr', 'poc',
+    # operating system
+    'windows', 'win', 'linux', 'unix', 'rhel', 'ubuntu', 'centos', 'aix',
+    # generic nouns
+    'server', 'servers', 'host', 'hosts', 'hostname', 'hostnames', 'name',
+    'names', 'machine', 'machines', 'asset', 'assets', 'device', 'devices',
+    'node', 'nodes', 'box', 'boxes', 'ip', 'fqdn',
+    # request filler
+    'new', 'newly', 'onboard', 'onboarded', 'onboarding', 'request',
+    'requests', 'req', 'required', 'please', 'kindly', 'thanks', 'thank',
+    'regards', 'urgent', 'asap', 'fyi', 'eom', 'external', 'internal',
+    'siem', 'qradar', 'security', 'signoff', 'signoffs', 'sign', 'off',
+    'confirmation', 'confirm', 'validation', 'validate', 'verification',
+    'verify', 'check', 'status', 'update', 'and', 'for', 'of', 'the',
+    'on', 'in', 'to', 'from', 'with', 'tbd', 'na', 'nil', 'xxx', 'xxxx',
+]
 
 # ─── Scan windows ─────────────────────────────────────────────────────────────
 LOOKBACK_DAYS    = 30   # how many days back to scan the Inbox
@@ -129,6 +170,10 @@ _MAX_TS                 = 2_147_483_647
 LOG_SOURCE_TYPES_CACHE: dict = {}
 STATUS_PRIORITY = {'not_found': 2, 'partial': 1, 'active': 0}
 _runtime_drafted_hosts: set = set()
+
+# Tokens thrown away by the most recent extract_hostnames() call, purely so the
+# run log can show WHY something was ignored. Reset on every call.
+_last_parse_dropped: list = []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -506,6 +551,217 @@ def is_sender_allowed(addr: str) -> bool:
     return False
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SUBJECT PARSING   (rebuilt in v3.2)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Real-world subject lines that must all resolve to the same hostname list:
+#
+#   Security Signoff | SRV01
+#   Security Signoff for | SRV01
+#   Security Sign-off Request | OnPrem | SRV01
+#   Security Signoff | SRV01, SRV02; SRV03
+#   Security Signoff - SRV01 - SRV02            (spaced dash = separator)
+#   Security Signoff | PRD-SQL-01               (embedded dash = NOT a separator)
+#   Security Signoff for SRV01 and SRV02        (no separator at all)
+#
+# Strategy:
+#   1. Locate the keyword by comparing *alphanumerics only*, so spacing and
+#      hyphenation ("Sign-off", "Sign off", "SIGNOFF") never matter.
+#   2. Everything to the right of the keyword is the payload.
+#   3. Split the payload on | , ; / newline and spaced/en/em dashes.
+#   4. Drop noise tokens (OnPrem, Azure, Prod, "for", "please", ...).
+#   5. Validate what's left looks like a hostname, de-duplicate, return.
+#
+# Safety rail: when the payload contained NO explicit separator, a multi-token
+# result is narrowed to tokens that actually look like hostnames (they contain
+# a digit, dot, or dash).  That stops free-text subjects such as
+# "Security Signoff for the new servers" turning prose into QRadar queries.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Reply / forward prefixes, including numbered ones (RE[2]:) and the common
+# non-English equivalents that Exchange adds for other Outlook languages.
+_RE_REPLY_PREFIX = re.compile(
+    r'^\s*(re|fw|fwd|rv|aw|wg|tr|sv|vs|res|enc|antw|antwort)\s*(\[\d+\])?\s*:',
+    re.IGNORECASE,
+)
+
+# A dash only separates hosts when it is spaced, or when it is an en/em dash.
+_RE_DASH_SEPARATOR = re.compile(r'\s+[-]+\s+|\s*[\u2013\u2014]+\s*')
+
+# Characters trimmed from the edge of a token: quotes, brackets, punctuation.
+_TOKEN_TRIM_CHARS = ' \t\'"`()[]{}<>.,;:!?*_'
+
+# A hostname may contain letters, digits, dots, dashes, underscores — and a
+# space only in the multi-word fallback path below.
+_RE_HOSTNAME_SHAPE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._\- ]*$')
+
+# Some teams submit the IP rather than the name — QRadar log source names very
+# often contain it, so accept it as a lookup target.
+_RE_IPV4 = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+
+_SPLIT_SENTINEL = '\x00'
+
+
+def _norm_word(text: str) -> str:
+    """Lowercase and strip everything that isn't a letter or digit."""
+    return re.sub(r'[^a-z0-9]', '', (text or '').lower())
+
+
+_NOISE_SET = {_norm_word(w) for w in SUBJECT_NOISE_WORDS if _norm_word(w)}
+
+
+def _squash(text: str) -> tuple:
+    """
+    Return (alphanumerics-only lowercase string, index map back to `text`).
+    Lets us find 'securitysignoff' inside 'Security  Sign-Off' and still know
+    exactly where the match ends in the original string.
+    """
+    squashed, index_map = [], []
+    for i, ch in enumerate(text or ''):
+        if ch.isalnum():
+            squashed.append(ch.lower())
+            index_map.append(i)
+    return ''.join(squashed), index_map
+
+
+def _keyword_span(subject: str):
+    """Return (start, end) offsets of SUBJECT_KEYWORD in `subject`, or None."""
+    key = _norm_word(SUBJECT_KEYWORD)
+    if not key:
+        return (0, 0)
+    squashed, index_map = _squash(subject)
+    pos = squashed.find(key)
+    if pos < 0:
+        return None
+    return index_map[pos], index_map[pos + len(key) - 1] + 1
+
+
+def _clean_token(token: str) -> str:
+    return (token or '').strip().strip(_TOKEN_TRIM_CHARS).strip()
+
+
+def _is_noise(token: str) -> bool:
+    n = _norm_word(token)
+    return (not n) or n in _NOISE_SET
+
+
+def _is_valid_hostname(token: str) -> bool:
+    """Loose sanity check — is this plausibly a machine name?"""
+    if not token or len(token) > 120:
+        return False
+    if '@' in token:                                  # an email address, not a host
+        return False
+    if _RE_IPV4.match(token):
+        return all(0 <= int(o) <= 255 for o in token.split('.'))
+    if not _RE_HOSTNAME_SHAPE.match(token):
+        return False
+    if not any(c.isalpha() for c in token):           # kills dates and bare numbers
+        return False
+    if len(_norm_word(token)) < 3:                    # kills stray initials
+        return False
+    return True
+
+
+def _is_strong_hostname(token: str) -> bool:
+    """Stricter check used where the sender gave us no explicit separator."""
+    if not token or ' ' in token:
+        return False
+    return any(c.isdigit() for c in token) or '.' in token or '-' in token
+
+
+def _split_payload(payload: str) -> tuple:
+    """Return (raw_tokens, had_explicit_separator)."""
+    text = payload or ''
+    had_sep = False
+
+    for sep in [SUBJECT_SEPARATOR] + list(EXTRA_HOST_SEPARATORS):
+        if sep and sep in text:
+            had_sep = True
+            text = text.replace(sep, _SPLIT_SENTINEL)
+
+    if _RE_DASH_SEPARATOR.search(text):
+        had_sep = True
+        text = _RE_DASH_SEPARATOR.sub(_SPLIT_SENTINEL, text)
+
+    return [t.strip() for t in text.split(_SPLIT_SENTINEL)], had_sep
+
+
+def _tokens_from_multiword(token: str) -> list:
+    """
+    Handle a token that still contains spaces, e.g. "OnPrem SRV01" or
+    "Prod Windows SRV01".  Noise words are dropped; if any survivor looks
+    like a real hostname we keep only those, otherwise we keep the whole
+    remaining phrase (some estates really do use spaced names).
+    """
+    words = [_clean_token(w) for w in token.split()]
+    kept  = [w for w in words if w and not _is_noise(w)]
+    if not kept:
+        return []
+    strong = [w for w in kept if _is_strong_hostname(w)]
+    if strong:
+        return strong
+    return [' '.join(kept)]
+
+
+def extract_hostnames(subject: str) -> list:
+    """
+    Return the list of hostnames parsed from `subject`, in the order given,
+    de-duplicated case-insensitively, with environment/filler tags removed.
+    Tokens that were thrown away are recorded in `_last_parse_dropped` so the
+    run log can explain itself.
+    """
+    global _last_parse_dropped
+    _last_parse_dropped = []
+
+    span = _keyword_span(subject or '')
+    if span is None:
+        return []
+    payload = (subject or '')[span[1]:]
+
+    raw_tokens, had_sep = _split_payload(payload)
+
+    candidates = []
+    for raw in raw_tokens:
+        token = _clean_token(raw)
+        if not token:
+            continue
+        if _is_noise(token):
+            _last_parse_dropped.append(token)
+            continue
+        if ' ' in token:
+            pieces = _tokens_from_multiword(token)
+            if not pieces:
+                _last_parse_dropped.append(token)
+            candidates.extend(pieces)
+        else:
+            candidates.append(token)
+
+    hostnames, seen = [], set()
+    for cand in candidates:
+        cand = _clean_token(cand)
+        if not cand or _is_noise(cand):
+            if cand:
+                _last_parse_dropped.append(cand)
+            continue
+        if not _is_valid_hostname(cand):
+            _last_parse_dropped.append(cand)
+            continue
+        key = cand.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        hostnames.append(cand)
+
+    # No explicit separator anywhere — be conservative with free text.
+    if not had_sep and len(hostnames) > 1:
+        strong = [h for h in hostnames if _is_strong_hostname(h)]
+        _last_parse_dropped.extend(h for h in hostnames if h not in strong)
+        hostnames = strong
+
+    return hostnames
+
+
 def passes_subject_guards(subject: str) -> tuple:
     """
     Returns (True, 'ok') or (False, reason_string).
@@ -513,42 +769,54 @@ def passes_subject_guards(subject: str) -> tuple:
     Rules applied in order:
       1. RE: / FW: / FWD: prefix → skip  (first-email-only policy)
       2. Already carries a [Processed*] tag → skip
-      3. Separator not present → skip
-      4. Keyword not found left of the separator → skip
+      3. Keyword not found (spacing/hyphenation-insensitive) → skip
+      4. Keyword sits to the RIGHT of the first separator → skip
+      5. Nothing at all after the keyword → skip
+
+    Note: unlike v3.1 the separator is no longer mandatory — a subject such as
+    "Security Signoff for SRV01" is accepted, because extract_hostnames() can
+    resolve it safely.  Emails whose payload yields no hostname are still
+    skipped by the caller.
     """
-    if not subject:
+    if not subject or not subject.strip():
         return False, "empty subject"
 
     s     = subject.strip()
     lower = s.lower()
 
     # Rule 1 — first-email-only: reject any reply or forward
-    for prefix in ('re:', 'fw:', 'fwd:'):
-        if lower.startswith(prefix):
-            return False, f"reply/forward ({prefix.rstrip(':')})"
+    m = _RE_REPLY_PREFIX.match(s)
+    if m:
+        return False, f"reply/forward ({m.group(1).lower()})"
 
     # Rule 2 — skip already-processed emails
     if '[processed' in lower:
         return False, "already tagged"
 
-    # Rule 3 — separator must be present
-    if SUBJECT_SEPARATOR not in s:
-        return False, f"no '{SUBJECT_SEPARATOR}' separator"
+    # Rule 3 — keyword must be present somewhere
+    span = _keyword_span(s)
+    if span is None:
+        return False, f"keyword '{SUBJECT_KEYWORD}' not found"
 
-    # Rule 4 — keyword must appear left of the separator
-    left = s.split(SUBJECT_SEPARATOR)[0].strip()
-    if SUBJECT_KEYWORD.lower() not in left.lower():
-        return False, f"keyword '{SUBJECT_KEYWORD}' not in '{left}'"
+    # Rule 4 — keyword must sit left of the primary separator when one is used
+    if SUBJECT_SEPARATOR and SUBJECT_SEPARATOR in s:
+        if span[0] > s.index(SUBJECT_SEPARATOR):
+            return False, f"keyword '{SUBJECT_KEYWORD}' not left of '{SUBJECT_SEPARATOR}'"
+
+    # Rule 5 — something usable must follow the keyword. "Security Signoff for |"
+    # and "Security Signoff for the new servers" both fail here: every word left
+    # over is filler, so there is nothing to look up.
+    tail = s[span[1]:]
+    for sep in [SUBJECT_SEPARATOR] + list(EXTRA_HOST_SEPARATORS):
+        if sep:
+            tail = tail.replace(sep, ' ')
+    tail_words = [w for w in (_clean_token(w) for w in tail.split()) if w]
+    if not tail_words:
+        return False, "nothing after keyword"
+    if all(_is_noise(w) for w in tail_words):
+        return False, f"nothing usable after keyword ({' '.join(tail_words)!r} is all filler)"
 
     return True, "ok"
-
-
-def extract_hostnames(subject: str) -> list:
-    """Return list of hostnames parsed from the right-hand side of the separator."""
-    parts = subject.split(SUBJECT_SEPARATOR, 1)
-    if len(parts) < 2:
-        return []
-    return [h.strip() for h in parts[1].split(SUBJECT_SEPARATOR) if h.strip()]
 
 
 def body_contains_dl(mail_item) -> bool:
@@ -826,7 +1094,8 @@ def build_reply_html(hostname_list: list) -> tuple:
 
 def write_record(email_subject: str, sender: str, host_records: list,
                  overall_status: str, is_revalidation: bool,
-                 prior_status: str | None, was_sent: bool = False) -> None:
+                 prior_status: str | None, was_sent: bool = False,
+                 ignored_tokens: list = None) -> None:
     data = _load_data()
     data.setdefault('entries', [])
     data['entries'].append({
@@ -839,6 +1108,7 @@ def write_record(email_subject: str, sender: str, host_records: list,
         'prior_status':      prior_status,
         'was_sent':          was_sent,   # True = auto-sent, False = saved as draft
         'hosts':             host_records,
+        'ignored_tokens':    ignored_tokens or [],   # v3.2 — noise dropped from the subject
         'manually_resolved': False,
         'notes':             '',
     })
@@ -999,6 +1269,62 @@ def get_outlook_folders():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SELF-TEST  —  python signoff_runner.py --selftest
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SELFTEST_CASES = [
+    # (subject, expected_hostnames  |  None = expected to be skipped by guards)
+    ('Security Signoff | SRV01',                                   ['SRV01']),
+    ('Security Signoff for | SRV01',                               ['SRV01']),
+    ('Security Signoff for |',                                     None),
+    ('Security Sign-off Request | OnPrem | ABCPRDSQL01',           ['ABCPRDSQL01']),
+    ('Security Sign off | On-Prem | PRD-SQL-01',                   ['PRD-SQL-01']),
+    ('Security Signoff | OnPrem| SRV01, SRV02; SRV03',             ['SRV01', 'SRV02', 'SRV03']),
+    ('Security Signoff - SRV01 - SRV02',                           ['SRV01', 'SRV02']),
+    ('Security Signoff | PRD-SQL-01',                              ['PRD-SQL-01']),
+    ('Security Signoff | Azure | web-app-03.corp.local',           ['web-app-03.corp.local']),
+    ('Security Signoff | 10.20.30.40',                             ['10.20.30.40']),
+    ('Security Signoff | SRV01 | SRV02 | Thanks',                   ['SRV01', 'SRV02']),
+    ('Security Signoff for SRV01 and SRV02',                       ['SRV01', 'SRV02']),
+    ('Security Signoff | Prod Windows SRV01 / Linux SRV02',        ['SRV01', 'SRV02']),
+    ('Security SignOff Request | SRV01 | SRV01',                   ['SRV01']),
+    ('Security Signoff | OnPrem | Server Name',                    None),
+    ('Security Signoff for the new servers',                       None),
+    ('RE: Security Signoff | SRV01',                               None),
+    ('FWD: Security Signoff | SRV01',                              None),
+    ('RE[2]: Security Signoff | SRV01',                            None),
+    ('[Processed-Active] Security Signoff | SRV01',                None),
+    ('SRV01 | Security Signoff',                                   None),
+    ('Weekly patching report | SRV01',                             None),
+]
+
+
+def _selftest() -> int:
+    """Run the subject parser over known-good/known-bad subjects. No Outlook, no QRadar."""
+    print('=' * 78)
+    print('Subject parser self-test — SUBJECT_KEYWORD = '
+          f'{SUBJECT_KEYWORD!r}, SUBJECT_SEPARATOR = {SUBJECT_SEPARATOR!r}')
+    print('=' * 78)
+    failures = 0
+    for subject, expected in _SELFTEST_CASES:
+        ok, reason = passes_subject_guards(subject)
+        if not ok:
+            actual, shown = None, f'SKIP ({reason})'
+        else:
+            actual = extract_hostnames(subject)
+            shown  = f'{actual}' + (f'   [ignored: {_last_parse_dropped}]'
+                                    if _last_parse_dropped else '')
+        passed = (actual == expected)
+        failures += int(not passed)
+        print(f"  {'PASS' if passed else 'FAIL'}  {subject!r}\n        → {shown}")
+        if not passed:
+            print(f"        expected: {expected if expected is not None else 'SKIP'}")
+    print('=' * 78)
+    print(f"{len(_SELFTEST_CASES) - failures}/{len(_SELFTEST_CASES)} passed")
+    return 1 if failures else 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1016,11 +1342,13 @@ def main() -> None:
         send_policy = 'draft-only'
 
     _log('=' * 65)
-    _log('QRadar Signoff Runner  v3.1')
+    _log('QRadar Signoff Runner  v3.2')
     _log(f'  Inbox scan : last {LOOKBACK_DAYS}d')
     _log(f'  Sent scan  : last {SENT_SCAN_DAYS}d')
     _log(f'  Active-skip: {ACTIVE_SKIP_DAYS}d')
     _log(f'  Policy     : first-email-only | {send_policy}')
+    _log(f"  Separators : '{SUBJECT_SEPARATOR}' "
+         f"{[s for s in EXTRA_HOST_SEPARATORS if s.strip()]} + spaced dash")
     _log(f'  Data file  : {SIGNOFF_DATA_PATH}')
     _log(f'  Log file   : {RUN_LOG_PATH}')
     _log('=' * 65)
@@ -1083,10 +1411,12 @@ def main() -> None:
                 continue
 
             # ── Parse hostnames ───────────────────────────────────────────────
-            hostname_list = extract_hostnames(subject)
+            hostname_list  = extract_hostnames(subject)
+            ignored_tokens = list(_last_parse_dropped)
             if not hostname_list:
                 skipped += 1
-                _log(f"  SKIP (no hostnames parsed): {subject[:60]!r}")
+                _log(f"  SKIP (no hostnames parsed): {subject[:60]!r}"
+                     + (f"  [ignored: {ignored_tokens}]" if ignored_tokens else ''))
                 continue
 
             # ── Runtime dedup ─────────────────────────────────────────────────
@@ -1098,6 +1428,8 @@ def main() -> None:
             _log(f"\n  Candidate : {subject[:70]!r}")
             _log(f"  Sender    : {sender}")
             _log(f"  Hosts     : {hostname_list}")
+            if ignored_tokens:
+                _log(f"  Ignored   : {ignored_tokens}")
 
             # ── Conversation dedup ────────────────────────────────────────────
             last_tag, last_dt = check_conversation_status(mail, sent, drafts)
@@ -1138,6 +1470,7 @@ def main() -> None:
                     is_revalidation = is_reval,
                     prior_status    = last_tag,
                     was_sent        = was_sent,
+                    ignored_tokens  = ignored_tokens,
                 )
             processed += 1
 
@@ -1157,6 +1490,8 @@ def main() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
+    if '--selftest' in sys.argv:
+        sys.exit(_selftest())
     try:
         main()
     except KeyboardInterrupt:
