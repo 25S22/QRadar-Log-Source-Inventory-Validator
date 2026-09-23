@@ -1,4 +1,47 @@
+"""
+QRadar Rule Status Report — v2
+
+Changes from v1 (see conversation for full rationale):
+  1. FIX: _extract_rule_ids no longer crashes when an offense has "rules": null
+     (dict.get(key, default) only applies the default when the key is *missing*,
+     not when it's present with a null value).
+  2. FIX: pagination now advances by however many items actually came back,
+     instead of assuming "fewer than requested = last page" — some QRadar
+     consoles cap page size server-side regardless of the Range header you send,
+     which was silently truncating offense history.
+  3. FIX: offense fetch now pins an explicit sort (?sort=+id) so pagination is
+     stable against a live console where new offenses keep landing / existing
+     ones get last_updated_time bumped.
+  4. FIX: tracker file reading now respects TRACKER_HEADER_ROW (previously the
+     read always assumed header row 1 while the write-back used the configured
+     row — misaligned if you ever set TRACKER_HEADER_ROW != 1).
+  5. NEW: only enabled rules whose response actions include "part of an
+     offense" (configurable phrase match) are considered at all. Rules without
+     this action can never appear in offense data, so counting offenses to
+     decide "dead" is meaningless for them — including them was a silent
+     false-positive risk in v1.
+  6. NEW: first-triggered / last-triggered per rule, derived from the same
+     offense data already being fetched (not a separate, less-reliable QRadar
+     API field). Rules whose first-ever-seen offense falls inside
+     NEWLY_TRIGGERED_WINDOW_DAYS are surfaced as "Newly Triggered" — i.e.
+     rules you've validated for the first time recently.
+  7. CHANGED: tracker file model simplified to two meaningful columns —
+     Rule Name and Triggered. "Under Investigation" is no longer a column you
+     maintain; it's simply "Triggered is falsy," computed for you. The sheet
+     to read from the tracker workbook is now configurable
+     (TRACKER_SHEET_NAME), and the auto-detect logic still supports extra
+     columns in that sheet beyond these two — they're carried through
+     untouched, just not used for anything.
+
+CAVEAT carried through: "first triggered" is bounded by whatever offense
+history you actually fetch. If FULL_HISTORY_LOOKBACK_DAYS is set too close to
+NEWLY_TRIGGERED_WINDOW_DAYS (or shorter), a rule that's actually been firing
+for years can look "newly triggered" simply because that's as far back as your
+fetch goes. validate_config() checks for this.
+"""
+
 import os
+import json
 import shutil
 import time
 import tempfile
@@ -31,15 +74,34 @@ QRADAR_USERNAME = 'your-username'
 QRADAR_PASSWORD = 'your-password'
 VERIFY_SSL      = False
 
-TRACKER_VALIDATION_WINDOW_DAYS = 7
-FULL_HISTORY_LOOKBACK_DAYS     = None
+# --- Time windows -----------------------------------------------------------
+TRACKER_VALIDATION_WINDOW_DAYS = 7        # "did this tracked rule fire recently" cross-check window
+NEWLY_TRIGGERED_WINDOW_DAYS    = 30       # "rule fired for the very first time within N days" window
+FULL_HISTORY_LOOKBACK_DAYS     = None     # None = unbounded (all offenses QRadar currently retains)
 RULE_DEAD_THRESHOLD            = 0
 
-TRACKER_EXCEL_PATH                 = ''
-TRACKER_HEADER_ROW                 = 1
-AUTO_UPDATE_TRACKER_TESTED         = True
-AUTO_CLEAR_INVESTIGATION_ON_TESTED = True
-TRACKER_BACKUP_BEFORE_WRITE        = True
+# --- Tracker file -------------------------------------------------------------
+TRACKER_EXCEL_PATH            = ''
+TRACKER_SHEET_NAME            = None      # None = first sheet in the workbook; or set an exact sheet name
+TRACKER_HEADER_ROW            = 1         # 1 = header on the first row of the sheet
+AUTO_UPDATE_TRACKER_TRIGGERED = True      # if a tracked rule shows Triggered=No but QRadar shows recent
+                                           # offense activity, flip it to Yes and write it back
+TRACKER_BACKUP_BEFORE_WRITE   = True
+
+# --- Offense-action filter ----------------------------------------------------
+# Only rules with a response action that creates/indexes an offense can ever show up in offense
+# data — so only those rules are meaningful candidates for "dead" or "newly triggered" analysis.
+# QRadar's exact API field for this varies by version/deployment, so rather than hardcode a field
+# name I might get wrong, this searches the rule's full JSON payload (case-insensitive) for any of
+# these phrases. Set RULE_ACTION_DEBUG = True once and re-run to see one rule's raw fields printed
+# to the console, then tighten this list to whatever your deployment actually uses.
+REQUIRE_OFFENSE_ACTION = True
+OFFENSE_ACTION_PHRASES = [
+    'part of an offense',
+    'part of the offense',
+    'index offense',
+]
+RULE_ACTION_DEBUG = False
 
 OUTPUT_DIR = r'C:\path\to\your\output'
 
@@ -60,9 +122,8 @@ OUTPUT_EXCEL = os.path.join(OUTPUT_DIR, 'qradar_rules_under_investigation_and_de
 
 _MAPI_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
 
-_RULE_NAME_COL_ALIASES     = ['alert rule name', 'rule name', 'name']
-_INVESTIGATION_COL_ALIASES = ['under investigation', 'investigation', 'investigating']
-_TESTED_COL_ALIASES        = ['tested', 'testing completed', 'test completed', 'testing']
+_RULE_NAME_COL_ALIASES = ['alert rule name', 'rule name', 'name']
+_TRIGGERED_COL_ALIASES = ['triggered', 'fired', 'confirmed', 'validated']
 _TRUE_STRINGS = {'true', 'yes', 'y', '1', 'x', '✓', 'done', 'complete', 'completed'}
 
 
@@ -130,6 +191,13 @@ def _api_get(path, params=None, label='request'):
 
 
 def _api_get_all(path, params=None, label='request', page_size=None, max_pages=MAX_PAGES):
+    """
+    Walk every page of an endpoint. Advances by however many items actually came back on each
+    page (not by the requested page_size) — some QRadar consoles silently cap the page size
+    server-side regardless of what Range you ask for, and advancing by the requested size in that
+    case would skip data. Stops when a page comes back empty or the running total matches the
+    server-reported Content-Range total.
+    """
     page_size = page_size or (API_PAGE_SIZE + 1)
     all_items = []
     start = 0
@@ -142,11 +210,9 @@ def _api_get_all(path, params=None, label='request', page_size=None, max_pages=M
         if not items:
             break
         all_items.extend(items)
+        start += len(items)
         if total is not None and len(all_items) >= total:
             break
-        if len(items) < page_size:
-            break
-        start += page_size
     else:
         logger.warning(
             "Hit max_pages=%d for '%s' — data may be incomplete. Raise MAX_PAGES "
@@ -167,15 +233,24 @@ def validate_config():
 
     if TRACKER_VALIDATION_WINDOW_DAYS <= 0:
         problems.append("TRACKER_VALIDATION_WINDOW_DAYS must be a positive number of days.")
+    if NEWLY_TRIGGERED_WINDOW_DAYS <= 0:
+        problems.append("NEWLY_TRIGGERED_WINDOW_DAYS must be a positive number of days.")
 
     if FULL_HISTORY_LOOKBACK_DAYS is not None:
         if FULL_HISTORY_LOOKBACK_DAYS <= 0:
             problems.append("FULL_HISTORY_LOOKBACK_DAYS must be None (unbounded) or a positive number of days.")
-        elif FULL_HISTORY_LOOKBACK_DAYS <= TRACKER_VALIDATION_WINDOW_DAYS:
-            problems.append(
-                f"FULL_HISTORY_LOOKBACK_DAYS ({FULL_HISTORY_LOOKBACK_DAYS}) must be greater than "
-                f"TRACKER_VALIDATION_WINDOW_DAYS ({TRACKER_VALIDATION_WINDOW_DAYS})."
-            )
+        else:
+            if FULL_HISTORY_LOOKBACK_DAYS <= TRACKER_VALIDATION_WINDOW_DAYS:
+                problems.append(
+                    f"FULL_HISTORY_LOOKBACK_DAYS ({FULL_HISTORY_LOOKBACK_DAYS}) must be greater than "
+                    f"TRACKER_VALIDATION_WINDOW_DAYS ({TRACKER_VALIDATION_WINDOW_DAYS})."
+                )
+            if FULL_HISTORY_LOOKBACK_DAYS <= NEWLY_TRIGGERED_WINDOW_DAYS:
+                problems.append(
+                    f"FULL_HISTORY_LOOKBACK_DAYS ({FULL_HISTORY_LOOKBACK_DAYS}) must be greater than "
+                    f"NEWLY_TRIGGERED_WINDOW_DAYS ({NEWLY_TRIGGERED_WINDOW_DAYS}), or 'newly triggered' "
+                    f"will just reflect the edge of your fetch window rather than a real first-ever trigger."
+                )
 
     if TRACKER_EXCEL_PATH and not os.path.exists(TRACKER_EXCEL_PATH):
         problems.append(
@@ -212,21 +287,69 @@ def test_connection():
         return False
 
 
+def _rule_action_text_blob(rule):
+    """Flattened, lowercased text of the whole rule object, searched for response-action phrases."""
+    try:
+        return json.dumps(rule, default=str).lower()
+    except Exception:
+        return str(rule).lower()
+
+
+def _rule_has_offense_action(rule):
+    if not REQUIRE_OFFENSE_ACTION:
+        return True
+    blob = _rule_action_text_blob(rule)
+    return any(phrase.lower() in blob for phrase in OFFENSE_ACTION_PHRASES)
+
+
 def fetch_all_rules():
+    """
+    Returns (rules, total_enabled, excluded_no_offense_action).
+    `rules` is the final in-scope list: enabled, not a building block, and (if
+    REQUIRE_OFFENSE_ACTION) carrying a response action that indexes events into an offense.
+    """
     print("📥 Fetching correlation rules...")
     try:
         data = _api_get_all('/api/analytics/rules', label='analytics rules')
-        rules = [
+
+        if RULE_ACTION_DEBUG and data:
+            sample = data[0]
+            print("\n🔎 RULE_ACTION_DEBUG — raw fields on one rule (use this to tune OFFENSE_ACTION_PHRASES):")
+            for k, v in sample.items():
+                preview = str(v)
+                if len(preview) > 140:
+                    preview = preview[:140] + '…'
+                print(f"     {k}: {preview}")
+            print()
+
+        enabled = [
             r for r in data
             if r.get('enabled', False) is True
             and 'BB' not in str(r.get('type', '')).upper()
             and 'BUILDING_BLOCK' not in str(r.get('type', '')).upper()
         ]
-        print(f"   ✅ {len(rules)} enabled correlation rules (of {len(data)} total).")
-        return rules
+
+        if REQUIRE_OFFENSE_ACTION:
+            rules = [r for r in enabled if _rule_has_offense_action(r)]
+        else:
+            rules = enabled
+        excluded = len(enabled) - len(rules)
+
+        print(f"   ✅ {len(rules)} rule(s) in scope (of {len(enabled)} enabled, {len(data)} total).")
+        if REQUIRE_OFFENSE_ACTION:
+            print(f"      {excluded} enabled rule(s) excluded — no offense-creating response detected "
+                  f"(they can never appear in offense data, so dead/newly-triggered analysis doesn't apply).")
+            if excluded and not RULE_ACTION_DEBUG:
+                logger.warning(
+                    "%d enabled rule(s) excluded for not matching OFFENSE_ACTION_PHRASES %s. "
+                    "If that count looks wrong, set RULE_ACTION_DEBUG = True and re-run once to "
+                    "inspect a raw rule's fields and tune the phrase list.",
+                    excluded, OFFENSE_ACTION_PHRASES
+                )
+        return rules, len(enabled), excluded
     except Exception as e:
         print(f"   ❌ Failed to fetch rules: {e}")
-        return []
+        return [], 0, 0
 
 
 def fetch_all_offenses():
@@ -240,7 +363,7 @@ def fetch_all_offenses():
         print("📥 Fetching ALL offenses currently retained by QRadar (no date filter, paginated)...")
 
     fields_str = 'id,rules,start_time,magnitude,status,severity'
-    params = {'fields': fields_str}
+    params = {'fields': fields_str, 'sort': '+id'}  # pinned sort keeps pagination stable on a live console
     if filter_str:
         params['filter'] = filter_str
 
@@ -252,7 +375,7 @@ def fetch_all_offenses():
         if filter_str:
             print(f"   ⚠  Filtered offense fetch failed ({e}). Trying unfiltered fetch...")
             try:
-                data = _api_get_all('/api/siem/offenses', params={'fields': fields_str},
+                data = _api_get_all('/api/siem/offenses', params={'fields': fields_str, 'sort': '+id'},
                                      label='offenses (unfiltered)')
                 data = [o for o in data if (o.get('start_time') or 0) >= cutoff_ms]
                 print(f"   ✅ {len(data)} offenses after in-memory filter.")
@@ -271,7 +394,7 @@ def filter_offenses_by_days(offenses, days):
 
 def _extract_rule_ids(offense):
     ids = []
-    for r in offense.get('rules', []):
+    for r in (offense.get('rules') or []):  # `or []` — the key can be present with a null value
         if isinstance(r, dict):
             rid = r.get('id')
         elif isinstance(r, (int, str)):
@@ -380,45 +503,57 @@ def load_tracker_file(path):
         logger.warning("Tracker file not found at '%s'.", path)
         return None
     try:
-        df = pd.read_excel(path, engine='openpyxl', sheet_name=0)
-        sheet_name = pd.ExcelFile(path, engine='openpyxl').sheet_names[0]
+        xl = pd.ExcelFile(path, engine='openpyxl')
+        if TRACKER_SHEET_NAME:
+            if TRACKER_SHEET_NAME not in xl.sheet_names:
+                logger.warning(
+                    "TRACKER_SHEET_NAME '%s' not found in '%s' (available sheets: %s) — "
+                    "skipping tracker this run.", TRACKER_SHEET_NAME, path, xl.sheet_names
+                )
+                return None
+            sheet_name = TRACKER_SHEET_NAME
+        else:
+            sheet_name = xl.sheet_names[0]
+        df = pd.read_excel(path, engine='openpyxl', sheet_name=sheet_name,
+                            header=TRACKER_HEADER_ROW - 1)
     except Exception as e:
         logger.warning("Could not read tracker file '%s' (%s) — skipping it this run.", path, e)
         return None
 
-    name_col   = _find_col(df.columns, _RULE_NAME_COL_ALIASES)
-    inv_col    = _find_col(df.columns, _INVESTIGATION_COL_ALIASES)
-    tested_col = _find_col(df.columns, _TESTED_COL_ALIASES)
+    name_col      = _find_col(df.columns, _RULE_NAME_COL_ALIASES)
+    triggered_col = _find_col(df.columns, _TRIGGERED_COL_ALIASES)
 
-    if inv_col is None and tested_col is None and not df.empty:
-        logger.warning("Tracker file '%s' has neither an 'Under Investigation' nor a 'Tested' column.", path)
+    if triggered_col is None and not df.empty:
+        logger.warning(
+            "Tracker sheet '%s' has no recognizable 'Triggered' column (looked for: %s) — "
+            "triggered / under-investigation counts will be unavailable this run.",
+            sheet_name, _TRIGGERED_COL_ALIASES
+        )
     if name_col is None and not df.empty:
         logger.warning(
-            "Tracker file '%s' has no recognizable Rule Name column — cross-referencing against "
-            "QRadar and the auto-mark-tested logic are disabled this run; only raw counts will be reported.",
-            path
+            "Tracker sheet '%s' has no recognizable Rule Name column — cross-referencing against "
+            "QRadar and auto-mark-triggered logic are disabled this run; only raw counts will be reported.",
+            sheet_name
         )
 
     return {
-        'raw':                 df,
-        'sheet_name':          sheet_name,
-        'name_col':            name_col,
-        'investigation_col':   inv_col,
-        'tested_col':          tested_col,
-        'changed_cells':       [],
-        'auto_marked_rows':    [],
-        'auto_marked_indices': set(),
-        'unmatched_count':     None,
+        'raw':                       df,
+        'sheet_name':                sheet_name,
+        'name_col':                  name_col,
+        'triggered_col':             triggered_col,
+        'changed_cells':             [],
+        'auto_marked_rows':          [],
+        'auto_marked_indices':       set(),
+        'unmatched_count':           None,
         'under_investigation_count': 0,
-        'tested_count':        0,
+        'triggered_count':           0,
     }
 
 
 def reconcile_tracker_with_qradar(tracker_info, master_df):
-    df = tracker_info['raw']
-    name_col   = tracker_info['name_col']
-    inv_col    = tracker_info['investigation_col']
-    tested_col = tracker_info['tested_col']
+    df            = tracker_info['raw']
+    name_col      = tracker_info['name_col']
+    triggered_col = tracker_info['triggered_col']
 
     lookup = {}
     if not master_df.empty:
@@ -433,8 +568,7 @@ def reconcile_tracker_with_qradar(tracker_info, master_df):
     for idx, row in df.iterrows():
         matched_rule = lookup.get(_normalize_name(row[name_col])) if name_col else None
 
-        is_investigating = _to_bool(row[inv_col]) if inv_col else False
-        is_tested        = _to_bool(row[tested_col]) if tested_col else False
+        is_triggered = _to_bool(row[triggered_col]) if triggered_col else False
         recent = int(matched_rule['offenses_recent']) if matched_rule is not None else None
         total  = int(matched_rule['offenses_total']) if matched_rule is not None else None
 
@@ -443,20 +577,16 @@ def reconcile_tracker_with_qradar(tracker_info, master_df):
         total_list.append(total)
 
         should_auto_mark = (
-            AUTO_UPDATE_TRACKER_TESTED
+            AUTO_UPDATE_TRACKER_TRIGGERED
             and matched_rule is not None
-            and is_investigating
-            and not is_tested
-            and tested_col is not None
+            and not is_triggered
+            and triggered_col is not None
             and recent is not None
             and recent > 0
         )
         if should_auto_mark:
-            df.at[idx, tested_col] = True
-            changed_cells.append((idx, tested_col, True))
-            if AUTO_CLEAR_INVESTIGATION_ON_TESTED and inv_col:
-                df.at[idx, inv_col] = False
-                changed_cells.append((idx, inv_col, False))
+            df.at[idx, triggered_col] = True
+            changed_cells.append((idx, triggered_col, True))
             auto_marked_indices.add(idx)
             auto_marked_rows.append({
                 'rule_name': str(row[name_col]),
@@ -472,8 +602,10 @@ def reconcile_tracker_with_qradar(tracker_info, master_df):
     tracker_info['auto_marked_rows'] = auto_marked_rows
     tracker_info['auto_marked_indices'] = auto_marked_indices
     tracker_info['unmatched_count'] = int(len(matched_flags) - sum(matched_flags)) if name_col else None
-    tracker_info['under_investigation_count'] = int(df[inv_col].apply(_to_bool).sum()) if inv_col else 0
-    tracker_info['tested_count'] = int(df[tested_col].apply(_to_bool).sum()) if tested_col else 0
+    tracker_info['triggered_count'] = int(df[triggered_col].apply(_to_bool).sum()) if triggered_col else 0
+    tracker_info['under_investigation_count'] = (
+        int((~df[triggered_col].apply(_to_bool)).sum()) if triggered_col else 0
+    )
     return tracker_info
 
 
@@ -481,7 +613,7 @@ def persist_tracker_updates(path, tracker_info):
     changed_cells = tracker_info.get('changed_cells') or []
     if not changed_cells:
         return 'no_changes'
-    if not AUTO_UPDATE_TRACKER_TESTED:
+    if not AUTO_UPDATE_TRACKER_TRIGGERED:
         return 'disabled'
 
     try:
@@ -513,9 +645,18 @@ def persist_tracker_updates(path, tracker_info):
 
 def build_master_rule_table(rules, offenses_all):
     full_counts = {}
+    first_seen  = {}  # rule_id -> earliest offense start_time (ms) seen in the fetched offense set
+    last_seen   = {}  # rule_id -> latest offense start_time (ms)
+
     for o in offenses_all:
+        st = o.get('start_time') or 0
         for rid in _extract_rule_ids(o):
             full_counts[rid] = full_counts.get(rid, 0) + 1
+            if st:
+                if rid not in first_seen or st < first_seen[rid]:
+                    first_seen[rid] = st
+                if rid not in last_seen or st > last_seen[rid]:
+                    last_seen[rid] = st
 
     recent_offenses = filter_offenses_by_days(offenses_all, TRACKER_VALIDATION_WINDOW_DAYS)
     recent_counts = {}
@@ -523,24 +664,34 @@ def build_master_rule_table(rules, offenses_all):
         for rid in _extract_rule_ids(o):
             recent_counts[rid] = recent_counts.get(rid, 0) + 1
 
+    newly_cutoff_ms = int((datetime.now() - timedelta(days=NEWLY_TRIGGERED_WINDOW_DAYS)).timestamp() * 1000)
+
     rows = []
     for rule in rules:
-        rid    = rule.get('id')
-        total  = full_counts.get(rid, 0)
-        recent = recent_counts.get(rid, 0)
+        rid      = rule.get('id')
+        total    = full_counts.get(rid, 0)
+        recent   = recent_counts.get(rid, 0)
+        first_ts = first_seen.get(rid)
+        last_ts  = last_seen.get(rid)
+
         rows.append({
-            'rule_id':          rid,
-            'rule_name':        _csv_formula_safe(rule.get('name', f'Rule {rid}')),
-            'rule_type':        rule.get('type', 'UNKNOWN'),
-            'origin':           rule.get('origin', 'UNKNOWN'),
-            'owner':            rule.get('owner', 'Unknown'),
-            'created':          _format_epoch_ms(rule.get('creation_date')),
-            'created_age_days': _age_days_from_epoch(rule.get('creation_date')),
-            'modified':         _format_epoch_ms(rule.get('modification_date')),
-            'description':      _csv_formula_safe(_get_rule_description(rule)),
-            'offenses_total':   total,
-            'offenses_recent':  recent,
-            'is_dead':          total <= RULE_DEAD_THRESHOLD,
+            'rule_id':             rid,
+            'rule_name':           _csv_formula_safe(rule.get('name', f'Rule {rid}')),
+            'rule_type':           rule.get('type', 'UNKNOWN'),
+            'origin':              rule.get('origin', 'UNKNOWN'),
+            'owner':               rule.get('owner', 'Unknown'),
+            'created':             _format_epoch_ms(rule.get('creation_date')),
+            'created_age_days':    _age_days_from_epoch(rule.get('creation_date')),
+            'modified':            _format_epoch_ms(rule.get('modification_date')),
+            'description':         _csv_formula_safe(_get_rule_description(rule)),
+            'offenses_total':      total,
+            'offenses_recent':     recent,
+            'first_triggered':     _format_epoch_ms(first_ts) if first_ts else '—',
+            'first_triggered_ts':  first_ts,
+            'last_triggered':      _format_epoch_ms(last_ts) if last_ts else '—',
+            'last_triggered_ts':   last_ts,
+            'is_dead':             total <= RULE_DEAD_THRESHOLD,
+            'is_newly_triggered':  bool(first_ts and first_ts >= newly_cutoff_ms),
         })
     return pd.DataFrame(rows)
 
@@ -550,6 +701,7 @@ _FILLS = {
     'orange':      PatternFill(start_color='FFBF47', end_color='FFBF47', fill_type='solid'),
     'green':       PatternFill(start_color='A8E6CF', end_color='A8E6CF', fill_type='solid'),
     'blue':        PatternFill(start_color='74B9FF', end_color='74B9FF', fill_type='solid'),
+    'teal':        PatternFill(start_color='7FE0D0', end_color='7FE0D0', fill_type='solid'),
     'header':      PatternFill(start_color='2D2257', end_color='2D2257', fill_type='solid'),
     'zebra_a':     PatternFill(start_color='FFFFFF', end_color='FFFFFF', fill_type='solid'),
     'zebra_b':     PatternFill(start_color='F3F1FB', end_color='F3F1FB', fill_type='solid'),
@@ -591,7 +743,7 @@ def _pct(n, total):
     return f"{(n / total * 100):.1f}%" if total else "0.0%"
 
 
-def _write_summary_sheet(wb, dead_df, tracker_info, total_rules):
+def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules, excluded_no_offense_action):
     ws = wb.active
     ws.title = 'Executive Summary'
 
@@ -602,14 +754,20 @@ def _write_summary_sheet(wb, dead_df, tracker_info, total_rules):
 
     hist_note = ('unbounded — all offenses currently retained by QRadar'
                  if not FULL_HISTORY_LOOKBACK_DAYS else f'last {FULL_HISTORY_LOOKBACK_DAYS} days')
-    ws['A3'] = f"Full-history window: {hist_note}   ·   Tracker validation window: last {TRACKER_VALIDATION_WINDOW_DAYS} day(s)"
+    ws['A3'] = (f"Full-history window: {hist_note}   ·   Tracker validation window: "
+                f"last {TRACKER_VALIDATION_WINDOW_DAYS} day(s)   ·   Newly-triggered window: "
+                f"last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s)")
     ws['A3'].font = Font(size=10, color='7C6FA0')
 
-    ws['A5'] = 'Total enabled correlation rules analyzed:'
+    ws['A5'] = 'Total in-scope enabled correlation rules analyzed:'
     ws['B5'] = int(total_rules)
     ws['B5'].font = _BOLD
+    if REQUIRE_OFFENSE_ACTION:
+        ws['A6'] = f'Enabled rules excluded (no offense-creating response action):'
+        ws['B6'] = int(excluded_no_offense_action)
+        ws['B6'].font = _BOLD
 
-    row = 7
+    row = 8
     ws.cell(row=row, column=1, value='Metric').fill = _FILLS['header']
     ws.cell(row=row, column=1).font = _HDR_FONT
     for c, label in ((2, 'Count'), (3, '% of Rules')):
@@ -618,11 +776,13 @@ def _write_summary_sheet(wb, dead_df, tracker_info, total_rules):
         ws.cell(row=row, column=c).alignment = _CENTRE
     row += 1
 
-    dead_n = len(dead_df)
+    dead_n  = len(dead_df)
+    newly_n = len(newly_df)
     metrics = [
-        ('Dead — Never Fired', dead_n, _pct(dead_n, total_rules), 'red'),
-        ('Under Investigation', tracker_info['under_investigation_count'] if tracker_info else 'N/A', '', 'orange'),
-        ('Testing Completed',   tracker_info['tested_count']              if tracker_info else 'N/A', '', 'blue'),
+        ('Dead — Never Fired',      dead_n,  _pct(dead_n, total_rules),  'red'),
+        (f'Newly Triggered (≤{NEWLY_TRIGGERED_WINDOW_DAYS}d)', newly_n, _pct(newly_n, total_rules), 'teal'),
+        ('Under Investigation',     tracker_info['under_investigation_count'] if tracker_info else 'N/A', '', 'orange'),
+        ('Triggered (confirmed)',   tracker_info['triggered_count']           if tracker_info else 'N/A', '', 'blue'),
     ]
     for label, value, pct, fill_key in metrics:
         ws.cell(row=row, column=1, value=label).font = _BOLD
@@ -636,16 +796,16 @@ def _write_summary_sheet(wb, dead_df, tracker_info, total_rules):
 
     if tracker_info is None:
         tracker_note = (
-            f"Investigation/Testing tracker not configured or not found "
-            f"(TRACKER_EXCEL_PATH = '{TRACKER_EXCEL_PATH or '(blank)'}')."
+            f"Tracker not configured or not found (TRACKER_EXCEL_PATH = '{TRACKER_EXCEL_PATH or '(blank)'}')."
         )
     else:
         crossref = 'enabled (matched by Rule Name)' if tracker_info['name_col'] else 'disabled (no Rule Name column found)'
         auto_n = len(tracker_info['auto_marked_rows'])
         unmatched = tracker_info['unmatched_count']
         tracker_note = (
-            f"Tracker source: {TRACKER_EXCEL_PATH}  ·  {len(tracker_info['raw'])} row(s) read  ·  "
-            f"Cross-referencing: {crossref}  ·  Auto-marked Tested this run: {auto_n}"
+            f"Tracker source: {TRACKER_EXCEL_PATH}  (sheet: {tracker_info['sheet_name']})  ·  "
+            f"{len(tracker_info['raw'])} row(s) read  ·  Cross-referencing: {crossref}  ·  "
+            f"Auto-marked Triggered this run: {auto_n}"
             + (f"  ·  Unmatched rows: {unmatched}" if unmatched is not None else "")
         )
     ws.cell(row=row, column=1, value=tracker_note).font = Font(italic=True, size=9, color='7C6FA0')
@@ -657,15 +817,18 @@ def _write_summary_sheet(wb, dead_df, tracker_info, total_rules):
     caveat = (
         'Rule descriptions reflect whatever metadata QRadar exposes via REST API; full boolean '
         'trigger logic is not reliably exposed in most versions — cross-reference the Rules console. '
-        '"Dead" is bounded by whatever offense history QRadar currently retains (or by '
-        'FULL_HISTORY_LOOKBACK_DAYS, if set). Auto-marking Tested uses recent offense activity as a '
-        'proxy for "fired since you started investigating" — it does not confirm the offense was '
-        'caused by your specific test versus unrelated real traffic.'
+        '"Dead" and "Newly Triggered" are both bounded by whatever offense history QRadar currently '
+        'retains (or by FULL_HISTORY_LOOKBACK_DAYS, if set) — a rule that first fired before that '
+        'window began will not show its true first-triggered date. Only rules with an offense-creating '
+        'response action are considered, based on a configurable text match (see OFFENSE_ACTION_PHRASES) '
+        'rather than a guaranteed API field — verify the excluded count above looks right. Auto-marking '
+        'Triggered uses recent offense activity as a proxy for "fired since you started testing" — it '
+        'does not confirm the offense was caused by your specific test versus unrelated real traffic.'
     )
     ws.cell(row=row, column=1, value=caveat).font = Font(italic=True, size=9, color='7C6FA0')
     ws.cell(row=row, column=1).alignment = _WRAP
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-    ws.row_dimensions[row].height = 60
+    ws.row_dimensions[row].height = 75
 
     for i, w in enumerate([46, 14, 14, 14], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -679,7 +842,7 @@ def _write_dead_sheet(wb, dead_df):
     _write_sheet_header(ws, cols, widths)
 
     if dead_df.empty:
-        ws.append(['No dead rules — every enabled rule has fired at least once.'])
+        ws.append(['No dead rules — every in-scope rule has fired at least once.'])
         return
 
     sorted_df = dead_df.sort_values('created_age_days', ascending=False, na_position='last')
@@ -702,25 +865,46 @@ def _write_dead_sheet(wb, dead_df):
     ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
 
 
+def _write_newly_triggered_sheet(wb, newly_df):
+    ws = wb.create_sheet('Newly Triggered Rules')
+    cols   = ['Rule ID', 'Rule Name', 'Type', 'Owner', 'First Triggered', 'Last Triggered', 'Offenses (Total)']
+    widths = [9, 42, 14, 14, 15, 15, 16]
+    _write_sheet_header(ws, cols, widths)
+
+    if newly_df.empty:
+        ws.append([f'No rules first fired in the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s).'])
+        return
+
+    sorted_df = newly_df.sort_values('first_triggered_ts', ascending=False, na_position='last')
+    first_row = ws.max_row + 1
+
+    for _, r in sorted_df.iterrows():
+        ws.append([int(r['rule_id']), str(r['rule_name']), str(r['rule_type']), str(r['owner']),
+                   str(r['first_triggered']), str(r['last_triggered']), int(r['offenses_total'])])
+
+    _apply_zebra_and_borders(ws, first_row, ws.max_row, len(cols))
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
+
+
 def _write_tracker_sheet(wb, tracker_info):
-    ws = wb.create_sheet('Investigation & Testing Tracker')
+    ws = wb.create_sheet('Rule Testing Tracker')
     df = tracker_info['raw']
     original_cols = [c for c in df.columns if not str(c).startswith('_')]
     has_match_info = '_matched_to_qradar' in df.columns
     extra_cols = (
         ['Matched to QRadar Rule?', f'Offenses (last {TRACKER_VALIDATION_WINDOW_DAYS}d)',
-         'Offenses (Total)', 'Auto-Marked Tested This Run?']
+         'Offenses (Total)', 'Auto-Marked Triggered This Run?']
         if has_match_info else []
     )
     cols = [str(c) for c in original_cols] + extra_cols
-    widths = [max(14, min(50, len(str(c)) + 4)) for c in original_cols] + [20, 18, 16, 20][:len(extra_cols)]
+    widths = [max(14, min(50, len(str(c)) + 4)) for c in original_cols] + [20, 18, 16, 22][:len(extra_cols)]
     _write_sheet_header(ws, cols, widths)
 
     if df.empty:
-        ws.append(['Tracker file has no rows.'])
+        ws.append(['Tracker sheet has no rows.'])
         return
 
-    inv_col, tested_col = tracker_info['investigation_col'], tracker_info['tested_col']
+    triggered_col = tracker_info['triggered_col']
     auto_marked_indices = tracker_info.get('auto_marked_indices', set())
     first_row = ws.max_row + 1
 
@@ -742,20 +926,22 @@ def _write_tracker_sheet(wb, tracker_info):
                 ws.cell(row=r_idx, column=c_idx).fill = _FILLS['auto_marked']
 
         for c_idx, c in enumerate(original_cols, start=1):
-            if c == inv_col and _to_bool(r[c]):
-                ws.cell(row=r_idx, column=c_idx).fill = _FILLS['orange']
-            elif c == tested_col and _to_bool(r[c]):
-                ws.cell(row=r_idx, column=c_idx).fill = _FILLS['blue']
+            if c == triggered_col:
+                if _to_bool(r[c]):
+                    ws.cell(row=r_idx, column=c_idx).fill = _FILLS['blue']
+                else:
+                    ws.cell(row=r_idx, column=c_idx).fill = _FILLS['orange']
 
     _apply_zebra_and_borders(ws, first_row, ws.max_row, len(cols))
     ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
 
 
-def save_excel_report(dead_df, tracker_info, total_rules, path):
+def save_excel_report(dead_df, newly_df, tracker_info, total_rules, excluded_no_offense_action, path):
     try:
         wb = openpyxl.Workbook()
-        _write_summary_sheet(wb, dead_df, tracker_info, total_rules)
+        _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules, excluded_no_offense_action)
         _write_dead_sheet(wb, dead_df)
+        _write_newly_triggered_sheet(wb, newly_df)
         if tracker_info is not None:
             _write_tracker_sheet(wb, tracker_info)
 
@@ -782,17 +968,17 @@ _CHART_TITLE = '#a78bfa'
 _CHART_AXIS  = '#332c50'
 
 
-def generate_status_chart(dead_count, tracker_info, total_rules):
-    labels  = ['Dead']
-    values  = [dead_count]
-    colours = ['#f87171']
+def generate_status_chart(dead_count, newly_count, tracker_info, total_rules):
+    labels  = ['Dead', 'Newly\nTriggered']
+    values  = [dead_count, newly_count]
+    colours = ['#f87171', '#2dd4bf']
 
     if tracker_info is not None:
-        labels  += ['Under\nInvestigation', 'Testing\nCompleted']
-        values  += [tracker_info['under_investigation_count'], tracker_info['tested_count']]
+        labels  += ['Under\nInvestigation', 'Triggered']
+        values  += [tracker_info['under_investigation_count'], tracker_info['triggered_count']]
         colours += ['#f5b155', '#5b8cff']
 
-    fig, ax = plt.subplots(figsize=(6.0, 4.0), facecolor=_CHART_BG)
+    fig, ax = plt.subplots(figsize=(6.4, 4.0), facecolor=_CHART_BG)
     ax.set_facecolor(_CHART_BG)
     ax.yaxis.grid(True, color=_CHART_GRID, linewidth=0.8, zorder=0)
     ax.set_axisbelow(True)
@@ -836,6 +1022,7 @@ _C = {
     'red':    '#f87171',
     'amber':  '#f5b155',
     'blue':   '#5b8cff',
+    'teal':   '#2dd4bf',
 }
 
 
@@ -847,7 +1034,7 @@ def _build_dead_table_html(dead_df):
     C = _C
     if dead_df.empty:
         return (f'<p style="color:{C["blue"]};font-size:12px;font-weight:600;padding:8px 0;margin:0;">'
-                f'{_dot(C["blue"])} No dead rules — every enabled rule has fired at least once.</p>')
+                f'{_dot(C["blue"])} No dead rules — every in-scope rule has fired at least once.</p>')
 
     shown = dead_df.sort_values('created_age_days', ascending=False, na_position='last').head(EMAIL_TABLE_ROW_CAP)
     rows_html = ''
@@ -884,21 +1071,59 @@ def _build_dead_table_html(dead_df):
     </table>{more_note}"""
 
 
+def _build_newly_triggered_table_html(newly_df):
+    C = _C
+    if newly_df.empty:
+        return (f'<p style="color:{C["dim"]};font-size:12px;padding:8px 0;margin:0;">'
+                f'No rules first fired in the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s).</p>')
+
+    shown = newly_df.sort_values('first_triggered_ts', ascending=False, na_position='last').head(EMAIL_TABLE_ROW_CAP)
+    rows_html = ''
+    for i, (_, row) in enumerate(shown.iterrows()):
+        bg = C['page'] if i % 2 == 0 else C['card']
+        name = _html_escape(row['rule_name'])
+        name_short = name[:42] + '…' if len(name) > 42 else name
+        rows_html += f"""
+        <tr bgcolor="{bg}" style="background-color:{bg};">
+          <td bgcolor="{bg}" style="padding:9px 12px;border-left:2px solid {C['teal']};font-size:12px;color:{C['text']};" title="{name}">{name_short}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['owner'])}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['teal']};text-align:center;font-weight:600;">{_html_escape(row['first_triggered'])}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{int(row['offenses_total'])}</td>
+        </tr>"""
+
+    more_note = ''
+    if len(newly_df) > EMAIL_TABLE_ROW_CAP:
+        more_note = (f'<div style="font-size:10px;color:{C["dim"]};margin-top:8px;">'
+                     f'+ {len(newly_df) - EMAIL_TABLE_ROW_CAP} more — see attached Excel for the full list.</div>')
+
+    return f"""
+    <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="border-collapse:collapse;margin-top:10px;background-color:{C['page']};">
+      <thead><tr>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:left;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Rule Name</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Owner</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">First Triggered</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Offenses (Total)</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>{more_note}"""
+
+
 def _build_under_investigation_table_html(tracker_info):
     C = _C
-    if tracker_info is None or not tracker_info.get('investigation_col'):
+    if tracker_info is None or not tracker_info.get('triggered_col'):
         return (f'<p style="color:{C["dim"]};font-size:12px;padding:8px 0;margin:0;">'
-                f'Tracker not configured — set TRACKER_EXCEL_PATH to see active investigations here.</p>')
+                f'Tracker not configured, or no Triggered column found — set TRACKER_EXCEL_PATH / '
+                f'add a Triggered column to see active investigations here.</p>')
 
     df = tracker_info['raw']
-    inv_col, name_col = tracker_info['investigation_col'], tracker_info['name_col']
+    triggered_col, name_col = tracker_info['triggered_col'], tracker_info['name_col']
     has_match = '_matched_to_qradar' in df.columns
 
-    mask = df[inv_col].apply(_to_bool)
+    mask = ~df[triggered_col].apply(_to_bool)
     shown = df[mask]
     if shown.empty:
         return (f'<p style="color:{C["blue"]};font-size:12px;font-weight:600;padding:8px 0;margin:0;">'
-                f'{_dot(C["blue"])} Nothing currently under investigation.</p>')
+                f'{_dot(C["blue"])} Nothing currently under investigation — everything tracked is Triggered.</p>')
 
     shown = shown.head(EMAIL_TABLE_ROW_CAP)
     rows_html = ''
@@ -968,17 +1193,20 @@ def _build_auto_validated_table_html(tracker_info):
     </table>{more_note}"""
 
 
-def build_email_html(dead_df, tracker_info, total_rules, chart_cid):
+def build_email_html(dead_df, newly_df, tracker_info, total_rules, chart_cid):
     C = _C
     run_time = datetime.now().strftime('%d %b %Y  ·  %H:%M:%S')
 
     dead_count   = len(dead_df)
+    newly_count  = len(newly_df)
     inv_count    = tracker_info['under_investigation_count'] if tracker_info else None
-    tested_count = tracker_info['tested_count']              if tracker_info else None
-    auto_marked  = tracker_info['auto_marked_rows']          if tracker_info else []
+    trig_count   = tracker_info['triggered_count']            if tracker_info else None
+    auto_marked  = tracker_info['auto_marked_rows']            if tracker_info else []
 
     if dead_count > 0:
         hdr_txt, hdr_color = f'{dead_count} DEAD RULE(S) TO REVIEW', C['red']
+    elif newly_count > 0:
+        hdr_txt, hdr_color = f'{newly_count} NEWLY TRIGGERED RULE(S)', C['teal']
     elif auto_marked:
         hdr_txt, hdr_color = f'{len(auto_marked)} AUTO-VALIDATED THIS RUN', C['blue']
     else:
@@ -993,28 +1221,31 @@ def build_email_html(dead_df, tracker_info, total_rules, chart_cid):
         display_val = value if value is not None else '—'
         note_html = (f'<div style="font-size:9px;color:{C["dim"]};margin-top:4px;">{note}</div>'
                      if note else '')
-        return (f'<td width="33%" bgcolor="{C["page"]}" style="padding:5px;background-color:{C["page"]};">'
+        return (f'<td width="25%" bgcolor="{C["page"]}" style="padding:5px;background-color:{C["page"]};">'
                 f'<table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C["card"]}" '
                 f'style="border-collapse:collapse;background-color:{C["card"]};border:1px solid {C["border"]};'
                 f'border-top:2px solid {color};border-radius:8px;">'
-                f'<tr><td bgcolor="{C["card"]}" style="background-color:{C["card"]};padding:16px 8px;text-align:center;">'
-                f'<div style="font-size:28px;font-weight:800;color:{color};line-height:1;letter-spacing:-1px;">{display_val}</div>'
-                f'<div style="font-size:9px;color:{C["dim"]};margin-top:6px;text-transform:uppercase;letter-spacing:1px;">{label}</div>'
+                f'<tr><td bgcolor="{C["card"]}" style="background-color:{C["card"]};padding:14px 6px;text-align:center;">'
+                f'<div style="font-size:24px;font-weight:800;color:{color};line-height:1;letter-spacing:-1px;">{display_val}</div>'
+                f'<div style="font-size:8.5px;color:{C["dim"]};margin-top:6px;text-transform:uppercase;letter-spacing:0.8px;">{label}</div>'
                 f'{note_html}</td></tr></table></td>')
 
-    dead_pct = f"{dead_count / total_rules * 100:.1f}% of rules" if total_rules else ''
+    dead_pct  = f"{dead_count / total_rules * 100:.1f}% of rules" if total_rules else ''
+    newly_pct = f"{newly_count / total_rules * 100:.1f}% of rules" if total_rules else ''
     inv_note = '' if tracker_info else 'not configured'
-    tested_note = f"+{len(auto_marked)} auto-marked this run" if auto_marked else ('' if tracker_info else 'not configured')
+    trig_note = f"+{len(auto_marked)} auto this run" if auto_marked else ('' if tracker_info else 'not configured')
 
     headline_metrics = (
         metric_card('Dead Rules', dead_count, C['red'], dead_pct)
+        + metric_card(f'Newly Triggered ({NEWLY_TRIGGERED_WINDOW_DAYS}d)', newly_count, C['teal'], newly_pct)
         + metric_card('Under Investigation', inv_count, C['amber'], inv_note)
-        + metric_card('Testing Completed', tested_count, C['blue'], tested_note)
+        + metric_card('Triggered', trig_count, C['blue'], trig_note)
     )
 
     chart_html = (f'<img src="cid:{chart_cid}" alt="Rule status chart" '
                   f'style="display:block;max-width:100%;margin:18px auto 0;">') if chart_cid else ''
     dead_table_html   = _build_dead_table_html(dead_df)
+    newly_table_html  = _build_newly_triggered_table_html(newly_df)
     inv_table_html    = _build_under_investigation_table_html(tracker_info)
     auto_table_html   = _build_auto_validated_table_html(tracker_info)
 
@@ -1029,7 +1260,7 @@ def build_email_html(dead_df, tracker_info, total_rules, chart_cid):
     if auto_table_html:
         auto_section = (
             section_header(C['blue'], 'Auto-Validated This Run',
-                            'Marked Under Investigation and fired since — Tested has been set to Yes in your tracker file.')
+                            'Was marked not-yet-triggered but has fired since — Triggered has been set to Yes in your tracker file.')
             + f'<tr><td bgcolor="{C["page"]}" style="background-color:{C["page"]};padding:0 0 20px;">{auto_table_html}</td></tr>'
         )
 
@@ -1078,12 +1309,16 @@ table, td {{ font-family:Segoe UI, Arial, sans-serif !important; }}
 
   <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 4px;text-align:center;">{chart_html}</td></tr>
 
+  {section_header(C['teal'], 'Newly Triggered Rules',
+                   f"Fired for the first time within the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s) — freshly validated rules.")}
+  <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 8px;">{newly_table_html}</td></tr>
+
   {section_header(C['red'], 'Dead Rules — Never Fired',
                    f"Zero offenses across {hist_note}. Candidates for review or removal.")}
   <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 8px;">{dead_table_html}</td></tr>
 
   {section_header(C['amber'], 'Rules Under Investigation',
-                   f"Currently flagged in your tracker — 'Fired Recently?' checks the last {TRACKER_VALIDATION_WINDOW_DAYS} day(s).")}
+                   f"Tracker rows where Triggered is not yet Yes — 'Fired Recently?' checks the last {TRACKER_VALIDATION_WINDOW_DAYS} day(s).")}
   <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 8px;">{inv_table_html}</td></tr>
 
   {auto_section}
@@ -1091,7 +1326,7 @@ table, td {{ font-family:Segoe UI, Arial, sans-serif !important; }}
   <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:18px 0 4px;border-top:1px solid {C['border']};">
     <div style="font-size:9px;color:{C['dim']};letter-spacing:0.3px;line-height:1.6;">
       QRadar Rule Status Auditor &nbsp;·&nbsp; Auto-generated {run_time}<br>
-      Full rule details, and the Investigation/Testing tracker (if configured), are in the attached Excel workbook.
+      Full rule details, and the Rule Testing Tracker (if configured), are in the attached Excel workbook.
     </div>
   </td></tr>
 
@@ -1143,10 +1378,13 @@ def main():
     print("=" * 62)
     print(f"  Host                     : {QRADAR_HOST}")
     print(f"  Tracker validation window: last {TRACKER_VALIDATION_WINDOW_DAYS} day(s)")
+    print(f"  Newly-triggered window   : last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s)")
     print(f"  Full history             : "
           f"{'unbounded (all retained offenses)' if not FULL_HISTORY_LOOKBACK_DAYS else f'{FULL_HISTORY_LOOKBACK_DAYS} days'}")
+    print(f"  Require offense action   : {REQUIRE_OFFENSE_ACTION}  (phrases: {OFFENSE_ACTION_PHRASES})")
     print(f"  Tracker file             : {TRACKER_EXCEL_PATH or '(not configured)'}")
-    print(f"  Auto-mark Tested         : {AUTO_UPDATE_TRACKER_TESTED}")
+    print(f"  Tracker sheet            : {TRACKER_SHEET_NAME or '(first sheet)'}")
+    print(f"  Auto-mark Triggered      : {AUTO_UPDATE_TRACKER_TRIGGERED}")
     print(f"  Retry config             : {MAX_RETRIES} attempts, {RETRY_DELAY_BASE}s base backoff")
     print("=" * 62)
 
@@ -1157,9 +1395,10 @@ def main():
     if not test_connection():
         return
 
-    rules = fetch_all_rules()
+    rules, total_enabled, excluded_no_offense_action = fetch_all_rules()
     if not rules:
-        print("\n❌ No enabled rules returned — check credentials, host URL, and permissions.")
+        print("\n❌ No in-scope rules returned — check credentials, host URL, permissions, or "
+              "OFFENSE_ACTION_PHRASES if REQUIRE_OFFENSE_ACTION excluded everything.")
         return
 
     offenses_all = fetch_all_offenses()
@@ -1170,56 +1409,59 @@ def main():
     print("\n🔍 Classifying rules...")
     master_df = build_master_rule_table(rules, offenses_all)
     dead_df   = master_df[master_df['is_dead']].copy()
+    newly_df  = master_df[master_df['is_newly_triggered']].copy()
 
     print(f"   Dead — never fired: {len(dead_df)}")
+    print(f"   Newly triggered (first fired in last {NEWLY_TRIGGERED_WINDOW_DAYS}d): {len(newly_df)}")
 
     undocumented = int(master_df['description'].str.contains('Not exposed via API', na=False).sum())
     if undocumented:
         print(f"\n   ℹ  Trigger-logic descriptions are unavailable via the API for {undocumented} "
               f"of {len(master_df)} rule(s).")
 
-    print("\n📋 Loading investigation/testing tracker...")
+    print("\n📋 Loading rule testing tracker...")
     tracker_info = load_tracker_file(TRACKER_EXCEL_PATH) if TRACKER_EXCEL_PATH else None
     if tracker_info is None:
         print("   ℹ  Tracker not configured or unavailable this run.")
     else:
         tracker_info = reconcile_tracker_with_qradar(tracker_info, master_df)
         print(f"   ✅ {tracker_info['under_investigation_count']} under investigation, "
-              f"{tracker_info['tested_count']} testing completed "
-              f"(of {len(tracker_info['raw'])} tracked row(s)).")
+              f"{tracker_info['triggered_count']} triggered "
+              f"(of {len(tracker_info['raw'])} tracked row(s), sheet '{tracker_info['sheet_name']}').")
         if tracker_info['name_col'] and tracker_info['unmatched_count']:
-            print(f"   ⚠  {tracker_info['unmatched_count']} tracker row(s) didn't match any enabled QRadar rule by name.")
+            print(f"   ⚠  {tracker_info['unmatched_count']} tracker row(s) didn't match any in-scope QRadar rule by name.")
 
         if tracker_info['changed_cells']:
             result = persist_tracker_updates(TRACKER_EXCEL_PATH, tracker_info)
             n_auto = len(tracker_info['auto_marked_rows'])
             if result == 'written':
-                print(f"   ✏  Auto-marked {n_auto} rule(s) as Tested — written back to {TRACKER_EXCEL_PATH} "
+                print(f"   ✏  Auto-marked {n_auto} rule(s) as Triggered — written back to {TRACKER_EXCEL_PATH} "
                       f"(backup saved alongside it).")
             elif result == 'locked':
-                print(f"   ⚠  {n_auto} rule(s) qualify to be auto-marked Tested, but the tracker file is "
+                print(f"   ⚠  {n_auto} rule(s) qualify to be auto-marked Triggered, but the tracker file is "
                       f"open elsewhere — close it and re-run to persist.")
             elif result == 'disabled':
-                print(f"   ℹ  {n_auto} rule(s) qualify to be auto-marked Tested "
-                      f"(AUTO_UPDATE_TRACKER_TESTED=False — not written back).")
+                print(f"   ℹ  {n_auto} rule(s) qualify to be auto-marked Triggered "
+                      f"(AUTO_UPDATE_TRACKER_TRIGGERED=False — not written back).")
             elif result == 'error':
                 print("   ❌ Could not write updates back to the tracker file — see log for details.")
 
     print(f"\n💾 Saving Excel report → {OUTPUT_EXCEL}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    saved_excel_path = save_excel_report(dead_df, tracker_info, len(master_df), OUTPUT_EXCEL)
+    saved_excel_path = save_excel_report(dead_df, newly_df, tracker_info, len(master_df),
+                                          excluded_no_offense_action, OUTPUT_EXCEL)
 
     print("\n📊 Generating status chart...")
-    chart_path = generate_status_chart(len(dead_df), tracker_info, len(master_df))
+    chart_path = generate_status_chart(len(dead_df), len(newly_df), tracker_info, len(master_df))
 
     print("\n✉  Building email draft...")
-    html_body = build_email_html(dead_df, tracker_info, len(master_df),
+    html_body = build_email_html(dead_df, newly_df, tracker_info, len(master_df),
                                   chart_cid='rule_status' if chart_path else None)
 
-    subject_parts = [f"{len(dead_df)} dead"]
+    subject_parts = [f"{len(dead_df)} dead", f"{len(newly_df)} newly triggered"]
     if tracker_info is not None:
         subject_parts.append(f"{tracker_info['under_investigation_count']} under investigation")
-        subject_parts.append(f"{tracker_info['tested_count']} testing completed")
+        subject_parts.append(f"{tracker_info['triggered_count']} triggered")
     subject = f"{REPORT_TITLE} — " + ", ".join(subject_parts)
 
     high_importance = len(dead_df) >= EMAIL_HIGH_IMPORTANCE_DEAD_THRESHOLD
