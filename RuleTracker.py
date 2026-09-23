@@ -1,43 +1,35 @@
 """
-QRadar Rule Status Report — v2
+QRadar Rule Status Report — v3
 
-Changes from v1 (see conversation for full rationale):
-  1. FIX: _extract_rule_ids no longer crashes when an offense has "rules": null
-     (dict.get(key, default) only applies the default when the key is *missing*,
-     not when it's present with a null value).
-  2. FIX: pagination now advances by however many items actually came back,
-     instead of assuming "fewer than requested = last page" — some QRadar
-     consoles cap page size server-side regardless of the Range header you send,
-     which was silently truncating offense history.
-  3. FIX: offense fetch now pins an explicit sort (?sort=+id) so pagination is
-     stable against a live console where new offenses keep landing / existing
-     ones get last_updated_time bumped.
-  4. FIX: tracker file reading now respects TRACKER_HEADER_ROW (previously the
-     read always assumed header row 1 while the write-back used the configured
-     row — misaligned if you ever set TRACKER_HEADER_ROW != 1).
-  5. NEW: only enabled rules whose response actions include "part of an
-     offense" (configurable phrase match) are considered at all. Rules without
-     this action can never appear in offense data, so counting offenses to
-     decide "dead" is meaningless for them — including them was a silent
-     false-positive risk in v1.
-  6. NEW: first-triggered / last-triggered per rule, derived from the same
-     offense data already being fetched (not a separate, less-reliable QRadar
-     API field). Rules whose first-ever-seen offense falls inside
-     NEWLY_TRIGGERED_WINDOW_DAYS are surfaced as "Newly Triggered" — i.e.
-     rules you've validated for the first time recently.
-  7. CHANGED: tracker file model simplified to two meaningful columns —
-     Rule Name and Triggered. "Under Investigation" is no longer a column you
-     maintain; it's simply "Triggered is falsy," computed for you. The sheet
-     to read from the tracker workbook is now configurable
-     (TRACKER_SHEET_NAME), and the auto-detect logic still supports extra
-     columns in that sheet beyond these two — they're carried through
-     untouched, just not used for anything.
+MAJOR CHANGE FROM v2: offense data is no longer used anywhere in this script. Two reasons drove
+this, both from the same root cause (short offense retention):
+  1. "First/Last Triggered" is now pulled directly from QRadar Use Case Manager (UCM)'s Use Case
+     Explorer report API, which tracks these independently of offense retention.
+  2. The "Event is part of an offense" rule filter isn't exposed via the core /api/analytics/rules
+     endpoint at all — it lives in UCM's own data model. UCM's Use Case Explorer supports it
+     natively as a documented filter, which is also why the old text-search-based filter attempt
+     never found anything: it was searching a payload that structurally couldn't contain it.
 
-CAVEAT carried through: "first triggered" is bounded by whatever offense
-history you actually fetch. If FULL_HISTORY_LOOKBACK_DAYS is set too close to
-NEWLY_TRIGGERED_WINDOW_DAYS (or shorter), a rule that's actually been firing
-for years can look "newly triggered" simply because that's as far back as your
-fetch goes. validate_config() checks for this.
+Because offense retention was the whole reason to stop trusting offense-derived "Dead" too, "Dead"
+is now ALSO redefined as "never triggered, per UCM" rather than "zero offenses in retained
+history" — this keeps the whole report internally consistent on one underlying data source. Flag
+this if you wanted Dead to stay offense-based for some other reason.
+
+IMPORTANT — please read before running:
+  UCM's REST API is reached through the QRadar app-proxy path, which needs your Use Case Manager
+  app's numeric ID (UCM_APP_ID) and, per IBM's docs, an Authorized Service token sent via a SEC
+  header (UCM_AUTH_TOKEN) rather than the Basic Auth used elsewhere in this script. I have solid
+  documentation for the REQUEST shapes (filters, column codes, the generate -> poll -> fetch
+  workflow) but not a verified example of the exact RESPONSE shape for the status/result calls in
+  your specific app version — those can vary. Set UCM_DEBUG = True for your first run: it prints
+  the raw JSON from every UCM call so you (or I, if you paste it back) can quickly confirm or
+  correct the few assumptions marked below with "ASSUMPTION:".
+
+  The most bulletproof way to get filters/columns that are guaranteed correct for YOUR app version:
+  open Use Case Explorer in the QRadar UI, set the filters by hand (Rule enabled = Yes, Action =
+  "Ensure the detected event is part of an offense"), open your browser's dev tools Network tab,
+  and copy the exact POST body QRadar sends to /api/use_case_explorer. Paste that over the
+  `filters` list in fetch_ucm_rule_report() below if it differs from what's here.
 """
 
 import os
@@ -70,38 +62,38 @@ logger = logging.getLogger(__name__)
 
 
 QRADAR_HOST     = 'https://your-qradar-host'
-QRADAR_USERNAME = 'your-username'
-QRADAR_PASSWORD = 'your-password'
+QRADAR_USERNAME = 'your-username'   # used for the /api/help/versions connection check, and as a
+QRADAR_PASSWORD = 'your-password'   # fallback UCM auth if UCM_AUTH_TOKEN is left blank
 VERIFY_SSL      = False
 
-# --- Time windows -----------------------------------------------------------
-TRACKER_VALIDATION_WINDOW_DAYS = 7        # "did this tracked rule fire recently" cross-check window
-NEWLY_TRIGGERED_WINDOW_DAYS    = 30       # "rule fired for the very first time within N days" window
-FULL_HISTORY_LOOKBACK_DAYS     = None     # None = unbounded (all offenses QRadar currently retains)
-RULE_DEAD_THRESHOLD            = 0
+# --- QRadar Use Case Manager (UCM) app ---------------------------------------
+UCM_APP_ID     = ''   # from the browser URL when you open Use Case Manager in the QRadar UI,
+                       # e.g. https://<host>/console/plugins/<APP_ID>/app_proxy/...
+UCM_AUTH_TOKEN = ''    # An Authorized Service Token (QRadar Admin > Authorized Services), sent via
+                       # the SEC header — IBM's docs specify this for UCM's API. Leave blank to
+                       # fall back to Basic Auth with QRADAR_USERNAME/PASSWORD instead.
+UCM_POLL_INTERVAL_SECS = 2
+UCM_POLL_TIMEOUT_SECS  = 120
+UCM_DEBUG = False      # True: print raw JSON from every UCM API call. Turn on for your first run.
 
-# --- Tracker file -------------------------------------------------------------
+# Report columns requested from Use Case Explorer (see IBM's "Report column codes" reference).
+# ASSUMPTION: result rows come back keyed by these same short codes. _normalize_ucm_row() also
+# handles the case where a row is a plain list in this same column order, and _row_get() also
+# tries a couple of plausible full-name alternates — but if UCM_DEBUG shows a genuinely different
+# shape, this is the one place to fix it.
+UCM_REPORT_COLUMNS = ["ID", "N", "EN", "T", "RO", "GR", "A", "RE", "AD", "RED", "CD", "MD",
+                      "FTG", "LTG", "TG", "NO"]
+
+# --- Time windows -------------------------------------------------------------
+NEWLY_TRIGGERED_WINDOW_DAYS    = 30   # "first triggered within N days" -> newly validated rule
+TRACKER_VALIDATION_WINDOW_DAYS = 7    # "last triggered within N days" -> tracker auto-validation
+
+# --- Tracker file --------------------------------------------------------------
 TRACKER_EXCEL_PATH            = ''
-TRACKER_SHEET_NAME            = None      # None = first sheet in the workbook; or set an exact sheet name
-TRACKER_HEADER_ROW            = 1         # 1 = header on the first row of the sheet
-AUTO_UPDATE_TRACKER_TRIGGERED = True      # if a tracked rule shows Triggered=No but QRadar shows recent
-                                           # offense activity, flip it to Yes and write it back
+TRACKER_SHEET_NAME            = None      # None = first sheet in the workbook; or an exact name
+TRACKER_HEADER_ROW            = 1
+AUTO_UPDATE_TRACKER_TRIGGERED = True
 TRACKER_BACKUP_BEFORE_WRITE   = True
-
-# --- Offense-action filter ----------------------------------------------------
-# Only rules with a response action that creates/indexes an offense can ever show up in offense
-# data — so only those rules are meaningful candidates for "dead" or "newly triggered" analysis.
-# QRadar's exact API field for this varies by version/deployment, so rather than hardcode a field
-# name I might get wrong, this searches the rule's full JSON payload (case-insensitive) for any of
-# these phrases. Set RULE_ACTION_DEBUG = True once and re-run to see one rule's raw fields printed
-# to the console, then tighten this list to whatever your deployment actually uses.
-REQUIRE_OFFENSE_ACTION = True
-OFFENSE_ACTION_PHRASES = [
-    'part of an offense',
-    'part of the offense',
-    'index offense',
-]
-RULE_ACTION_DEBUG = False
 
 OUTPUT_DIR = r'C:\path\to\your\output'
 
@@ -184,41 +176,10 @@ def _api_get(path, params=None, label='request'):
     items, total = _api_get_page(path, 0, API_PAGE_SIZE, params=params, label=label)
     if total is not None and total > API_PAGE_SIZE + 1:
         logger.warning(
-            "Pagination cap hit for '%s': %d items on server, only %d fetched. "
-            "Use _api_get_all for this endpoint.", label, total, API_PAGE_SIZE + 1
+            "Pagination cap hit for '%s': %d items on server, only %d fetched.",
+            label, total, API_PAGE_SIZE + 1
         )
     return items
-
-
-def _api_get_all(path, params=None, label='request', page_size=None, max_pages=MAX_PAGES):
-    """
-    Walk every page of an endpoint. Advances by however many items actually came back on each
-    page (not by the requested page_size) — some QRadar consoles silently cap the page size
-    server-side regardless of what Range you ask for, and advancing by the requested size in that
-    case would skip data. Stops when a page comes back empty or the running total matches the
-    server-reported Content-Range total.
-    """
-    page_size = page_size or (API_PAGE_SIZE + 1)
-    all_items = []
-    start = 0
-    for page_num in range(max_pages):
-        end = start + page_size - 1
-        items, total = _api_get_page(
-            path, start, end, params=params,
-            label=f'{label} (items {start}-{end})'
-        )
-        if not items:
-            break
-        all_items.extend(items)
-        start += len(items)
-        if total is not None and len(all_items) >= total:
-            break
-    else:
-        logger.warning(
-            "Hit max_pages=%d for '%s' — data may be incomplete. Raise MAX_PAGES "
-            "if your deployment has more history than that.", max_pages, label
-        )
-    return all_items
 
 
 def validate_config():
@@ -226,8 +187,16 @@ def validate_config():
 
     if QRADAR_HOST.rstrip('/') in ('https://your-qradar-host', ''):
         problems.append("QRADAR_HOST is still the placeholder — set it to your real console URL.")
-    if QRADAR_USERNAME in ('your-username', '') or QRADAR_PASSWORD in ('your-password', ''):
-        problems.append("QRADAR_USERNAME / QRADAR_PASSWORD look like the placeholders.")
+    if not UCM_APP_ID:
+        problems.append(
+            "UCM_APP_ID is blank. Open Use Case Manager in the QRadar UI and copy the numeric "
+            "app ID from the URL: https://<host>/console/plugins/<APP_ID>/app_proxy/..."
+        )
+    if not UCM_AUTH_TOKEN and (QRADAR_USERNAME in ('your-username', '') or QRADAR_PASSWORD in ('your-password', '')):
+        problems.append(
+            "UCM_AUTH_TOKEN is blank and QRADAR_USERNAME/PASSWORD look like placeholders — "
+            "UCM calls will have no valid auth either way."
+        )
     if OUTPUT_DIR == r'C:\path\to\your\output':
         problems.append("OUTPUT_DIR is still the placeholder path.")
 
@@ -235,22 +204,6 @@ def validate_config():
         problems.append("TRACKER_VALIDATION_WINDOW_DAYS must be a positive number of days.")
     if NEWLY_TRIGGERED_WINDOW_DAYS <= 0:
         problems.append("NEWLY_TRIGGERED_WINDOW_DAYS must be a positive number of days.")
-
-    if FULL_HISTORY_LOOKBACK_DAYS is not None:
-        if FULL_HISTORY_LOOKBACK_DAYS <= 0:
-            problems.append("FULL_HISTORY_LOOKBACK_DAYS must be None (unbounded) or a positive number of days.")
-        else:
-            if FULL_HISTORY_LOOKBACK_DAYS <= TRACKER_VALIDATION_WINDOW_DAYS:
-                problems.append(
-                    f"FULL_HISTORY_LOOKBACK_DAYS ({FULL_HISTORY_LOOKBACK_DAYS}) must be greater than "
-                    f"TRACKER_VALIDATION_WINDOW_DAYS ({TRACKER_VALIDATION_WINDOW_DAYS})."
-                )
-            if FULL_HISTORY_LOOKBACK_DAYS <= NEWLY_TRIGGERED_WINDOW_DAYS:
-                problems.append(
-                    f"FULL_HISTORY_LOOKBACK_DAYS ({FULL_HISTORY_LOOKBACK_DAYS}) must be greater than "
-                    f"NEWLY_TRIGGERED_WINDOW_DAYS ({NEWLY_TRIGGERED_WINDOW_DAYS}), or 'newly triggered' "
-                    f"will just reflect the edge of your fetch window rather than a real first-ever trigger."
-                )
 
     if TRACKER_EXCEL_PATH and not os.path.exists(TRACKER_EXCEL_PATH):
         problems.append(
@@ -264,14 +217,14 @@ def validate_config():
         print()
 
     fatal = any(
-        ('placeholder' in p and 'QRADAR_' in p) or 'must be' in p
+        ('placeholder' in p and 'QRADAR_' in p) or 'must be' in p or 'UCM_APP_ID' in p
         for p in problems
     )
     return not fatal
 
 
 def test_connection():
-    print("🔗 Testing QRadar connection...")
+    print("🔗 Testing base QRadar connection (Basic Auth)...")
     try:
         result = _api_get('/api/help/versions', label='connection test')
         if result:
@@ -287,126 +240,171 @@ def test_connection():
         return False
 
 
-def _rule_action_text_blob(rule):
-    """Flattened, lowercased text of the whole rule object, searched for response-action phrases."""
-    try:
-        return json.dumps(rule, default=str).lower()
-    except Exception:
-        return str(rule).lower()
+# --- Use Case Manager (UCM) -------------------------------------------------
+
+def _ucm_base_url():
+    return f"{QRADAR_HOST.rstrip('/')}/console/plugins/{UCM_APP_ID}/app_proxy/api"
 
 
-def _rule_has_offense_action(rule):
-    if not REQUIRE_OFFENSE_ACTION:
-        return True
-    blob = _rule_action_text_blob(rule)
-    return any(phrase.lower() in blob for phrase in OFFENSE_ACTION_PHRASES)
-
-
-def fetch_all_rules():
-    """
-    Returns (rules, total_enabled, excluded_no_offense_action).
-    `rules` is the final in-scope list: enabled, not a building block, and (if
-    REQUIRE_OFFENSE_ACTION) carrying a response action that indexes events into an offense.
-    """
-    print("📥 Fetching correlation rules...")
-    try:
-        data = _api_get_all('/api/analytics/rules', label='analytics rules')
-
-        if RULE_ACTION_DEBUG and data:
-            sample = data[0]
-            print("\n🔎 RULE_ACTION_DEBUG — raw fields on one rule (use this to tune OFFENSE_ACTION_PHRASES):")
-            for k, v in sample.items():
-                preview = str(v)
-                if len(preview) > 140:
-                    preview = preview[:140] + '…'
-                print(f"     {k}: {preview}")
-            print()
-
-        enabled = [
-            r for r in data
-            if r.get('enabled', False) is True
-            and 'BB' not in str(r.get('type', '')).upper()
-            and 'BUILDING_BLOCK' not in str(r.get('type', '')).upper()
-        ]
-
-        if REQUIRE_OFFENSE_ACTION:
-            rules = [r for r in enabled if _rule_has_offense_action(r)]
-        else:
-            rules = enabled
-        excluded = len(enabled) - len(rules)
-
-        print(f"   ✅ {len(rules)} rule(s) in scope (of {len(enabled)} enabled, {len(data)} total).")
-        if REQUIRE_OFFENSE_ACTION:
-            print(f"      {excluded} enabled rule(s) excluded — no offense-creating response detected "
-                  f"(they can never appear in offense data, so dead/newly-triggered analysis doesn't apply).")
-            if excluded and not RULE_ACTION_DEBUG:
-                logger.warning(
-                    "%d enabled rule(s) excluded for not matching OFFENSE_ACTION_PHRASES %s. "
-                    "If that count looks wrong, set RULE_ACTION_DEBUG = True and re-run once to "
-                    "inspect a raw rule's fields and tune the phrase list.",
-                    excluded, OFFENSE_ACTION_PHRASES
-                )
-        return rules, len(enabled), excluded
-    except Exception as e:
-        print(f"   ❌ Failed to fetch rules: {e}")
-        return [], 0, 0
-
-
-def fetch_all_offenses():
-    if FULL_HISTORY_LOOKBACK_DAYS:
-        cutoff_ms  = int((datetime.now() - timedelta(days=FULL_HISTORY_LOOKBACK_DAYS)).timestamp() * 1000)
-        filter_str = f'start_time >= {cutoff_ms}'
-        print(f"📥 Fetching offenses from the last {FULL_HISTORY_LOOKBACK_DAYS} days (paginated)...")
+def _ucm_request_kwargs():
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+    kwargs = {'verify': VERIFY_SSL, 'timeout': REQUEST_TIMEOUT, 'headers': headers}
+    if UCM_AUTH_TOKEN:
+        headers['SEC'] = UCM_AUTH_TOKEN
     else:
-        cutoff_ms  = None
-        filter_str = None
-        print("📥 Fetching ALL offenses currently retained by QRadar (no date filter, paginated)...")
+        kwargs['auth'] = (QRADAR_USERNAME, QRADAR_PASSWORD)
+    return kwargs
 
-    fields_str = 'id,rules,start_time,magnitude,status,severity'
-    params = {'fields': fields_str, 'sort': '+id'}  # pinned sort keeps pagination stable on a live console
-    if filter_str:
-        params['filter'] = filter_str
 
+def _ucm_debug_print(label, payload):
+    if not UCM_DEBUG:
+        return
     try:
-        data = _api_get_all('/api/siem/offenses', params=params, label='offenses')
-        print(f"   ✅ {len(data)} offenses fetched.")
-        return data
-    except Exception as e:
-        if filter_str:
-            print(f"   ⚠  Filtered offense fetch failed ({e}). Trying unfiltered fetch...")
-            try:
-                data = _api_get_all('/api/siem/offenses', params={'fields': fields_str, 'sort': '+id'},
-                                     label='offenses (unfiltered)')
-                data = [o for o in data if (o.get('start_time') or 0) >= cutoff_ms]
-                print(f"   ✅ {len(data)} offenses after in-memory filter.")
-                return data
-            except Exception as e2:
-                print(f"   ❌ Offense fetch failed entirely: {e2} — every rule will show as Dead this run.")
-                return []
-        print(f"   ❌ Offense fetch failed: {e} — every rule will show as Dead this run.")
-        return []
+        text = json.dumps(payload, default=str)
+    except Exception:
+        text = str(payload)
+    if len(text) > 2000:
+        text = text[:2000] + '…'
+    print(f"\n🔎 UCM_DEBUG — {label}:\n{text}\n")
 
 
-def filter_offenses_by_days(offenses, days):
-    cutoff_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-    return [o for o in offenses if (o.get('start_time') or 0) >= cutoff_ms]
+def _row_get(row, *keys):
+    for k in keys:
+        if k in row and row[k] not in (None, ''):
+            return row[k]
+    return None
 
 
-def _extract_rule_ids(offense):
-    ids = []
-    for r in (offense.get('rules') or []):  # `or []` — the key can be present with a null value
-        if isinstance(r, dict):
-            rid = r.get('id')
-        elif isinstance(r, (int, str)):
-            rid = r
+def _normalize_ucm_row(row, columns):
+    if isinstance(row, dict):
+        return row
+    if isinstance(row, (list, tuple)):
+        return dict(zip(columns, row))
+    return {}
+
+
+def _parse_ucm_date(val):
+    """
+    Best-effort parse of a UCM First/Last/Creation/Modification date value. ASSUMPTION: could be
+    epoch milliseconds (like the rest of QRadar's API) or a formatted date string; both are
+    handled. A rule that has never triggered should come back empty/None here, not a real date.
+    Returns (epoch_ms_or_None, display_string).
+    """
+    if val in (None, '', 'Never', 'N/A', '-', 0, '0'):
+        return None, '—'
+    if isinstance(val, (int, float)) or (isinstance(val, str) and val.strip().isdigit()):
+        try:
+            ms = int(val)
+            return ms, datetime.fromtimestamp(ms / 1000).strftime('%Y-%m-%d')
+        except (ValueError, OSError, OverflowError):
+            pass
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%m/%d/%Y %H:%M:%S',
+                '%b %d, %Y %I:%M:%S %p', '%Y-%m-%d'):
+        try:
+            dt = datetime.strptime(str(val).strip(), fmt)
+            return int(dt.timestamp() * 1000), dt.strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    logger.warning(
+        "Could not parse UCM date value %r — leaving it blank. Set UCM_DEBUG=True, check the raw "
+        "value's format, and add it to _parse_ucm_date().", val
+    )
+    return None, '—'
+
+
+def _parse_ucm_triggered_count(val):
+    if val in (None, ''):
+        return 0
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 1 if _to_bool(val) else 0
+
+
+def fetch_ucm_rule_report():
+    """
+    3-step Use Case Explorer workflow: POST to generate -> GET status until complete -> GET result
+    (paginated). Filters ask UCM to do the "enabled" + "not a building block" + "action = part of
+    an offense" filtering server-side, so no separate /api/analytics/rules call or manual JSON
+    text-search is needed anymore.
+
+    ASSUMPTION: the "enabled" filter below follows the same documented pattern as IBM's "action"/
+    "response"/"group" examples, but IBM's own filter reference page didn't give a literal example
+    for "enabled" specifically — if this comes back with 0 or clearly-wrong rows, get the exact
+    filter from your browser's dev tools as described in the module docstring above.
+    """
+    filters = [
+        {"name": "enabled", "type": "ATTRIBUTE", "recursive": True,
+         "matchCriteria": "PARTIAL", "values": [True], "attributeName": "", "valueType": "COMMON"},
+        {"name": "rule", "type": "ATTRIBUTE", "recursive": True,
+         "matchCriteria": "PARTIAL", "values": [True], "attributeName": "", "valueType": "EXCLUSIVE_COMMON"},
+        {"name": "action", "type": "ATTRIBUTE", "recursive": True,
+         "matchCriteria": "PARTIAL", "values": ["offense"], "attributeName": "", "valueType": "COMMON"},
+    ]
+    body = {"filters": filters, "columns": UCM_REPORT_COLUMNS}
+    base = _ucm_base_url()
+
+    print("📥 Requesting Use Case Explorer report (enabled + not-a-building-block + "
+          "'part of an offense' action)...")
+    post_resp = requests.post(f"{base}/use_case_explorer", json=body, **_ucm_request_kwargs())
+    if post_resp.status_code not in (200, 201, 202):
+        raise RuntimeError(f"UCM report generation failed: HTTP {post_resp.status_code} — "
+                            f"{post_resp.text[:300]}")
+    post_json = post_resp.json()
+    _ucm_debug_print("POST /use_case_explorer response", post_json)
+
+    report_id = post_json.get('reportId') or post_json.get('id') or post_json.get('report_id')
+    if not report_id:
+        raise RuntimeError(f"UCM report generation didn't return a reportId: {post_resp.text[:300]}")
+
+    # Poll for completion. ASSUMPTION: a top-level "status" string that contains "COMPLETE" on
+    # success or "FAIL"/"ERROR" on failure — confirm against UCM_DEBUG output.
+    deadline = time.time() + UCM_POLL_TIMEOUT_SECS
+    status = None
+    while time.time() < deadline:
+        st_resp = requests.get(f"{base}/use_case_explorer/{report_id}/status", **_ucm_request_kwargs())
+        st_resp.raise_for_status()
+        st_json = st_resp.json()
+        _ucm_debug_print("GET .../status response", st_json)
+        status = str(st_json.get('status', '')).upper()
+        if 'COMPLETE' in status or 'SUCCESS' in status or 'DONE' in status:
+            break
+        if 'FAIL' in status or 'ERROR' in status:
+            raise RuntimeError(f"UCM report generation failed with status: {status}")
+        time.sleep(UCM_POLL_INTERVAL_SECS)
+    else:
+        raise RuntimeError(f"UCM report did not complete within {UCM_POLL_TIMEOUT_SECS}s "
+                            f"(last status: {status})")
+
+    # Paginate through results. ASSUMPTION: a `page` query param, 0-indexed, empty list = done.
+    all_rows = []
+    page = 0
+    while True:
+        res_resp = requests.get(f"{base}/use_case_explorer/{report_id}/result",
+                                 params={'page': page}, **_ucm_request_kwargs())
+        res_resp.raise_for_status()
+        payload = res_resp.json()
+        if page == 0:
+            _ucm_debug_print("GET .../result response (page 0)", payload)
+
+        if isinstance(payload, list):
+            page_rows = payload
+        elif isinstance(payload, dict):
+            page_rows = payload.get('results') or payload.get('data') or payload.get('rows') or []
         else:
-            rid = None
-        if rid is not None:
-            try:
-                ids.append(int(rid))
-            except (TypeError, ValueError):
-                pass
-    return ids
+            page_rows = []
+
+        if not page_rows:
+            break
+        all_rows.extend(page_rows)
+        page += 1
+        if page > 1000:
+            logger.warning("UCM result pagination exceeded 1000 pages — stopping early; "
+                            "data may be incomplete.")
+            break
+
+    print(f"   ✅ {len(all_rows)} rule(s) returned by Use Case Explorer.")
+    return all_rows
 
 
 def _html_escape(text):
@@ -444,15 +442,6 @@ def _native(val):
     return val
 
 
-def _format_epoch_ms(val):
-    if not val:
-        return '—'
-    try:
-        return datetime.fromtimestamp(int(val) / 1000).strftime('%Y-%m-%d')
-    except (TypeError, ValueError, OSError, OverflowError):
-        return '—'
-
-
 def _age_days_from_epoch(val):
     if not val:
         return None
@@ -461,14 +450,6 @@ def _age_days_from_epoch(val):
         return (datetime.now() - created).days
     except (TypeError, ValueError, OSError, OverflowError):
         return None
-
-
-def _get_rule_description(rule):
-    for field in ('notes', 'description', 'rule_description', 'comment'):
-        val = rule.get(field)
-        if val and isinstance(val, str) and val.strip():
-            return val.strip()
-    return 'Not exposed via API — review in QRadar Console (Offenses → Rules) for full trigger logic.'
 
 
 def _find_col(columns, aliases):
@@ -525,15 +506,13 @@ def load_tracker_file(path):
 
     if triggered_col is None and not df.empty:
         logger.warning(
-            "Tracker sheet '%s' has no recognizable 'Triggered' column (looked for: %s) — "
-            "triggered / under-investigation counts will be unavailable this run.",
+            "Tracker sheet '%s' has no recognizable 'Triggered' column (looked for: %s).",
             sheet_name, _TRIGGERED_COL_ALIASES
         )
     if name_col is None and not df.empty:
         logger.warning(
             "Tracker sheet '%s' has no recognizable Rule Name column — cross-referencing against "
-            "QRadar and auto-mark-triggered logic are disabled this run; only raw counts will be reported.",
-            sheet_name
+            "QRadar and auto-mark-triggered logic are disabled this run.", sheet_name
         )
 
     return {
@@ -562,27 +541,26 @@ def reconcile_tracker_with_qradar(tracker_info, master_df):
             if key not in lookup:
                 lookup[key] = r
 
-    matched_flags, recent_list, total_list = [], [], []
+    matched_flags, recently_active_list, total_triggered_list = [], [], []
     changed_cells, auto_marked_rows, auto_marked_indices = [], [], set()
 
     for idx, row in df.iterrows():
         matched_rule = lookup.get(_normalize_name(row[name_col])) if name_col else None
 
         is_triggered = _to_bool(row[triggered_col]) if triggered_col else False
-        recent = int(matched_rule['offenses_recent']) if matched_rule is not None else None
-        total  = int(matched_rule['offenses_total']) if matched_rule is not None else None
+        recently_active = bool(matched_rule['is_recently_triggered']) if matched_rule is not None else None
+        total_triggered = int(matched_rule['triggered_count']) if matched_rule is not None else None
 
         matched_flags.append(matched_rule is not None)
-        recent_list.append(recent)
-        total_list.append(total)
+        recently_active_list.append(recently_active)
+        total_triggered_list.append(total_triggered)
 
         should_auto_mark = (
             AUTO_UPDATE_TRACKER_TRIGGERED
             and matched_rule is not None
             and not is_triggered
             and triggered_col is not None
-            and recent is not None
-            and recent > 0
+            and recently_active
         )
         if should_auto_mark:
             df.at[idx, triggered_col] = True
@@ -590,12 +568,12 @@ def reconcile_tracker_with_qradar(tracker_info, master_df):
             auto_marked_indices.add(idx)
             auto_marked_rows.append({
                 'rule_name': str(row[name_col]),
-                'offenses_recent': recent,
+                'last_triggered': matched_rule['last_triggered'],
             })
 
-    df['_matched_to_qradar'] = matched_flags
-    df['_offenses_recent']   = recent_list
-    df['_offenses_total']    = total_list
+    df['_matched_to_qradar']    = matched_flags
+    df['_recently_active']      = recently_active_list
+    df['_triggered_count']      = total_triggered_list
 
     tracker_info['raw'] = df
     tracker_info['changed_cells'] = changed_cells
@@ -643,55 +621,48 @@ def persist_tracker_updates(path, tracker_info):
         return 'error'
 
 
-def build_master_rule_table(rules, offenses_all):
-    full_counts = {}
-    first_seen  = {}  # rule_id -> earliest offense start_time (ms) seen in the fetched offense set
-    last_seen   = {}  # rule_id -> latest offense start_time (ms)
-
-    for o in offenses_all:
-        st = o.get('start_time') or 0
-        for rid in _extract_rule_ids(o):
-            full_counts[rid] = full_counts.get(rid, 0) + 1
-            if st:
-                if rid not in first_seen or st < first_seen[rid]:
-                    first_seen[rid] = st
-                if rid not in last_seen or st > last_seen[rid]:
-                    last_seen[rid] = st
-
-    recent_offenses = filter_offenses_by_days(offenses_all, TRACKER_VALIDATION_WINDOW_DAYS)
-    recent_counts = {}
-    for o in recent_offenses:
-        for rid in _extract_rule_ids(o):
-            recent_counts[rid] = recent_counts.get(rid, 0) + 1
-
-    newly_cutoff_ms = int((datetime.now() - timedelta(days=NEWLY_TRIGGERED_WINDOW_DAYS)).timestamp() * 1000)
+def build_master_rule_table(ucm_rows):
+    newly_cutoff_ms  = int((datetime.now() - timedelta(days=NEWLY_TRIGGERED_WINDOW_DAYS)).timestamp() * 1000)
+    recent_cutoff_ms = int((datetime.now() - timedelta(days=TRACKER_VALIDATION_WINDOW_DAYS)).timestamp() * 1000)
 
     rows = []
-    for rule in rules:
-        rid      = rule.get('id')
-        total    = full_counts.get(rid, 0)
-        recent   = recent_counts.get(rid, 0)
-        first_ts = first_seen.get(rid)
-        last_ts  = last_seen.get(rid)
+    for raw in ucm_rows:
+        row = _normalize_ucm_row(raw, UCM_REPORT_COLUMNS)
+
+        rule_id  = _row_get(row, 'ID', 'id', 'Rule_ID')
+        name     = _row_get(row, 'N', 'name', 'Attribute_Name') or f'Rule {rule_id}'
+
+        created_ts, created_display   = _parse_ucm_date(_row_get(row, 'CD', 'creation_date', 'Attribute_Creation_Date'))
+        _,          modified_display  = _parse_ucm_date(_row_get(row, 'MD', 'modification_date', 'Attribute_Modification_Date'))
+        first_ts,   first_display     = _parse_ucm_date(_row_get(row, 'FTG', 'first_triggered', 'Attribute_First_Triggered'))
+        last_ts,    last_display      = _parse_ucm_date(_row_get(row, 'LTG', 'last_triggered', 'Attribute_Last_Triggered'))
+        triggered_count = _parse_ucm_triggered_count(_row_get(row, 'TG', 'triggered', 'Attribute_Triggered'))
 
         rows.append({
-            'rule_id':             rid,
-            'rule_name':           _csv_formula_safe(rule.get('name', f'Rule {rid}')),
-            'rule_type':           rule.get('type', 'UNKNOWN'),
-            'origin':              rule.get('origin', 'UNKNOWN'),
-            'owner':               rule.get('owner', 'Unknown'),
-            'created':             _format_epoch_ms(rule.get('creation_date')),
-            'created_age_days':    _age_days_from_epoch(rule.get('creation_date')),
-            'modified':            _format_epoch_ms(rule.get('modification_date')),
-            'description':         _csv_formula_safe(_get_rule_description(rule)),
-            'offenses_total':      total,
-            'offenses_recent':     recent,
-            'first_triggered':     _format_epoch_ms(first_ts) if first_ts else '—',
-            'first_triggered_ts':  first_ts,
-            'last_triggered':      _format_epoch_ms(last_ts) if last_ts else '—',
-            'last_triggered_ts':   last_ts,
-            'is_dead':             total <= RULE_DEAD_THRESHOLD,
-            'is_newly_triggered':  bool(first_ts and first_ts >= newly_cutoff_ms),
+            'rule_id':               rule_id,
+            'rule_name':             _csv_formula_safe(name),
+            'rule_type':             _row_get(row, 'T', 'type', 'Attribute_Type') or 'UNKNOWN',
+            'origin':                _row_get(row, 'RO', 'origin', 'Rule_Origin') or 'UNKNOWN',
+            'group':                 _row_get(row, 'GR', 'group', 'Attribute_Group') or '',
+            'action':                _row_get(row, 'A', 'action', 'Attribute_Action') or '',
+            'response':              _row_get(row, 'RE', 'response', 'Attribute_Response') or '',
+            'action_details':        _row_get(row, 'AD', 'action_details', 'Action_Details') or '',
+            'response_details':      _row_get(row, 'RED', 'response_details', 'Response_Details') or '',
+            'created':               created_display,
+            'created_age_days':      _age_days_from_epoch(created_ts) if created_ts else None,
+            'modified':              modified_display,
+            'description':           _csv_formula_safe(
+                                          _row_get(row, 'NO', 'notes', 'Attribute_Notes')
+                                          or 'Not returned by Use Case Explorer for this rule.'
+                                      ),
+            'triggered_count':       triggered_count,
+            'first_triggered':       first_display,
+            'first_triggered_ts':    first_ts,
+            'last_triggered':        last_display,
+            'last_triggered_ts':     last_ts,
+            'is_dead':               (first_ts is None) and triggered_count == 0,
+            'is_newly_triggered':    bool(first_ts and first_ts >= newly_cutoff_ms),
+            'is_recently_triggered': bool(last_ts and last_ts >= recent_cutoff_ms),
         })
     return pd.DataFrame(rows)
 
@@ -743,7 +714,7 @@ def _pct(n, total):
     return f"{(n / total * 100):.1f}%" if total else "0.0%"
 
 
-def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules, excluded_no_offense_action):
+def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules):
     ws = wb.active
     ws.title = 'Executive Summary'
 
@@ -752,22 +723,16 @@ def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules, exclu
     ws['A2'] = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     ws['A2'].font = Font(italic=True, size=10, color='7C6FA0')
 
-    hist_note = ('unbounded — all offenses currently retained by QRadar'
-                 if not FULL_HISTORY_LOOKBACK_DAYS else f'last {FULL_HISTORY_LOOKBACK_DAYS} days')
-    ws['A3'] = (f"Full-history window: {hist_note}   ·   Tracker validation window: "
-                f"last {TRACKER_VALIDATION_WINDOW_DAYS} day(s)   ·   Newly-triggered window: "
-                f"last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s)")
+    ws['A3'] = (f"Data source: QRadar Use Case Manager (Use Case Explorer)   ·   "
+                f"Newly-triggered window: last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s)   ·   "
+                f"Tracker validation window: last {TRACKER_VALIDATION_WINDOW_DAYS} day(s)")
     ws['A3'].font = Font(size=10, color='7C6FA0')
 
-    ws['A5'] = 'Total in-scope enabled correlation rules analyzed:'
+    ws['A5'] = 'Rules matching filters (enabled, not a building block, offense-creating action):'
     ws['B5'] = int(total_rules)
     ws['B5'].font = _BOLD
-    if REQUIRE_OFFENSE_ACTION:
-        ws['A6'] = f'Enabled rules excluded (no offense-creating response action):'
-        ws['B6'] = int(excluded_no_offense_action)
-        ws['B6'].font = _BOLD
 
-    row = 8
+    row = 7
     ws.cell(row=row, column=1, value='Metric').fill = _FILLS['header']
     ws.cell(row=row, column=1).font = _HDR_FONT
     for c, label in ((2, 'Count'), (3, '% of Rules')):
@@ -779,7 +744,7 @@ def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules, exclu
     dead_n  = len(dead_df)
     newly_n = len(newly_df)
     metrics = [
-        ('Dead — Never Fired',      dead_n,  _pct(dead_n, total_rules),  'red'),
+        ('Dead — Never Triggered',  dead_n,  _pct(dead_n, total_rules),  'red'),
         (f'Newly Triggered (≤{NEWLY_TRIGGERED_WINDOW_DAYS}d)', newly_n, _pct(newly_n, total_rules), 'teal'),
         ('Under Investigation',     tracker_info['under_investigation_count'] if tracker_info else 'N/A', '', 'orange'),
         ('Triggered (confirmed)',   tracker_info['triggered_count']           if tracker_info else 'N/A', '', 'blue'),
@@ -815,15 +780,14 @@ def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules, exclu
     row += 2
 
     caveat = (
-        'Rule descriptions reflect whatever metadata QRadar exposes via REST API; full boolean '
-        'trigger logic is not reliably exposed in most versions — cross-reference the Rules console. '
-        '"Dead" and "Newly Triggered" are both bounded by whatever offense history QRadar currently '
-        'retains (or by FULL_HISTORY_LOOKBACK_DAYS, if set) — a rule that first fired before that '
-        'window began will not show its true first-triggered date. Only rules with an offense-creating '
-        'response action are considered, based on a configurable text match (see OFFENSE_ACTION_PHRASES) '
-        'rather than a guaranteed API field — verify the excluded count above looks right. Auto-marking '
-        'Triggered uses recent offense activity as a proxy for "fired since you started testing" — it '
-        'does not confirm the offense was caused by your specific test versus unrelated real traffic.'
+        'All rule data — including First/Last Triggered — comes from QRadar Use Case Manager\'s '
+        'Use Case Explorer report, not from raw offense data, so none of this is bounded by '
+        'offense retention. "Dead" means never triggered per UCM\'s own stats. If UCM resets its '
+        'triggered stats when a rule is edited/re-saved in your deployment, a recently-modified '
+        'rule can show as never-triggered even though it fired before its last edit — worth '
+        'spot-checking a known-good rule if a "Dead" count looks surprising. Auto-marking '
+        'Triggered uses recent trigger activity as a proxy for "fired since you started testing" '
+        '— it does not confirm the trigger was caused by your specific test versus real traffic.'
     )
     ws.cell(row=row, column=1, value=caveat).font = Font(italic=True, size=9, color='7C6FA0')
     ws.cell(row=row, column=1).alignment = _WRAP
@@ -836,13 +800,13 @@ def _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules, exclu
 
 def _write_dead_sheet(wb, dead_df):
     ws = wb.create_sheet('Dead Rules')
-    cols   = ['Rule ID', 'Rule Name', 'Type', 'Origin', 'Owner', 'Created', 'Age (Days)',
-              'Modified', 'Description / Trigger Logic']
-    widths = [9, 42, 14, 10, 14, 12, 11, 12, 60]
+    cols   = ['Rule ID', 'Rule Name', 'Type', 'Origin', 'Group', 'Created', 'Age (Days)',
+              'Modified', 'Response', 'Description / Notes']
+    widths = [9, 42, 14, 10, 16, 12, 11, 12, 24, 55]
     _write_sheet_header(ws, cols, widths)
 
     if dead_df.empty:
-        ws.append(['No dead rules — every in-scope rule has fired at least once.'])
+        ws.append(['No dead rules — every in-scope rule has triggered at least once.'])
         return
 
     sorted_df = dead_df.sort_values('created_age_days', ascending=False, na_position='last')
@@ -852,9 +816,10 @@ def _write_dead_sheet(wb, dead_df):
 
     for _, r in sorted_df.iterrows():
         age = r['created_age_days']
-        ws.append([int(r['rule_id']), str(r['rule_name']), str(r['rule_type']), str(r['origin']),
-                   str(r['owner']), str(r['created']), age if age is not None else '—',
-                   str(r['modified']), str(r['description'])])
+        ws.append([int(r['rule_id']) if r['rule_id'] is not None else '—', str(r['rule_name']),
+                   str(r['rule_type']), str(r['origin']), str(r['group']), str(r['created']),
+                   age if age is not None else '—', str(r['modified']), str(r['response']),
+                   str(r['description'])])
         r_idx = ws.max_row
         ws.cell(row=r_idx, column=desc_idx).alignment = _WRAP
         if age is not None and age >= DEAD_RULE_STALE_AGE_DAYS:
@@ -867,20 +832,21 @@ def _write_dead_sheet(wb, dead_df):
 
 def _write_newly_triggered_sheet(wb, newly_df):
     ws = wb.create_sheet('Newly Triggered Rules')
-    cols   = ['Rule ID', 'Rule Name', 'Type', 'Owner', 'First Triggered', 'Last Triggered', 'Offenses (Total)']
-    widths = [9, 42, 14, 14, 15, 15, 16]
+    cols   = ['Rule ID', 'Rule Name', 'Type', 'Group', 'First Triggered', 'Last Triggered', 'Triggered Count']
+    widths = [9, 42, 14, 16, 15, 15, 16]
     _write_sheet_header(ws, cols, widths)
 
     if newly_df.empty:
-        ws.append([f'No rules first fired in the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s).'])
+        ws.append([f'No rules first triggered in the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s).'])
         return
 
     sorted_df = newly_df.sort_values('first_triggered_ts', ascending=False, na_position='last')
     first_row = ws.max_row + 1
 
     for _, r in sorted_df.iterrows():
-        ws.append([int(r['rule_id']), str(r['rule_name']), str(r['rule_type']), str(r['owner']),
-                   str(r['first_triggered']), str(r['last_triggered']), int(r['offenses_total'])])
+        ws.append([int(r['rule_id']) if r['rule_id'] is not None else '—', str(r['rule_name']),
+                   str(r['rule_type']), str(r['group']), str(r['first_triggered']),
+                   str(r['last_triggered']), int(r['triggered_count'])])
 
     _apply_zebra_and_borders(ws, first_row, ws.max_row, len(cols))
     ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
@@ -892,12 +858,12 @@ def _write_tracker_sheet(wb, tracker_info):
     original_cols = [c for c in df.columns if not str(c).startswith('_')]
     has_match_info = '_matched_to_qradar' in df.columns
     extra_cols = (
-        ['Matched to QRadar Rule?', f'Offenses (last {TRACKER_VALIDATION_WINDOW_DAYS}d)',
-         'Offenses (Total)', 'Auto-Marked Triggered This Run?']
+        ['Matched to QRadar Rule?', f'Fired in last {TRACKER_VALIDATION_WINDOW_DAYS}d?',
+         'Triggered Count (Total)', 'Auto-Marked Triggered This Run?']
         if has_match_info else []
     )
     cols = [str(c) for c in original_cols] + extra_cols
-    widths = [max(14, min(50, len(str(c)) + 4)) for c in original_cols] + [20, 18, 16, 22][:len(extra_cols)]
+    widths = [max(14, min(50, len(str(c)) + 4)) for c in original_cols] + [20, 20, 18, 22][:len(extra_cols)]
     _write_sheet_header(ws, cols, widths)
 
     if df.empty:
@@ -911,10 +877,10 @@ def _write_tracker_sheet(wb, tracker_info):
     for idx, r in df.iterrows():
         values = [_native(r[c]) for c in original_cols]
         if has_match_info:
-            recent, total = r['_offenses_recent'], r['_offenses_total']
+            active, total = r['_recently_active'], r['_triggered_count']
             values += [
                 'Yes' if r['_matched_to_qradar'] else 'No',
-                int(recent) if pd.notna(recent) else '—',
+                ('Yes' if active else 'No') if active is not None else '—',
                 int(total) if pd.notna(total) else '—',
                 'Yes' if idx in auto_marked_indices else 'No',
             ]
@@ -936,10 +902,10 @@ def _write_tracker_sheet(wb, tracker_info):
     ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{ws.max_row}"
 
 
-def save_excel_report(dead_df, newly_df, tracker_info, total_rules, excluded_no_offense_action, path):
+def save_excel_report(dead_df, newly_df, tracker_info, total_rules, path):
     try:
         wb = openpyxl.Workbook()
-        _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules, excluded_no_offense_action)
+        _write_summary_sheet(wb, dead_df, newly_df, tracker_info, total_rules)
         _write_dead_sheet(wb, dead_df)
         _write_newly_triggered_sheet(wb, newly_df)
         if tracker_info is not None:
@@ -1034,7 +1000,7 @@ def _build_dead_table_html(dead_df):
     C = _C
     if dead_df.empty:
         return (f'<p style="color:{C["blue"]};font-size:12px;font-weight:600;padding:8px 0;margin:0;">'
-                f'{_dot(C["blue"])} No dead rules — every in-scope rule has fired at least once.</p>')
+                f'{_dot(C["blue"])} No dead rules — every in-scope rule has triggered at least once.</p>')
 
     shown = dead_df.sort_values('created_age_days', ascending=False, na_position='last').head(EMAIL_TABLE_ROW_CAP)
     rows_html = ''
@@ -1048,7 +1014,7 @@ def _build_dead_table_html(dead_df):
         <tr bgcolor="{bg}" style="background-color:{bg};">
           <td bgcolor="{bg}" style="padding:9px 12px;border-left:2px solid {C['red']};font-size:12px;color:{C['text']};" title="{name}">{name_short}</td>
           <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['rule_type'])}</td>
-          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['owner'])}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['group'])}</td>
           <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['created'])}</td>
           <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['red']};text-align:center;font-weight:600;">{age_txt}</td>
         </tr>"""
@@ -1063,7 +1029,7 @@ def _build_dead_table_html(dead_df):
       <thead><tr>
         <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:left;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Rule Name</th>
         <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Type</th>
-        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Owner</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Group</th>
         <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Created</th>
         <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['red']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Age</th>
       </tr></thead>
@@ -1075,7 +1041,7 @@ def _build_newly_triggered_table_html(newly_df):
     C = _C
     if newly_df.empty:
         return (f'<p style="color:{C["dim"]};font-size:12px;padding:8px 0;margin:0;">'
-                f'No rules first fired in the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s).</p>')
+                f'No rules first triggered in the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s).</p>')
 
     shown = newly_df.sort_values('first_triggered_ts', ascending=False, na_position='last').head(EMAIL_TABLE_ROW_CAP)
     rows_html = ''
@@ -1086,9 +1052,9 @@ def _build_newly_triggered_table_html(newly_df):
         rows_html += f"""
         <tr bgcolor="{bg}" style="background-color:{bg};">
           <td bgcolor="{bg}" style="padding:9px 12px;border-left:2px solid {C['teal']};font-size:12px;color:{C['text']};" title="{name}">{name_short}</td>
-          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['owner'])}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{_html_escape(row['group'])}</td>
           <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['teal']};text-align:center;font-weight:600;">{_html_escape(row['first_triggered'])}</td>
-          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{int(row['offenses_total'])}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{int(row['triggered_count'])}</td>
         </tr>"""
 
     more_note = ''
@@ -1100,9 +1066,9 @@ def _build_newly_triggered_table_html(newly_df):
     <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="border-collapse:collapse;margin-top:10px;background-color:{C['page']};">
       <thead><tr>
         <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:left;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Rule Name</th>
-        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Owner</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Group</th>
         <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">First Triggered</th>
-        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Offenses (Total)</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['teal']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Triggered Count</th>
       </tr></thead>
       <tbody>{rows_html}</tbody>
     </table>{more_note}"""
@@ -1112,8 +1078,7 @@ def _build_under_investigation_table_html(tracker_info):
     C = _C
     if tracker_info is None or not tracker_info.get('triggered_col'):
         return (f'<p style="color:{C["dim"]};font-size:12px;padding:8px 0;margin:0;">'
-                f'Tracker not configured, or no Triggered column found — set TRACKER_EXCEL_PATH / '
-                f'add a Triggered column to see active investigations here.</p>')
+                f'Tracker not configured, or no Triggered column found.</p>')
 
     df = tracker_info['raw']
     triggered_col, name_col = tracker_info['triggered_col'], tracker_info['name_col']
@@ -1131,17 +1096,15 @@ def _build_under_investigation_table_html(tracker_info):
         bg = C['page'] if i % 2 == 0 else C['card']
         name = _html_escape(row[name_col]) if name_col else '(no name column)'
         name_short = name[:42] + '…' if len(name) > 42 else name
-        recent = row['_offenses_recent'] if has_match else None
-        if recent is not None and pd.notna(recent):
-            fired_txt, fired_color = ('Yes', C['blue']) if recent > 0 else ('No', C['dim'])
-            recent_txt = str(int(recent))
+        active = row['_recently_active'] if has_match else None
+        if active is not None:
+            fired_txt, fired_color = ('Yes', C['blue']) if active else ('No', C['dim'])
         else:
-            fired_txt, fired_color, recent_txt = '—', C['dim'], '—'
+            fired_txt, fired_color = '—', C['dim']
         rows_html += f"""
         <tr bgcolor="{bg}" style="background-color:{bg};">
           <td bgcolor="{bg}" style="padding:9px 12px;border-left:2px solid {C['amber']};font-size:12px;color:{C['text']};" title="{name}">{name_short}</td>
           <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{fired_color};text-align:center;font-weight:600;">{fired_txt}</td>
-          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['dim']};text-align:center;">{recent_txt}</td>
         </tr>"""
 
     more_note = ''
@@ -1153,8 +1116,7 @@ def _build_under_investigation_table_html(tracker_info):
     <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="border-collapse:collapse;margin-top:10px;background-color:{C['page']};">
       <thead><tr>
         <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:left;font-size:9px;color:{C['amber']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Rule Name</th>
-        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['amber']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Fired Recently?</th>
-        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['amber']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Offenses (last {TRACKER_VALIDATION_WINDOW_DAYS}d)</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['amber']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Fired in last {TRACKER_VALIDATION_WINDOW_DAYS}d?</th>
       </tr></thead>
       <tbody>{rows_html}</tbody>
     </table>{more_note}"""
@@ -1175,7 +1137,7 @@ def _build_auto_validated_table_html(tracker_info):
         rows_html += f"""
         <tr bgcolor="{bg}" style="background-color:{bg};">
           <td bgcolor="{bg}" style="padding:9px 12px;border-left:2px solid {C['blue']};font-size:12px;color:{C['text']};" title="{name}">{name_short}</td>
-          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['blue']};text-align:center;font-weight:600;">{r['offenses_recent']}</td>
+          <td bgcolor="{bg}" style="padding:9px 12px;font-size:11px;color:{C['blue']};text-align:center;font-weight:600;">{_html_escape(r['last_triggered'])}</td>
         </tr>"""
 
     more_note = ''
@@ -1187,7 +1149,7 @@ def _build_auto_validated_table_html(tracker_info):
     <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="border-collapse:collapse;margin-top:10px;background-color:{C['page']};">
       <thead><tr>
         <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:left;font-size:9px;color:{C['blue']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Rule Name</th>
-        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['blue']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Offenses (last {TRACKER_VALIDATION_WINDOW_DAYS}d)</th>
+        <th bgcolor="{C['page']}" style="padding:8px 12px;text-align:center;font-size:9px;color:{C['blue']};font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid {C['border']};">Last Triggered</th>
       </tr></thead>
       <tbody>{rows_html}</tbody>
     </table>{more_note}"""
@@ -1264,9 +1226,6 @@ def build_email_html(dead_df, newly_df, tracker_info, total_rules, chart_cid):
             + f'<tr><td bgcolor="{C["page"]}" style="background-color:{C["page"]};padding:0 0 20px;">{auto_table_html}</td></tr>'
         )
 
-    hist_note = ('all offenses currently retained by QRadar' if not FULL_HISTORY_LOOKBACK_DAYS
-                 else f'the last {FULL_HISTORY_LOOKBACK_DAYS} days')
-
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1292,7 +1251,7 @@ table, td {{ font-family:Segoe UI, Arial, sans-serif !important; }}
     <table width="100%" cellpadding="0" cellspacing="0" bgcolor="{C['page']}" style="background-color:{C['page']};"><tr>
       <td bgcolor="{C['page']}" style="background-color:{C['page']};">
         <div style="font-size:9px;color:{C['dim']};letter-spacing:3px;text-transform:uppercase;margin-bottom:8px;">
-          QRadar
+          QRadar Use Case Manager
         </div>
         <div style="font-size:23px;font-weight:800;color:{C['text']};letter-spacing:-0.4px;line-height:1.25;">
           {REPORT_TITLE}
@@ -1313,12 +1272,12 @@ table, td {{ font-family:Segoe UI, Arial, sans-serif !important; }}
                    f"Fired for the first time within the last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s) — freshly validated rules.")}
   <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 8px;">{newly_table_html}</td></tr>
 
-  {section_header(C['red'], 'Dead Rules — Never Fired',
-                   f"Zero offenses across {hist_note}. Candidates for review or removal.")}
+  {section_header(C['red'], 'Dead Rules — Never Triggered',
+                   "Per QRadar Use Case Manager. Candidates for review or removal.")}
   <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 8px;">{dead_table_html}</td></tr>
 
   {section_header(C['amber'], 'Rules Under Investigation',
-                   f"Tracker rows where Triggered is not yet Yes — 'Fired Recently?' checks the last {TRACKER_VALIDATION_WINDOW_DAYS} day(s).")}
+                   f"Tracker rows where Triggered is not yet Yes — checked against the last {TRACKER_VALIDATION_WINDOW_DAYS} day(s).")}
   <tr><td bgcolor="{C['page']}" style="background-color:{C['page']};padding:0 0 8px;">{inv_table_html}</td></tr>
 
   {auto_section}
@@ -1377,15 +1336,14 @@ def main():
     print(f"  QRadar — {REPORT_TITLE}")
     print("=" * 62)
     print(f"  Host                     : {QRADAR_HOST}")
-    print(f"  Tracker validation window: last {TRACKER_VALIDATION_WINDOW_DAYS} day(s)")
+    print(f"  UCM app ID               : {UCM_APP_ID or '(not configured)'}")
+    print(f"  UCM auth                 : {'SEC token' if UCM_AUTH_TOKEN else 'Basic Auth fallback'}")
     print(f"  Newly-triggered window   : last {NEWLY_TRIGGERED_WINDOW_DAYS} day(s)")
-    print(f"  Full history             : "
-          f"{'unbounded (all retained offenses)' if not FULL_HISTORY_LOOKBACK_DAYS else f'{FULL_HISTORY_LOOKBACK_DAYS} days'}")
-    print(f"  Require offense action   : {REQUIRE_OFFENSE_ACTION}  (phrases: {OFFENSE_ACTION_PHRASES})")
+    print(f"  Tracker validation window: last {TRACKER_VALIDATION_WINDOW_DAYS} day(s)")
     print(f"  Tracker file             : {TRACKER_EXCEL_PATH or '(not configured)'}")
     print(f"  Tracker sheet            : {TRACKER_SHEET_NAME or '(first sheet)'}")
     print(f"  Auto-mark Triggered      : {AUTO_UPDATE_TRACKER_TRIGGERED}")
-    print(f"  Retry config             : {MAX_RETRIES} attempts, {RETRY_DELAY_BASE}s base backoff")
+    print(f"  UCM_DEBUG                : {UCM_DEBUG}")
     print("=" * 62)
 
     if not validate_config():
@@ -1395,29 +1353,27 @@ def main():
     if not test_connection():
         return
 
-    rules, total_enabled, excluded_no_offense_action = fetch_all_rules()
-    if not rules:
-        print("\n❌ No in-scope rules returned — check credentials, host URL, permissions, or "
-              "OFFENSE_ACTION_PHRASES if REQUIRE_OFFENSE_ACTION excluded everything.")
+    try:
+        ucm_rows = fetch_ucm_rule_report()
+    except Exception as e:
+        print(f"\n❌ Use Case Manager fetch failed: {e}")
+        print("   Set UCM_DEBUG = True and re-run to see the raw request/response and pinpoint why.")
         return
 
-    offenses_all = fetch_all_offenses()
-    if not offenses_all:
-        print("\n⚠  WARNING: no offenses were retrieved — check the warnings above before "
-              "treating every rule below as 'Dead'.")
+    if not ucm_rows:
+        print("\n❌ Use Case Explorer returned no rows. Check UCM_APP_ID, UCM_AUTH_TOKEN, and that "
+              "the filters in fetch_ucm_rule_report() match your deployment (UCM_DEBUG = True "
+              "shows the raw request/response).")
+        return
 
     print("\n🔍 Classifying rules...")
-    master_df = build_master_rule_table(rules, offenses_all)
+    master_df = build_master_rule_table(ucm_rows)
     dead_df   = master_df[master_df['is_dead']].copy()
     newly_df  = master_df[master_df['is_newly_triggered']].copy()
 
-    print(f"   Dead — never fired: {len(dead_df)}")
+    print(f"   Total in-scope rules: {len(master_df)}")
+    print(f"   Dead — never triggered: {len(dead_df)}")
     print(f"   Newly triggered (first fired in last {NEWLY_TRIGGERED_WINDOW_DAYS}d): {len(newly_df)}")
-
-    undocumented = int(master_df['description'].str.contains('Not exposed via API', na=False).sum())
-    if undocumented:
-        print(f"\n   ℹ  Trigger-logic descriptions are unavailable via the API for {undocumented} "
-              f"of {len(master_df)} rule(s).")
 
     print("\n📋 Loading rule testing tracker...")
     tracker_info = load_tracker_file(TRACKER_EXCEL_PATH) if TRACKER_EXCEL_PATH else None
@@ -1448,8 +1404,7 @@ def main():
 
     print(f"\n💾 Saving Excel report → {OUTPUT_EXCEL}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    saved_excel_path = save_excel_report(dead_df, newly_df, tracker_info, len(master_df),
-                                          excluded_no_offense_action, OUTPUT_EXCEL)
+    saved_excel_path = save_excel_report(dead_df, newly_df, tracker_info, len(master_df), OUTPUT_EXCEL)
 
     print("\n📊 Generating status chart...")
     chart_path = generate_status_chart(len(dead_df), len(newly_df), tracker_info, len(master_df))
