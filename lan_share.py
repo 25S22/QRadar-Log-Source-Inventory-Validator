@@ -1,77 +1,64 @@
+#!/usr/bin/env python3
 """
-LAN file-share feasibility test (single file), v2 - works with ANY IP range.
+LAN file share - zero dependencies (pure Python standard library).
 
-Usage:
-    pip install streamlit psutil      # psutil is optional but lists all your networks
     python lan_share.py
 
-What it does:
-  1. Asks for a port (Enter = random free port)
-  2. Asks for an optional PIN
-  3. Lists every network address on this machine (any range: 10.x, 172.x,
-     192.168.x, hotspot ranges, Tailscale 100.x ...) and lets you choose which
-     one to serve on, or all of them
-  4. Starts a Streamlit site and prints the URL(s) to open from your other device
+Asks for a port (Enter = random free port), then serves on ALL network
+interfaces so any device on the same Wi-Fi / hotspot can open it:
 
-Shared files live in ./lan_shared/ next to this script.
+    http://<this-machine's-ip>:<port>
+
+Features: upload files OR whole folders, download files, download all as .zip,
+delete files. Every request is logged here, so you can SEE whether the other
+device is actually reaching this machine.
+
+Shared files live in ./storage/ next to this script.
+No password: anyone on the same network can use it. Ctrl+C to stop.
 """
 
-import io
-import ipaddress
-import os
+import http.server
+import json
+import mimetypes
+import platform
 import random
+import re
+import shutil
 import socket
+import socketserver
 import subprocess
 import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
-SHARE_DIR = Path(__file__).resolve().parent / "lan_shared"
+SHARE_DIR = Path(__file__).resolve().parent / "storage"
+SEEN_CLIENTS = set()
+OWN_IPS = set()
 
 
 # ----------------------------------------------------------------------------
-# Helpers used by the launcher
+# Network helpers
 # ----------------------------------------------------------------------------
-def get_lan_ip() -> str:
-    """IP this machine uses for its default route (the 'main' network)."""
+def get_default_ip():
+    """IP of the interface this machine uses for its main network connection."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("10.255.255.255", 1))  # no packet is actually sent
+        s.connect(("10.255.255.255", 1))  # nothing is sent; OS just picks the route
         return s.getsockname()[0]
     except OSError:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except OSError:
-            return "127.0.0.1"
+        return None
     finally:
         s.close()
 
 
-def classify_ip(ip: str) -> str:
-    """Human-readable label for which range an address belongs to."""
-    try:
-        a = ipaddress.ip_address(ip)
-    except ValueError:
-        return "invalid"
-    if a.is_loopback:
-        return "loopback (this machine only)"
-    if a.is_link_local:
-        return "link-local 169.254.x.x (no DHCP / direct cable)"
-    if a in ipaddress.ip_network("100.64.0.0/10"):
-        return "100.64.0.0/10 (Tailscale / carrier-grade NAT)"
-    if a in ipaddress.ip_network("10.0.0.0/8"):
-        return "private 10.0.0.0/8"
-    if a in ipaddress.ip_network("172.16.0.0/12"):
-        return "private 172.16.0.0/12"
-    if a in ipaddress.ip_network("192.168.0.0/16"):
-        return "private 192.168.0.0/16"
-    if a.is_private:
-        return "private (other)"
-    return "PUBLIC address (not a LAN range)"
-
-
-def list_ipv4_addresses() -> dict:
-    """Return {ip: interface_name} for this machine, excluding loopback."""
+def list_ipv4_addresses():
+    """{ip: interface_name} for this machine, excluding loopback."""
     found = {}
     try:
         import psutil
@@ -85,167 +72,401 @@ def list_ipv4_addresses() -> dict:
                 found.setdefault(info[4][0], "?")
         except OSError:
             pass
-        found.setdefault(get_lan_ip(), "default route")
-        print("(Tip: 'pip install psutil' to list every network adapter.)\n")
+    default_ip = get_default_ip()
+    if default_ip:
+        found.setdefault(default_ip, "default route")
     found.pop("127.0.0.1", None)
     return found
 
 
-def can_bind(host: str, port: int) -> bool:
+def port_is_free(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            s.bind((host, port))
+            s.bind(("0.0.0.0", port))
             return True
         except OSError:
             return False
 
 
-def pick_random_port() -> int:
+def pick_random_port():
     for _ in range(200):
         p = random.randint(8000, 9999)
-        if can_bind("0.0.0.0", p):
+        if port_is_free(p):
             return p
-    raise RuntimeError("Could not find a free port")
+    sys.exit("Could not find a free port.")
 
 
-def launcher() -> None:
+# ----------------------------------------------------------------------------
+# Firewall: the #1 reason other devices can't connect
+# ----------------------------------------------------------------------------
+def ensure_firewall_open(port):
+    system = platform.system()
+    try:
+        if system == "Windows":
+            _open_windows_firewall(port)
+        elif system == "Darwin":
+            out = subprocess.run(
+                ["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"],
+                capture_output=True, text=True).stdout
+            if "enabled" in out.lower():
+                print("  [firewall] macOS firewall is ON. If a popup asks whether Python\n"
+                      "             may accept incoming connections, click ALLOW.")
+        elif system == "Linux":
+            out = subprocess.run(["ufw", "status"], capture_output=True, text=True).stdout
+            if "Status: active" in out:
+                print(f"  [firewall] ufw is active. Run:  sudo ufw allow {port}/tcp")
+    except Exception:
+        pass
+
+
+def _open_windows_firewall(port):
+    import ctypes
+    name = f"LAN Share {port}"
+
+    def rule_exists():
+        r = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule",
+                            f"name={name}"], capture_output=True, text=True)
+        return r.returncode == 0 and "No rules match" not in r.stdout
+
+    if rule_exists():
+        print(f"  [firewall] Windows Firewall rule '{name}' already present.")
+        return
+
+    args = ["advfirewall", "firewall", "add", "rule", f"name={name}", "dir=in",
+            "action=allow", "protocol=TCP", f"localport={port}", "profile=any"]
+    if ctypes.windll.shell32.IsUserAnAdmin():
+        subprocess.run(["netsh"] + args, capture_output=True)
+    else:
+        print("  [firewall] Windows Firewall usually blocks other devices. Asking for\n"
+              "             permission (UAC popup) to open this port - click YES.")
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "netsh", subprocess.list2cmdline(args), None, 0)
+        for _ in range(20):
+            time.sleep(1)
+            if rule_exists():
+                break
+
+    if rule_exists():
+        print(f"  [firewall] Opened TCP port {port} (all network profiles).")
+        print(f"             Remove later with:  netsh advfirewall firewall delete rule name=\"{name}\"")
+    else:
+        print("  [firewall] Could NOT open the port automatically. Run this in an\n"
+              "             Administrator Command Prompt, then retry:\n"
+              f"             netsh advfirewall firewall add rule name=\"{name}\" dir=in "
+              f"action=allow protocol=TCP localport={port} profile=any")
+
+
+# ----------------------------------------------------------------------------
+# Safe path handling (blocks ../ tricks)
+# ----------------------------------------------------------------------------
+def safe_join(rel):
+    rel = rel.replace("\\", "/")
+    parts = [re.sub(r'[<>:"|?*\x00-\x1f]', "_", p) for p in rel.split("/") if p not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    target = SHARE_DIR.joinpath(*parts).resolve()
+    try:
+        target.relative_to(SHARE_DIR.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+# ----------------------------------------------------------------------------
+# Web page
+# ----------------------------------------------------------------------------
+PAGE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Home</title>
+<style>
+ :root{color-scheme:light dark;--bg:#fff;--fg:#222;--line:#e6e6e6;--mut:#999}
+ @media (prefers-color-scheme:dark){:root{--bg:#121212;--fg:#ddd;--line:#2a2a2a;--mut:#777}}
+ body{font-family:-apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);
+      margin:0;padding:20px;max-width:640px;margin-inline:auto}
+ .bar{display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px}
+ .ic{width:38px;height:38px;border-radius:50%;border:1px solid var(--line);display:flex;
+     align-items:center;justify-content:center;cursor:pointer;font-size:17px;color:var(--mut);
+     text-decoration:none;user-select:none;background:none}
+ .row{display:flex;gap:10px;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
+ .row a{flex:1;word-break:break-all;color:var(--fg);text-decoration:none}
+ .row span{color:var(--mut);font-size:.8rem;white-space:nowrap}
+ .row button{background:none;border:0;font-size:1rem;cursor:pointer;color:var(--mut)}
+ progress{width:100%;height:4px} #p div{margin:6px 0;font-size:.85rem;color:var(--mut);word-break:break-all}
+</style></head><body>
+<div class="bar">
+ <label class="ic">&#128196;<input type="file" id="a" multiple hidden></label>
+ <label class="ic">&#128193;<input type="file" id="b" webkitdirectory multiple hidden></label>
+ <a class="ic" id="z" href="/z" style="display:none">&#11015;</a>
+</div>
+<div id="p"></div>
+<div id="l"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+function fmt(n){ if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB';
+  if(n<1073741824) return (n/1048576).toFixed(1)+' MB'; return (n/1073741824).toFixed(2)+' GB'; }
+
+async function refresh(){
+  let items = [];
+  try{ items = await (await fetch('/l')).json(); }catch(e){ return; }
+  const box = $('l'); box.textContent = '';
+  $('z').style.display = items.length ? 'flex' : 'none';
+  for(const it of items){
+    const row = document.createElement('div'); row.className = 'row';
+    const a = document.createElement('a');
+    a.href = '/f/' + it.path.split('/').map(encodeURIComponent).join('/');
+    a.textContent = it.path;
+    const s = document.createElement('span'); s.textContent = fmt(it.size);
+    const x = document.createElement('button'); x.textContent = '\\u2715';
+    x.onclick = async () => {
+      if(confirm(it.path + ' ?')){
+        await fetch('/x?q=' + encodeURIComponent(it.path), {method:'POST'}); refresh(); }
+    };
+    row.append(a, s, x); box.append(row);
+  }
+}
+
+function sendOne(item, rel, label, bar){
+  return new Promise(res => {
+    const x = new XMLHttpRequest();
+    x.open('POST', '/u?q=' + encodeURIComponent(rel));
+    x.upload.onprogress = e => { if(e.lengthComputable) bar.value = e.loaded / e.total * 100; };
+    x.onload = () => { label.textContent = (x.status == 200 ? '\\u2713 ' : '\\u2717 ') + rel +
+                                           ' (' + fmt(item.size) + ')'; bar.remove(); res(x.status == 200); };
+    x.onerror = () => { label.textContent = '\\u2717 ' + rel; res(false); };
+    x.send(item);
+  });
+}
+
+async function addAll(list){
+  for(const item of list){
+    const rel = item.webkitRelativePath || item.name;
+    const wrap = document.createElement('div'), label = document.createElement('div'),
+          bar = document.createElement('progress');
+    bar.max = 100; bar.value = 0; label.textContent = rel;
+    wrap.append(label, bar); $('p').prepend(wrap);
+    await sendOne(item, rel, label, bar);
+  }
+  refresh();
+}
+$('a').onchange = e => { addAll([...e.target.files]); e.target.value = ''; };
+$('b').onchange = e => { addAll([...e.target.files]); e.target.value = ''; };
+
+refresh(); setInterval(refresh, 5000);
+</script></body></html>
+"""
+
+
+# ----------------------------------------------------------------------------
+# HTTP server
+# ----------------------------------------------------------------------------
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "S"
+    sys_version = ""
+
+    # -- logging: this is the key diagnostic --------------------------------
+    def log_message(self, fmt, *args):
+        if self.headers.get("X-Selftest"):
+            return
+        ip = self.client_address[0]
+        is_local = ip.startswith("127.") or ip in OWN_IPS
+        if not is_local and ip not in SEEN_CLIENTS:
+            SEEN_CLIENTS.add(ip)
+            print(f"\n  >>> First request from ANOTHER device ({ip}) - the network path WORKS! <<<\n")
+        print(f"  [{datetime.now():%H:%M:%S}] {ip}  {self.command} {self.path}")
+
+    # -- small response helpers -----------------------------------------------
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    # -- routes ---------------------------------------------------------------
+    def do_GET(self):
+        try:
+            url = urllib.parse.urlsplit(self.path)
+            route = url.path
+            if route == "/":
+                self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            elif route == "/p":
+                self._send(200, b"ok")
+            elif route == "/l":
+                items = [{"path": p.relative_to(SHARE_DIR).as_posix(), "size": p.stat().st_size}
+                         for p in sorted(SHARE_DIR.rglob("*")) if p.is_file()]
+                self._send(200, json.dumps(items).encode(), "application/json")
+            elif route == "/z":
+                self._serve_zip()
+            elif route.startswith("/f/"):
+                self._serve_file(urllib.parse.unquote(route[len("/f/"):]))
+            else:
+                self._send(404, b"Not found")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    do_HEAD = do_GET
+
+    def do_POST(self):
+        try:
+            url = urllib.parse.urlsplit(self.path)
+            query = urllib.parse.parse_qs(url.query)
+            rel = query.get("q", [""])[0]
+            if url.path == "/u":
+                self._receive_upload(rel)
+            elif url.path == "/x":
+                target = safe_join(rel)
+                if target and target.is_file():
+                    target.unlink()
+                    self._send(200, b"deleted")
+                else:
+                    self._send(404, b"Not found")
+            else:
+                self._send(404, b"Not found")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # -- actions --------------------------------------------------------------
+    def _receive_upload(self, rel):
+        target = safe_join(rel)
+        length = int(self.headers.get("Content-Length", 0))
+        if target is None:
+            remaining = length
+            while remaining > 0:                    # drain so the client sees our reply
+                remaining -= len(self.rfile.read(min(65536, remaining)))
+            self._send(400, b"Bad path")
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".part")
+        remaining = length
+        with open(tmp, "wb") as out:
+            while remaining > 0:
+                chunk = self.rfile.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                out.write(chunk)
+                remaining -= len(chunk)
+        if remaining:                               # connection dropped mid-upload
+            tmp.unlink(missing_ok=True)
+            return
+        tmp.replace(target)
+        self._send(200, b"saved")
+
+    def _serve_file(self, rel):
+        target = safe_join(rel)
+        if target is None or not target.is_file():
+            self._send(404, b"Not found")
+            return
+        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(target.stat().st_size))
+        self.send_header("Content-Disposition",
+                         "attachment; filename*=UTF-8''" + urllib.parse.quote(target.name))
+        self.end_headers()
+        if self.command != "HEAD":
+            with open(target, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, 1 << 20)
+
+    def _serve_zip(self):
+        with tempfile.TemporaryFile() as tmp:
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+                for p in sorted(SHARE_DIR.rglob("*")):
+                    if p.is_file() and not p.name.endswith(".part"):
+                        z.write(p, p.relative_to(SHARE_DIR).as_posix())
+            size = tmp.tell()
+            tmp.seek(0)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", 'attachment; filename="archive.zip"')
+            self.end_headers()
+            if self.command != "HEAD":
+                shutil.copyfileobj(tmp, self.wfile, 1 << 20)
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def self_test(ip, port):
+    """Confirm the server answers on this machine's network address."""
+    time.sleep(0.5)
+    try:
+        req = urllib.request.Request(f"http://{ip}:{port}/p", headers={"X-Selftest": "1"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            ok = r.read() == b"ok"
+    except Exception:
+        ok = False
+    print(f"  [self-test] Server reachable on {ip}:{port} from this machine: "
+          f"{'YES' if ok else 'NO'}")
+
+
+def main():
     print("=" * 64)
-    print(" LAN file-share test (any IP range)")
+    print(" LAN Share  -  open to everyone on the same Wi-Fi / hotspot")
     print("=" * 64)
 
-    # ---- port ----
     raw = input("Port number (press Enter for a random free port): ").strip()
     if raw:
         if not raw.isdigit() or not (1024 <= int(raw) <= 65535):
             sys.exit("Please enter a number between 1024 and 65535.")
         port = int(raw)
-        if not can_bind("0.0.0.0", port):
+        if not port_is_free(port):
             sys.exit(f"Port {port} is already in use. Try another one.")
     else:
         port = pick_random_port()
 
-    # ---- pin ----
-    pin = input("Optional PIN to protect the site (Enter for none): ").strip()
-
-    # ---- which network / IP range to serve on ----
-    addrs = list(list_ipv4_addresses().items())
-    print("\nNetwork addresses found on this machine:")
-    for i, (ip, iface) in enumerate(addrs, 1):
-        print(f"  [{i}] {ip:<16} {iface:<14} {classify_ip(ip)}")
-    print("  [A] all interfaces (0.0.0.0)   <- default")
-    choice = input("Serve on which? Enter = all, a number, or type an IP: ").strip()
-
-    if choice == "" or choice.lower() == "a":
-        bind = "0.0.0.0"
-    elif choice.isdigit() and 1 <= int(choice) <= len(addrs):
-        bind = addrs[int(choice) - 1][0]
-    else:
-        bind = choice
-        try:
-            ipaddress.ip_address(bind)
-        except ValueError:
-            sys.exit(f"'{bind}' is not a valid IP address.")
-    if not can_bind(bind, port):
-        sys.exit(f"Can't bind to {bind}:{port}. That IP isn't assigned to this "
-                 f"machine, or the port is taken.")
-
     SHARE_DIR.mkdir(exist_ok=True)
-
-    print("\n  Open from this machine:  http://localhost:%d" % port)
-    urls = [ip for ip, _ in addrs] if bind == "0.0.0.0" else [bind]
-    for ip in urls:
-        print(f"  From another device:     http://{ip}:{port}   ({classify_ip(ip)})")
-    print("\n  The other device must be on the SAME network/subnet as the")
-    print("  address you use (e.g. both on 10.20.30.x). Ctrl+C to stop.\n")
-
-    env = os.environ.copy()
-    env["LAN_SHARE_CHILD"] = "1"
-    env["LAN_SHARE_PIN"] = pin
-
-    cmd = [
-        sys.executable, "-m", "streamlit", "run", str(Path(__file__).resolve()),
-        "--server.address", bind,
-        "--server.port", str(port),
-        "--server.headless", "true",
-        "--server.maxUploadSize", "2048",  # MB
-        "--browser.gatherUsageStats", "false",
-    ]
     try:
-        subprocess.run(cmd, env=env)
+        server = Server(("0.0.0.0", port), Handler)   # 0.0.0.0 = every network interface
+    except OSError as e:
+        sys.exit(f"Could not start server on port {port}: {e}")
+
+    addrs = list_ipv4_addresses()
+    OWN_IPS.update(addrs)
+    default_ip = get_default_ip()
+
+    print()
+    ensure_firewall_open(port)
+
+    print("\n  Open one of these on the OTHER device (same Wi-Fi / hotspot):\n")
+    for ip, iface in sorted(addrs.items(), key=lambda kv: kv[0] != default_ip):
+        star = "   <-- most likely" if ip == default_ip else ""
+        print(f"     http://{ip}:{port}    ({iface}){star}")
+    print(f"\n     http://localhost:{port}    (this machine only)\n")
+
+    if any(ip.startswith("172.20.10.") for ip in addrs):
+        print("  NOTE: 172.20.10.x is an iPhone hotspot. iPhone hotspots are widely\n"
+              "        reported to isolate connected devices from each other, which\n"
+              "        blocks this kind of test. If nothing shows up below when the\n"
+              "        other device opens the link, that is the likely reason.\n")
+
+    print("  Every request will be logged below. If you open the link on the other")
+    print("  device and NOTHING appears here, the request never arrived (firewall,\n"
+          "  VPN, wrong IP, or the network blocks device-to-device traffic).")
+    print("  Ctrl+C to stop.\n")
+
+    if default_ip:
+        threading.Thread(target=self_test, args=(default_ip, port), daemon=True).start()
+
+    try:
+        server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
-
-
-# ----------------------------------------------------------------------------
-# The Streamlit app (only runs when launched by the launcher above)
-# ----------------------------------------------------------------------------
-def app() -> None:
-    import streamlit as st
-
-    st.set_page_config(page_title="LAN Share", page_icon="📡")
-    SHARE_DIR.mkdir(exist_ok=True)
-
-    pin = os.environ.get("LAN_SHARE_PIN", "")
-    if pin and not st.session_state.get("authed"):
-        st.title("📡 LAN Share")
-        entered = st.text_input("Enter PIN", type="password")
-        if st.button("Unlock"):
-            if entered == pin:
-                st.session_state["authed"] = True
-                st.rerun()
-            else:
-                st.error("Wrong PIN")
-        st.stop()
-
-    st.title("📡 LAN Share")
-
-    client_ip = "unknown"
-    try:
-        client_ip = st.context.ip_address or "unknown"
-    except Exception:
-        pass
-    st.success(f"Connected. Your device's IP as seen by the server: **{client_ip}**")
-    st.caption(f"Server host: {socket.gethostname()} · default LAN IP: {get_lan_ip()}")
-
-    st.subheader("⬆️ Upload")
-    st.caption("Folders can't be picked directly in a browser upload box. "
-               "Zip the folder first, or select many files at once.")
-    uploader_key = st.session_state.setdefault("uk", 0)
-    files = st.file_uploader("Choose files", accept_multiple_files=True,
-                             key=f"up_{uploader_key}")
-    if files and st.button(f"Save {len(files)} file(s) to shared folder"):
-        for f in files:
-            safe_name = os.path.basename(f.name)  # block path traversal
-            (SHARE_DIR / safe_name).write_bytes(f.getbuffer())
-        st.session_state["uk"] += 1
-        st.rerun()
-
-    st.subheader("⬇️ Shared files")
-    items = sorted(p for p in SHARE_DIR.rglob("*") if p.is_file())
-    if not items:
-        st.info("Nothing shared yet.")
-    else:
-        for i, p in enumerate(items):
-            rel = p.relative_to(SHARE_DIR)
-            size_kb = p.stat().st_size / 1024
-            c1, c2, c3 = st.columns([5, 2, 1])
-            c1.write(f"**{rel}**  \n{size_kb:,.1f} KB")
-            c2.download_button("Download", data=p.read_bytes(),
-                               file_name=p.name, key=f"dl_{i}")
-            if c3.button("🗑", key=f"rm_{i}", help="Delete"):
-                p.unlink()
-                st.rerun()
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            for p in items:
-                z.write(p, p.relative_to(SHARE_DIR))
-        st.download_button("Download everything as .zip", buf.getvalue(),
-                           file_name="lan_shared.zip")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
-    if os.environ.get("LAN_SHARE_CHILD") == "1":
-        app()
-    else:
-        launcher()
+    main()
+    
